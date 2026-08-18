@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.3.0
+// @version      1.4.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 官方爆率对比 · 一抽到底 · 实时余额
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -22,7 +22,6 @@
     const SITE_ORIGIN = 'https://hhanclub.net';
     const LOTTERY_PAGE = `${SITE_ORIGIN}/lucky.php`;
     const LOTTERY_API = `${SITE_ORIGIN}/plugin/lucky-draw`;
-    const RECORDS_API = `${SITE_ORIGIN}/plugin/lucky-draw/winning-records`;
 
     const STATS_KEY = 'hhanclub_lottery_stats_v4';
     const LEGACY_STATS_KEY = 'hhanclub_lottery_stats_v3';
@@ -50,11 +49,6 @@
         jackpotMaxRate: 0.002,
         // 读不到奖池时的兜底判定：VIP，或单笔十万以上的憨豆
         jackpotBeansFloor: 100000,
-        // 同步官方记录时每页拉多少条，以及两页之间歇多久
-        syncPageSize: 200,
-        syncPageDelay: 300,
-        // 安全上限，防止接口异常时无限翻页
-        syncMaxPages: 200,
         // 每抽多少次回服务端校准一次余额，纠正本地估算的累计漂移
         balanceSyncEveryDraws: 25,
         // 一抽到底的硬上限。转盘是正期望的（期望产出 > 单抽消耗），
@@ -221,7 +215,6 @@
         stats.cost = Number(data.cost) || 0;
         stats.firstAt = data.firstAt || null;
         stats.lastAt = data.lastAt || null;
-        if (data.syncedAt) stats.syncedAt = data.syncedAt;
 
         Object.keys(stats.gains).forEach(key => {
             stats.gains[key] = Number(data.gains?.[key]) || 0;
@@ -521,8 +514,8 @@
         bucket.value += parsed.value;
         bucket.tiers[parsed.label] = (bucket.tiers[parsed.label] || 0) + 1;
 
-        // 接口返回的文案常带尾随空格，同步记录那边又 trim 过，
-        // 不统一的话同一个奖会在兜底表里留下两条 key
+        // 接口返回的文案常带尾随空格，不 trim 的话同一个奖
+        // 会在兜底表里留下 "魔力 100" 和 "魔力 100 " 两条 key
         const rawKey = String(prizeText).trim();
         stats.raw[rawKey] = (stats.raw[rawKey] || 0) + 1;
     }
@@ -1541,7 +1534,6 @@
                 <div class="hh-small-actions">
                     <button id="reset-current-data" class="hh-small-btn">↻ 重置本次</button>
                     <button id="export-stats" class="hh-small-btn">📤 导出 CSV</button>
-                    <button id="sync-official" class="hh-small-btn">☁ 同步官方记录</button>
                     <button id="backup-stats" class="hh-small-btn">💾 备份 JSON</button>
                     <button id="import-stats" class="hh-small-btn">📥 导入备份</button>
                     <button id="clear-total-data" class="hh-small-btn">🗑 清空历史</button>
@@ -1637,9 +1629,18 @@
 
             const drift = value - beanBalance;
             beanBalance = value;
-            // domBalanceSeen 记的是「页面 DOM 上次显示的数」，不能写成服务端值：
-            // 站点从不更新 .bean-number，一旦两者不等，下一次 getBeanBalance()
-            // 就会把这里刚校准好的值当成过期数据冲掉。
+
+            // 校准值必须活过紧接着的 updateBalanceDisplay()。
+            // getBeanBalance() 的规则是「DOM 数字变了就采信 DOM」，所以这里要把
+            // domBalanceSeen 对齐到 DOM **当前**显示的数：
+            //   写成服务端值 → 和 DOM 不等，下一拍就被 DOM 冲掉；
+            //   保持不动     → DOM 若真变过，同样会被冲掉。
+            // 对齐之后，「DOM 变没变」照常判断，而刚拉回来的权威值不会被过期
+            // 的页面数字覆盖（站点从不刷新 .bean-number，它只会越来越旧）。
+            const element = document.querySelector('.bean-number');
+            const domValue = element ? firstNumber(element.textContent) : null;
+            if (domValue !== null) domBalanceSeen = domValue;
+
             drawsSinceCalibration = 0;
             updateBalanceDisplay();
 
@@ -2281,120 +2282,6 @@
         addLog('🗑 历史统计已清空', 'success');
     }
 
-    /* =========================================================
-       同步官方中奖记录
-
-       站点自己有一个分页接口能取回账号的全部中奖记录，每条都带
-       result（奖品文案）和 cost_bonus（那一抽实际扣了多少憨豆）。
-       用它重建「历史总计」，统计就不再依赖本脚本抽过多少次 ——
-       手点的、换电脑抽的、清过 localStorage 的，全都能补回来。
-    ========================================================= */
-
-    async function fetchRecordsPage(start, length) {
-        const query = new URLSearchParams({
-            __format: 'data-table',
-            start: String(start),
-            length: String(length),
-            draw: '1'
-        });
-
-        const response = await fetch(`${RECORDS_API}?${query}`, {
-            credentials: 'include',
-            headers: {
-                'accept': '*/*',
-                'referer': LOTTERY_PAGE,
-                'x-requested-with': 'XMLHttpRequest'
-            }
-        });
-
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-        const payload = await response.json();
-        if (payload.code !== 0) throw new Error(decodeUnicode(payload.msg || '接口返回异常'));
-
-        return {
-            rows: Array.isArray(payload.data) ? payload.data : [],
-            total: Number(payload.recordsTotal) || 0
-        };
-    }
-
-    async function syncOfficialRecords() {
-        if (running) {
-            addLog('⚠️ 请先停止自动抽奖再同步', 'warning');
-            return;
-        }
-        if (!confirm(`从站点拉取全部官方中奖记录，用真实数据重建「历史总计」？
-
-本次会话数据不受影响。`)) return;
-
-        const button = $('sync-official');
-        if (button) {
-            button.disabled = true;
-            setText('sync-official', '☁ 同步中...');
-        }
-
-        try {
-            const stats = emptyStats();
-            const size = CONFIG.syncPageSize;
-            let start = 0;
-            let total = 0;
-            let page = 0;
-
-            while (page < CONFIG.syncMaxPages) {
-                const { rows, total: reported } = await fetchRecordsPage(start, size);
-                if (page === 0) {
-                    total = reported;
-                    addLog(`☁️ 官方记录共 ${fmt(total)} 条，开始拉取`, 'info');
-                }
-                if (!rows.length) break;
-
-                rows.forEach(row => {
-                    const text = String(row.result || '').trim();
-                    if (!text) return;
-                    applyPrize(stats, text, Number(row.cost_bonus) || 0);
-
-                    const at = Date.parse(String(row.created_at || '').replace(' ', 'T'));
-                    if (!Number.isNaN(at)) {
-                        if (!stats.firstAt || at < stats.firstAt) stats.firstAt = at;
-                        if (!stats.lastAt || at > stats.lastAt) stats.lastAt = at;
-                    }
-                });
-
-                start += rows.length;
-                page += 1;
-                addLog(`☁️ 已拉取 ${fmt(stats.draws)}/${fmt(total)} 条`, 'info');
-
-                if (rows.length < size || (total && start >= total)) break;
-                // 用独立的等待：sleep() 的 timer 是给抽奖循环留着被 cancelSleep 打断的
-                await new Promise(resolve => setTimeout(resolve, CONFIG.syncPageDelay));
-            }
-
-            if (!stats.draws) {
-                addLog('⚠️ 没有拉到任何记录，历史统计保持不变', 'warning');
-                return;
-            }
-
-            stats.syncedAt = Date.now();
-            saveStats(stats);
-            totalStats = stats;
-
-            settings.viewMode = 'total';
-            saveSettings();
-            const viewSelect = $('view-mode');
-            if (viewSelect) viewSelect.value = 'total';
-
-            render();
-            addLog(`✅ 已用 ${fmt(stats.draws)} 条官方记录重建历史统计`, 'success');
-        } catch (error) {
-            addLog(`❌ 同步失败：${error.message}`, 'error');
-        } finally {
-            if (button) {
-                button.disabled = false;
-                setText('sync-official', '☁ 同步官方记录');
-            }
-        }
-    }
-
     /* 导出分奖项明细，方便自己拉表算真实爆率 */
     function exportStats() {
         const stats = activeStats();
@@ -2716,7 +2603,6 @@
         on('reset-current-data', 'click', resetCurrentData);
         on('clear-total-data', 'click', clearTotalData);
         on('export-stats', 'click', exportStats);
-        on('sync-official', 'click', syncOfficialRecords);
 
         on('toggle-all-tiers', 'click', () => {
             const rows = Array.from(document.querySelectorAll('#detail-list .hh-row'));
@@ -2816,9 +2702,6 @@
             addLog('📦 已迁移旧版历史统计数据', 'success');
         }
 
-        if (totalStats.syncedAt) {
-            addLog(`☁️ 历史统计同步自官方记录 · ${new Date(totalStats.syncedAt).toLocaleString()}`, 'info');
-        }
 
         setInterval(() => {
             getSingleCost();

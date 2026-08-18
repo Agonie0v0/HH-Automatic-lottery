@@ -336,8 +336,8 @@ console.log('\n[8] 设置持久化');
 
 /* ----------------------------------------------------------------
    以下夹具直接取自 hhanclub.net/lucky.php 的线上真实数据（2026-08）：
-   REAL_POOL 是抽奖页内联脚本里的 prizes 数组，
-   REAL_COUNTS 是 winning-records 接口最近 500 条记录的文案分布。
+   REAL_POOL 是抽奖页内联脚本里的 prizes 数组，REAL_BEANS 来自同期
+   最近 500 抽的实际战绩。
    注意 typeText 写的「魔力」就是憨豆：站点奖池里 type 1001 用的是 bean_icon，
    消耗侧也叫憨豆，只是 NexusPHP 的默认叫法没改干净。所以它们必须归到同一类。
 ------------------------------------------------------------------ */
@@ -355,107 +355,114 @@ const REAL_POOL = [
     { typeText: '邀请', amountText: '1 ', probability_real: '0.0038' }
 ];
 
-const REAL_COUNTS = {
-    '魔力 100 ': 122, '魔力 5000 ': 67, '魔力 2000 ': 136, '魔力 1000 ': 100,
-    '上传量 2 GB': 28, '彩虹 ID 7 Day(s)': 9, '上传量 5 GB': 6,
-    '补签卡 1 ': 28, '魔力 780000 ': 2, '邀请 1 ': 2
-};
-
-// 「魔力」档位的憨豆总额
+// 「魔力」档位在最近 500 抽里的憨豆总额，用作 [10] 的盈亏种子数据
 const REAL_BEANS = 100 * 122 + 5000 * 67 + 2000 * 136 + 1000 * 100 + 780000 * 2;
 
-function realRecords() {
-    const rows = [];
-    let id = 3900000;
-    for (const [result, times] of Object.entries(REAL_COUNTS)) {
-        for (let i = 0; i < times; i++) {
-            rows.push({ id: id++, cost_bonus: 2000, created_at: '2026-08-18 19:30', result });
-        }
-    }
-    return rows;
-}
-
-/* 把 winning-records 分页接口 stub 掉，返回真实记录 */
-function stubRecordsApi(w, rows, onServe) {
-    w.fetch = async url => {
-        const u = new URL(String(url), 'https://hhanclub.net');
-        const start = Number(u.searchParams.get('start'));
-        const length = Number(u.searchParams.get('length'));
-        const slice = rows.slice(start, start + length);
-        if (onServe) onServe(slice.length);
-        return { ok: true, status: 200, json: async () => ({ code: 0, data: slice, recordsTotal: rows.length }) };
-    };
-}
-
 /* ---------------------------------------------------------------- */
-console.log('\n[9] 同步官方记录 + 官方爆率对比（线上真实夹具）');
+console.log('\n[9] 线上真实文案的归类与官方爆率对比');
 {
+    // 奖池每一档各中一次。这样既走完真实的解析路径，又能验证
+    // 「奖池文案」和「接口文案」必须归一化成同一个 label —— 对不上号
+    // 的话档位行就配不到官方爆率。
+    const TEXTS = [
+        '魔力 780000 ', '魔力 5000 ', '魔力 100 ', '魔力 2000 ', '魔力 1000 ',
+        '上传量 2 GB', '上传量 5 GB', '彩虹 ID 7 Day(s)', 'VIP 7 Day(s)',
+        '补签卡 1 ', '邀请 1 '
+    ];
+
     const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+    const w = dom.window;
+
+    let i = 0;
+    w.fetch = async url => {
+        if (String(url).includes('lucky.php')) {
+            return { ok: true, status: 200, text: async () => '<html><body></body></html>' };
+        }
+        const text = TEXTS[i++] ?? TEXTS[TEXTS.length - 1];
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ret: 0, data: { prize_text: text } })
+        };
+    };
+
     await run(dom);
-    const d = dom.window.document;
+    const d = w.document;
 
     check('线上写法「每次消耗憨豆： 2000」解析为 2,000',
         d.getElementById('single-cost').textContent === '2,000',
         d.getElementById('single-cost').textContent);
 
-    const rows = realRecords();
-    let served = 0;
-    stubRecordsApi(dom.window, rows, n => { served += n; });
+    d.getElementById('lottery-interval').value = '3';
+    d.getElementById('max-lottery-count').value = String(TEXTS.length);
+    d.getElementById('start-lottery').click();
 
-    d.getElementById('sync-official').click();
-    await sleep(3000);
+    for (let n = 0; n < 60 && d.getElementById('lottery-status').textContent !== '已停止'; n++) {
+        await sleep(1000);
+    }
 
-    check(`分页拉全 ${rows.length} 条记录（实际 ${served}）`, served === rows.length);
-
-    const stats = JSON.parse(dom.window.localStorage.getItem('hhanclub_lottery_stats_v4'));
-    check('抽奖次数 = 500', stats.draws === 500, `实际 ${stats.draws}`);
-    check('消耗按 cost_bonus 累加 = 1,000,000', stats.cost === 1000000, `实际 ${stats.cost}`);
-    check(`「魔力」档位全部归到憨豆，累计 = ${REAL_BEANS}`,
-        stats.gains.beans === REAL_BEANS, `实际 ${stats.gains.beans}`);
-    check('没有留下独立的 magic 类别', !stats.prizes.magic, JSON.stringify(stats.prizes.magic));
-    check('憨豆中奖 427 次', stats.prizes.beans?.count === 427, `实际 ${stats.prizes.beans?.count}`);
-    check('上传量累计 = 2×28 + 5×6 = 86 GB', stats.gains.upload === 86, `实际 ${stats.gains.upload}`);
-    check('彩虹 ID 累计 63 天', stats.gains.rainbow === 63, `实际 ${stats.gains.rainbow}`);
-    check('补签卡 28 张', stats.prizes.makeup?.count === 28, `实际 ${stats.prizes.makeup?.count}`);
-    check('线上 10 种文案没有一种落进「其他奖品」',
+    const stats = JSON.parse(w.localStorage.getItem('hhanclub_lottery_stats_v4'));
+    check(`抽满 ${TEXTS.length} 次`, stats.draws === TEXTS.length, `实际 ${stats.draws}`);
+    check('线上 11 种文案没有一种落进「其他奖品」',
         !stats.prizes.unknown, JSON.stringify(stats.prizes.unknown));
+    check('没有留下独立的 magic 类别', !stats.prizes.magic, JSON.stringify(stats.prizes.magic));
 
-    // 奖池档位和接口文案必须归一化成同一个 label，否则爆率对不上号
+    check('五档「魔力」全部归到憨豆，共 5 次',
+        stats.prizes.beans?.count === 5, `实际 ${stats.prizes.beans?.count}`);
+    check('憨豆累计 = 780000+5000+100+2000+1000',
+        stats.gains.beans === 788100, `实际 ${stats.gains.beans}`);
+    check('上传量 2GB + 5GB = 7GB', stats.gains.upload === 7, `实际 ${stats.gains.upload}`);
+    check('彩虹 ID 7 天', stats.gains.rainbow === 7, `实际 ${stats.gains.rainbow}`);
+    check('VIP 7 天', stats.gains.vip === 7, `实际 ${stats.gains.vip}`);
+    check('补签卡 1 张', stats.prizes.makeup?.count === 1);
+    check('邀请 1 个', stats.prizes.invite?.count === 1);
+
+    // 档位 label 必须和奖池对得上，否则这里配不到爆率
     const tierRates = Array.from(d.querySelectorAll('#detail-list .hh-tier-rate'));
-    check('档位行渲染出爆率对比', tierRates.length === 10, `实际 ${tierRates.length}`);
+    check(`档位行渲染出 ${TEXTS.length} 条爆率对比`,
+        tierRates.length === TEXTS.length, `实际 ${tierRates.length}`);
     check('每个档位都配到了官方爆率',
         tierRates.every(el => /官方 \d/.test(el.textContent)),
         tierRates.map(el => el.textContent).join(' | '));
 
     const official = Array.from(d.querySelectorAll('#detail-list .hh-row-official'));
-    // 样本里 VIP 一次没中（官方爆率 0.02%），所以只有 5 个类别成行
-    check('5 个中过奖的类别都显示官方爆率', official.length === 5, `实际 ${official.length}`);
+    check('6 个类别都显示官方爆率', official.length === 6, `实际 ${official.length}`);
     check('憨豆类别官方爆率合并为 83.0%',
         official.some(el => el.textContent === '官方 83.0%'),
         official.map(el => el.textContent).join(' | '));
-    check('憨豆实测占比 85.4%',
-        d.querySelector('#detail-list .hh-row-pct').textContent === '85.4%',
-        d.querySelector('#detail-list .hh-row-pct').textContent);
+    check('VIP 类别官方爆率 0.0%（0.02% 四舍五入）',
+        official.some(el => el.textContent === '官方 0.0%'),
+        official.map(el => el.textContent).join(' | '));
 }
 
 /* ---------------------------------------------------------------- */
 console.log('\n[10] 憨豆盈亏与理论盈亏率');
 {
     const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+    const w = dom.window;
+
+    // 盈亏只用到 cost 和 gains.beans，直接给一份 500 抽的种子数据，
+    // 不必再为了造数据去跑几百次抽奖
+    w.localStorage.setItem('hhanclub_lottery_stats_v4', JSON.stringify({
+        version: 4, draws: 500, cost: 1000000,
+        gains: { beans: REAL_BEANS, magic: 0, invite: 2, rainbow: 63, vip: 0, makeup: 0, upload: 86 },
+        prizes: { beans: { count: 427, value: REAL_BEANS, tiers: { '100 憨豆': 122 } } },
+        raw: {}
+    }));
+
     await run(dom);
-    const d = dom.window.document;
+    const d = w.document;
 
     // 理论盈亏率只依赖奖池，没抽过也该算得出来
     const expected = 780000 * 0.0011 + 5000 * 0.1507 + 100 * 0.2261 + 2000 * 0.2261 + 1000 * 0.2261;
     const baseline = ((expected - 2000) / 2000) * 100;
-    check(`未抽奖也显示理论盈亏率 ${baseline.toFixed(1)}%`,
+    check(`显示理论盈亏率 ${baseline.toFixed(1)}%`,
         d.getElementById('theory-rate').textContent === `+${baseline.toFixed(1)}%`,
         d.getElementById('theory-rate').textContent);
     check('转盘是正期望的', baseline > 0, `实际 ${baseline.toFixed(2)}%`);
 
-    stubRecordsApi(dom.window, realRecords());
-    d.getElementById('sync-official').click();
-    await sleep(3000);
+    d.getElementById('view-mode').value = 'total';
+    d.getElementById('view-mode').dispatchEvent(new w.Event('change'));
+    await sleep(80);
 
     const profit = REAL_BEANS - 1000000;
     check(`盈亏 = ${REAL_BEANS} - 1,000,000`,
@@ -936,6 +943,60 @@ console.log('\n[20] 面板底部横幅已移除');
     check('没有 .hh-footer 节点', !d.querySelector('#lottery-control-panel .hh-footer'));
     check('面板里不再出现 4TH ANNIVERSARY 底栏文案',
         !d.getElementById('lottery-control-panel').textContent.includes('HHCLUB 4TH ANNIVERSARY'));
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[21] 校准值必须压过过期的页面数字');
+{
+    // 这条是线上实测逼出来的：校准拿到服务端值之后，紧接着的
+    // updateBalanceDisplay() 会重新读 DOM，一旦 DOM 数字和上次记录的不同，
+    // 「DOM 变了就采信 DOM」的规则就会把刚校准好的值冲掉。
+    const dom = makeDom({ useBean: '每次消耗憨豆： 2000', balance: '10000' });
+    const w = dom.window;
+    w.fetch = async url => {
+        if (String(url).includes('lucky.php')) {
+            return {
+                ok: true, status: 200,
+                text: async () => '<html><body><div class="bean-number">1741668.0</div></body></html>'
+            };
+        }
+        return { ok: false, status: 500, text: async () => '' };
+    };
+
+    await run(dom);
+    const d = w.document;
+
+    // 页面上的数字换成另一个过期值（模拟站点自己动过、或者别处改过）
+    d.querySelector('.bean-number').textContent = '12345.0';
+
+    d.getElementById('refresh-balance').click();
+    await sleep(700);
+
+    check('校准后显示服务端值而不是页面上的旧数字',
+        d.getElementById('bean-balance').textContent === '1,741,668',
+        d.getElementById('bean-balance').textContent);
+
+    // 「按余额设置」会走一遍 updateBalanceDisplay，正好用来确认校准值稳得住
+    d.getElementById('set-max-possible').click();
+    await sleep(120);
+    d.getElementById('set-max-possible').click();
+    await sleep(120);
+
+    check('后续刷新不会把校准值冲回去',
+        d.getElementById('bean-balance').textContent === '1,741,668',
+        d.getElementById('bean-balance').textContent);
+    check('最多可抽按校准值算',
+        d.getElementById('max-possible').textContent === '870',
+        d.getElementById('max-possible').textContent);
+
+    // 但页面数字如果之后又变了（比如用户刷新了页面），仍然要重新采信
+    d.querySelector('.bean-number').textContent = '500000.0';
+    d.getElementById('set-max-possible').click();
+    await sleep(120);
+
+    check('DOM 之后再变化时仍然重新采信',
+        d.getElementById('bean-balance').textContent === '500,000',
+        d.getElementById('bean-balance').textContent);
 }
 
 /* ---------------------------------------------------------------- */
