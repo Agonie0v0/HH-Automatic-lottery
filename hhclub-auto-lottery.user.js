@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.5.0
+// @version      1.6.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 官方爆率对比 · 一抽到底 · 实时余额
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -1169,6 +1169,88 @@
     #lottery-control-panel .hh-anniversary {
         margin: -14px -14px 12px -14px;
     }
+}
+
+/* ===== 导入方式弹窗 ===== */
+.hh-modal-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 2147483647;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(40, 26, 12, .45);
+    backdrop-filter: blur(2px);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+}
+.hh-modal {
+    width: min(330px, calc(100vw - 32px));
+    padding: 16px;
+    border-radius: 14px;
+    background: linear-gradient(160deg, #fffdf8, #fdf3e4);
+    border: 1px solid #e8d5bc;
+    box-shadow: 0 20px 60px rgba(60, 40, 20, .3);
+}
+.hh-modal-title {
+    font-size: 14px;
+    font-weight: 800;
+    color: #5a4030;
+    margin-bottom: 8px;
+}
+.hh-modal-text {
+    font-size: 11px;
+    line-height: 1.7;
+    color: #8a705a;
+    margin-bottom: 12px;
+}
+.hh-modal-text b { color: #d4873a; }
+.hh-modal-btn {
+    display: block;
+    width: 100%;
+    margin-bottom: 7px;
+    padding: 9px 11px;
+    border-radius: 9px;
+    border: 1px solid #e8d5bc;
+    background: #fffdf9;
+    color: #5a4030;
+    font-size: 12px;
+    font-weight: 700;
+    text-align: left;
+    cursor: pointer;
+    font-family: inherit;
+    transition: transform .12s ease, box-shadow .12s ease;
+}
+.hh-modal-btn span {
+    display: block;
+    margin-top: 2px;
+    font-size: 9px;
+    font-weight: 500;
+    color: #a08066;
+}
+.hh-modal-btn:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(120, 80, 40, .16);
+}
+.hh-modal-primary {
+    background: linear-gradient(135deg, #f5b555, #e09030);
+    border-color: #d4873a;
+    color: #fff;
+}
+.hh-modal-primary span { color: rgba(255, 255, 255, .85); }
+.hh-modal-ghost {
+    margin-bottom: 0;
+    padding: 7px 11px;
+    background: transparent;
+    border-color: transparent;
+    color: #a08066;
+    font-size: 11px;
+    font-weight: 600;
+    text-align: center;
+}
+.hh-modal-ghost:hover {
+    transform: none;
+    box-shadow: none;
+    background: rgba(160, 128, 102, .1);
 }
 
 /* ===== 一抽到底 ===== */
@@ -2389,6 +2471,52 @@
         return result;
     }
 
+    /* confirm() 只有两个出口，塞不下「合并 / 覆盖 / 取消」三种意图 ——
+       之前用「取消 = 合并」，既反直觉又没了真正的退出路径。改成自己弹一个。
+       合并是主路径：不同设备的记录本来就不重合。 */
+    function askImportMode(drawCount, currentCount) {
+        return new Promise(resolve => {
+            const overlay = document.createElement('div');
+            overlay.className = 'hh-modal-overlay';
+            overlay.innerHTML = `
+                <div class="hh-modal">
+                    <div class="hh-modal-title">📥 导入备份</div>
+                    <div class="hh-modal-text">
+                        备份里有 <b>${fmt(drawCount)}</b> 抽记录，<br>
+                        当前历史统计有 <b>${fmt(currentCount)}</b> 抽。
+                    </div>
+                    <button class="hh-modal-btn hh-modal-primary" data-mode="merge">
+                        合并 · 共 ${fmt(drawCount + currentCount)} 抽
+                        <span>换设备用这个，两边记录相加</span>
+                    </button>
+                    <button class="hh-modal-btn" data-mode="replace">
+                        覆盖 · 只留 ${fmt(drawCount)} 抽
+                        <span>丢掉当前历史，只保留备份里的</span>
+                    </button>
+                    <button class="hh-modal-btn hh-modal-ghost" data-mode="cancel">取消</button>
+                </div>
+            `;
+
+            const done = mode => {
+                overlay.remove();
+                document.removeEventListener('keydown', onKey);
+                resolve(mode);
+            };
+            const onKey = event => {
+                if (event.key === 'Escape') done('cancel');
+            };
+
+            overlay.addEventListener('click', event => {
+                const button = event.target.closest('[data-mode]');
+                if (button) return done(button.dataset.mode);
+                if (event.target === overlay) done('cancel');
+            });
+            document.addEventListener('keydown', onKey);
+
+            document.body.appendChild(overlay);
+        });
+    }
+
     function importStats() {
         if (running) {
             addLog('⚠️ 请先停止自动抽奖', 'warning');
@@ -2419,18 +2547,25 @@
             }
 
             const parsed = normalizeStats(incoming);
-            const replace = confirm(
-                `读到 ${fmt(parsed.draws)} 抽记录。\n\n` +
-                '确定 = 覆盖现有历史统计\n' +
-                '取消 = 与现有历史统计合并'
-            );
+            const existing = loadStats();
+            const mode = await askImportMode(parsed.draws, existing.draws);
 
-            const merged = replace ? parsed : mergeStats(loadStats(), parsed);
+            if (mode === 'cancel') {
+                addLog('📥 已取消导入', 'info');
+                return;
+            }
+
+            const merged = mode === 'replace' ? parsed : mergeStats(existing, parsed);
             saveStats(merged);
             totalStats = merged;
+
+            settings.viewMode = 'total';
+            saveSettings();
+            const viewSelect = $('view-mode');
+            if (viewSelect) viewSelect.value = 'total';
             render();
 
-            addLog(`📥 已${replace ? '覆盖' : '合并'}导入 · 历史共 ${fmt(merged.draws)} 抽`, 'success');
+            addLog(`📥 已${mode === 'replace' ? '覆盖' : '合并'}导入 · 历史共 ${fmt(merged.draws)} 抽`, 'success');
         });
 
         picker.click();
