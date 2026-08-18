@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.6.0
+// @version      1.7.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 官方爆率对比 · 一抽到底 · 实时余额
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -416,31 +416,30 @@
 
     let prizePool = null;
 
-    function readPrizePool() {
-        if (prizePool) return prizePool;
-        prizePool = [];
-
+    /* 从任意一份 lucky.php 文档里抠出奖池。解析失败返回 null，
+       调用方据此区分「没读到」和「读到了一个空奖池」。 */
+    function parsePrizePoolFrom(doc) {
         let raw = null;
-        for (const script of document.querySelectorAll('script:not([src])')) {
+        for (const script of doc.querySelectorAll('script:not([src])')) {
             const match = script.textContent.match(/\blet\s+prizes\s*=\s*(\[[\s\S]*?\])\s*;/);
             if (match) {
                 raw = match[1];
                 break;
             }
         }
-        if (!raw) return prizePool;
+        if (!raw) return null;
 
         let list;
         try {
             list = JSON.parse(raw);
         } catch (error) {
-            return prizePool;
+            return null;
         }
-        if (!Array.isArray(list)) return prizePool;
+        if (!Array.isArray(list)) return null;
 
         // 奖池文案拼法和接口返回的 prize_text 一致（typeText + ' ' + amountText），
         // 所以档位 label 天然对得上，可以直接按 label 匹配。
-        prizePool = list.map(item => {
+        return list.map(item => {
             const prize = parsePrizeText(`${item.typeText || ''} ${item.amountText || ''}`);
             return {
                 type: prize.type,
@@ -449,7 +448,17 @@
                 probability: Number(item.probability_real) || 0
             };
         });
+    }
+
+    function readPrizePool() {
+        if (prizePool) return prizePool;
+        prizePool = parsePrizePoolFrom(document) || [];
         return prizePool;
+    }
+
+    /* 奖池指纹，用来判断站点有没有偷偷调过爆率 */
+    function poolFingerprint(pool) {
+        return (pool || []).map(item => `${item.type}|${item.label}|${item.probability}`).sort().join(';');
     }
 
     /* 官方爆率查表：按类别汇总一份，按具体档位汇总一份 */
@@ -1682,16 +1691,40 @@
     /* 站点抽完不刷新余额，本地估算又会随时间漂移（比如你在别的标签页手点了几抽），
        所以每隔若干抽回服务端要一次权威值。lucky.php 自己就带 .bean-number，
        不用另找接口。 */
-    async function fetchServerBalance() {
+    /* 一次请求同时拿余额和奖池。站点会不定期调整爆率
+       （线上见过同一天改好几次），而奖池就在这份 HTML 里，
+       顺手解析不用多发一次请求。 */
+    async function fetchServerSnapshot() {
         try {
             const response = await fetch(LOTTERY_PAGE, { credentials: 'include' });
             if (!response.ok) return null;
 
             const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
-            return firstNumber(doc.querySelector('.bean-number')?.textContent ?? '');
+            return {
+                balance: firstNumber(doc.querySelector('.bean-number')?.textContent ?? ''),
+                pool: parsePrizePoolFrom(doc)
+            };
         } catch (error) {
             return null;
         }
+    }
+
+    /* 爆率变了就换掉缓存。变了要说一声 —— 理论盈亏率和大奖判定都跟着它走。 */
+    function adoptPool(pool, { quiet = false } = {}) {
+        if (!pool || !pool.length) return false;
+        if (poolFingerprint(pool) === poolFingerprint(prizePool)) return false;
+
+        const before = theoreticalProfitRate();
+        prizePool = pool;
+        const after = theoreticalProfitRate();
+
+        if (!quiet) {
+            const shift = (before !== null && after !== null && Math.abs(after - before) >= 0.05)
+                ? `，理论盈亏率 ${before > 0 ? '+' : ''}${before.toFixed(1)}% → ${after > 0 ? '+' : ''}${after.toFixed(1)}%`
+                : '';
+            addLog(`📈 站点调整了奖池爆率${shift}`, 'warning');
+        }
+        return true;
     }
 
     async function calibrateBalance({ quiet = false } = {}) {
@@ -1700,7 +1733,12 @@
         setText('balance-freshness', '校准中...');
 
         try {
-            const value = await fetchServerBalance();
+            const snapshot = await fetchServerSnapshot();
+            const value = snapshot ? snapshot.balance : null;
+
+            // 爆率先换，后面 render() 才会用上新的官方数据
+            if (snapshot) adoptPool(snapshot.pool);
+
             if (value === null) {
                 if (!quiet) addLog('⚠️ 余额校准失败，继续用本地估算', 'warning');
                 return false;
@@ -1722,6 +1760,7 @@
 
             drawsSinceCalibration = 0;
             updateBalanceDisplay();
+            render();
 
             if (!quiet) {
                 addLog(Math.abs(drift) >= 1
