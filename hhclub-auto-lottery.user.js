@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.2.0
-// @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 官方爆率对比 · 官方记录同步
+// @version      1.3.0
+// @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 官方爆率对比 · 一抽到底 · 实时余额
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
 // @grant        none
@@ -54,7 +54,12 @@
         syncPageSize: 200,
         syncPageDelay: 300,
         // 安全上限，防止接口异常时无限翻页
-        syncMaxPages: 200
+        syncMaxPages: 200,
+        // 每抽多少次回服务端校准一次余额，纠正本地估算的累计漂移
+        balanceSyncEveryDraws: 25,
+        // 一抽到底的硬上限。转盘是正期望的（期望产出 > 单抽消耗），
+        // 余额很可能一路往上涨，光靠「抽到没钱」这个条件是会停不下来的。
+        drainHardCap: 5000
     };
 
     /* 奖项分类元数据：决定明细列表的图标 / 名称 / 单位 */
@@ -91,6 +96,9 @@
     let roundStartDraws = 0;
     let sleepTimer = null;
     let sleepResolve = null;
+    // 距上次服务端校准过了多少抽，用来决定什么时候再校准一次
+    let drawsSinceCalibration = 0;
+    let calibrating = false;
 
     let settings = {
         interval: 7,
@@ -98,6 +106,8 @@
         viewMode: 'current',
         animation: true,
         detailOpen: 'none',
+        drainMode: false,
+        reserveBeans: 0,
         panelLeft: null,
         panelTop: null
     };
@@ -1106,16 +1116,6 @@
     color: #2d1f14;
 }
 
-/* ===== 底部 ===== */
-#lottery-control-panel .hh-footer {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-top: 8px;
-    color: #b09a84;
-    font-size: 8px;
-    font-weight: 500;
-}
 
 /* ===== 中奖弹窗 ===== */
 .hh-win-overlay {
@@ -1179,6 +1179,64 @@
     #lottery-control-panel .hh-anniversary {
         margin: -14px -14px 12px -14px;
     }
+}
+
+/* ===== 一抽到底 ===== */
+#lottery-control-panel .hh-drain {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: 8px;
+    padding: 7px 9px;
+    border-radius: 9px;
+    background: linear-gradient(135deg, #fff4e2, #ffe9cc);
+    border: 1px solid #f0cfa0;
+}
+#lottery-control-panel .hh-drain-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    font-weight: 700;
+    color: #8a5a20;
+    cursor: pointer;
+    user-select: none;
+}
+#lottery-control-panel .hh-drain-toggle input {
+    width: 13px;
+    height: 13px;
+    accent-color: #d4873a;
+    cursor: pointer;
+}
+#lottery-control-panel .hh-drain-reserve {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 10px;
+    color: #a08066;
+    font-weight: 600;
+}
+#lottery-control-panel .hh-drain-reserve input {
+    width: 74px;
+    padding: 3px 6px;
+    font-size: 11px;
+    font-weight: 700;
+    color: #5a4030;
+    border: 1px solid #e8d5bc;
+    border-radius: 6px;
+    background: #fffdf9;
+    text-align: right;
+}
+#lottery-control-panel .hh-drain-hint {
+    margin-top: 5px;
+    font-size: 9px;
+    line-height: 1.5;
+    color: #a08066;
+    display: none;
+}
+#lottery-control-panel .hh-drain-hint.is-on {
+    display: block;
 }
 
 /* ===== 大奖全屏庆祝 ===== */
@@ -1326,6 +1384,11 @@
                 <div class="hh-balance-card">
                     <div class="hh-label">💰 憨豆余额</div>
                     <div class="hh-balance-number" id="bean-balance">检测中...</div>
+                    <div class="hh-label" style="margin:4px 0 0;display:flex;align-items:center;gap:6px;">
+                        <span id="balance-freshness" style="color:#a08066;">已校准</span>
+                        <button id="refresh-balance" class="hh-small-btn"
+                                style="flex:0 0 auto;width:auto;padding:2px 7px;font-size:9px;">🔄</button>
+                    </div>
                     <div class="hh-label" style="margin:4px 0 0;">
                         单次消耗 <b id="single-cost" style="color:#d4873a;">2000</b> 憨豆
                     </div>
@@ -1387,6 +1450,21 @@
                         <label>🎯 最大抽奖次数</label>
                         <input type="number" id="max-lottery-count" value="10" min="1" max="1000">
                     </div>
+                </div>
+
+                <div class="hh-drain">
+                    <label class="hh-drain-toggle">
+                        <input type="checkbox" id="drain-mode">
+                        <span>🔥 一抽到底</span>
+                    </label>
+                    <div class="hh-drain-reserve">
+                        <span>保留</span>
+                        <input type="number" id="reserve-beans" value="0" min="0" step="1000">
+                        <span>憨豆</span>
+                    </div>
+                </div>
+                <div id="drain-hint" class="hh-drain-hint">
+                    勾选后忽略最大次数，一直抽到余额跌破保留线（上限 ${fmt(CONFIG.drainHardCap)} 抽）
                 </div>
 
                 <div style="display:flex;align-items:center;justify-content:space-between;margin-top:7px;">
@@ -1464,6 +1542,8 @@
                     <button id="reset-current-data" class="hh-small-btn">↻ 重置本次</button>
                     <button id="export-stats" class="hh-small-btn">📤 导出 CSV</button>
                     <button id="sync-official" class="hh-small-btn">☁ 同步官方记录</button>
+                    <button id="backup-stats" class="hh-small-btn">💾 备份 JSON</button>
+                    <button id="import-stats" class="hh-small-btn">📥 导入备份</button>
                     <button id="clear-total-data" class="hh-small-btn">🗑 清空历史</button>
                 </div>
             </div>
@@ -1490,11 +1570,6 @@
                 <div id="lottery-log" class="hh-log"></div>
             </div>
 
-            <!-- Footer -->
-            <div class="hh-footer">
-                <span>🎈 HHCLUB 4TH ANNIVERSARY</span>
-                <span>hhanclub.net</span>
-            </div>
         `;
 
         document.body.appendChild(panel);
@@ -1533,6 +1608,62 @@
         return beanBalance;
     }
 
+    /* 站点抽完不刷新余额，本地估算又会随时间漂移（比如你在别的标签页手点了几抽），
+       所以每隔若干抽回服务端要一次权威值。lucky.php 自己就带 .bean-number，
+       不用另找接口。 */
+    async function fetchServerBalance() {
+        try {
+            const response = await fetch(LOTTERY_PAGE, { credentials: 'include' });
+            if (!response.ok) return null;
+
+            const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
+            return firstNumber(doc.querySelector('.bean-number')?.textContent ?? '');
+        } catch (error) {
+            return null;
+        }
+    }
+
+    async function calibrateBalance({ quiet = false } = {}) {
+        if (calibrating) return false;
+        calibrating = true;
+        setText('balance-freshness', '校准中...');
+
+        try {
+            const value = await fetchServerBalance();
+            if (value === null) {
+                if (!quiet) addLog('⚠️ 余额校准失败，继续用本地估算', 'warning');
+                return false;
+            }
+
+            const drift = value - beanBalance;
+            beanBalance = value;
+            // domBalanceSeen 记的是「页面 DOM 上次显示的数」，不能写成服务端值：
+            // 站点从不更新 .bean-number，一旦两者不等，下一次 getBeanBalance()
+            // 就会把这里刚校准好的值当成过期数据冲掉。
+            drawsSinceCalibration = 0;
+            updateBalanceDisplay();
+
+            if (!quiet) {
+                addLog(Math.abs(drift) >= 1
+                    ? `🔄 余额已校准：${fmt(value)}（估算差 ${drift > 0 ? '+' : ''}${fmt(drift)}）`
+                    : `🔄 余额已校准：${fmt(value)}`, 'info');
+            }
+            return true;
+        } finally {
+            calibrating = false;
+            updateBalanceDisplay();
+        }
+    }
+
+    /* 抽完一次后更新估算：扣掉本次消耗，中的憨豆当场加回来
+       —— 奖池里 type 1001 就是憨豆，所以中奖是真的回血。 */
+    function applyDrawToBalance(prize) {
+        const won = prize.type === 'beans' ? prize.value : 0;
+        beanBalance = Math.max(0, beanBalance - singleCost + won);
+        drawsSinceCalibration++;
+        updateBalanceDisplay();
+    }
+
     function updateBalanceDisplay() {
         const balance = getBeanBalance();
         const cost = getSingleCost();
@@ -1540,6 +1671,12 @@
 
         setText('bean-balance', fmt(balance));
         setText('max-possible', fmt(maxPossible));
+
+        if (!calibrating) {
+            setText('balance-freshness', drawsSinceCalibration === 0
+                ? '已校准'
+                : `估算 · ${drawsSinceCalibration} 抽前校准`);
+        }
 
         const startButton = $('start-lottery');
         if (startButton && !running) {
@@ -1922,7 +2059,10 @@
 
     async function runSingleDraw(maxCount) {
         const roundCount = currentStats.draws - roundStartDraws;
-        addLog(`🎲 第 ${roundCount + 1}/${maxCount} 次抽奖`, 'info');
+        // 一抽到底没有「总共几次」可言，报余额比报硬上限有意义
+        addLog(settings.drainMode
+            ? `🎲 第 ${roundCount + 1} 次抽奖 · 余额 ${fmt(beanBalance)}`
+            : `🎲 第 ${roundCount + 1}/${maxCount} 次抽奖`, 'info');
 
         const result = await performLottery();
         if (!running) return;
@@ -1947,9 +2087,11 @@
 
             addLog(`🎉 抽中：${prizeText}${recordId ? ` · ID ${recordId}` : ''}`, 'success');
             recordDraw(prizeText);
+            applyDrawToBalance(parsePrizeText(prizeText));
 
-            beanBalance = Math.max(0, beanBalance - singleCost);
-            updateBalanceDisplay();
+            if (drawsSinceCalibration >= CONFIG.balanceSyncEveryDraws) {
+                await calibrateBalance({ quiet: true });
+            }
             return;
         }
 
@@ -1991,16 +2133,42 @@
         }
     }
 
+    /* 一抽到底：抽到「再抽一次就会跌破保留线」为止。
+       余额用的是本地估算，所以真要停之前先回服务端校准一次，
+       免得因为估算漂移多抽或少抽。 */
+    async function shouldStopForReserve() {
+        const reserve = Math.max(0, settings.reserveBeans);
+        if (beanBalance - singleCost >= reserve) return false;
+
+        // 估算说该停了，但可能是漂移造成的 —— 拿权威值再确认一遍
+        if (drawsSinceCalibration > 0) {
+            await calibrateBalance({ quiet: true });
+            if (beanBalance - singleCost >= reserve) return false;
+        }
+        return true;
+    }
+
     async function lotteryLoop(maxCount) {
         while (running) {
             const roundCount = currentStats.draws - roundStartDraws;
 
-            if (roundCount >= maxCount) {
+            if (settings.drainMode) {
+                if (await shouldStopForReserve()) {
+                    stopLottery(`🏁 一抽到底完成 · 保留 ${fmt(Math.max(0, settings.reserveBeans))} 憨豆`);
+                    return;
+                }
+                if (roundCount >= CONFIG.drainHardCap) {
+                    stopLottery(`🛑 已达一抽到底上限 ${fmt(CONFIG.drainHardCap)} 抽`);
+                    return;
+                }
+            } else if (roundCount >= maxCount) {
                 stopLottery('🎯 本轮达到最大抽奖次数');
                 return;
             }
 
-            await runSingleDraw(maxCount);
+            if (!running) return;
+
+            await runSingleDraw(settings.drainMode ? CONFIG.drainHardCap : maxCount);
             if (!running) return;
 
             await sleep(nextDelayMs());
@@ -2023,8 +2191,18 @@
         settings.maxCount = maxCount;
         saveSettings();
 
+        const reserve = Math.max(0, parseInt($('reserve-beans')?.value, 10) || 0);
+        if ($('reserve-beans')) $('reserve-beans').value = reserve;
+        settings.reserveBeans = reserve;
+        saveSettings();
+
         if (updateBalanceDisplay() <= 0) {
             addLog('💸 憨豆不足，无法开始抽奖', 'error');
+            return;
+        }
+
+        if (settings.drainMode && beanBalance - singleCost < reserve) {
+            addLog(`💸 余额已在保留线（${fmt(reserve)}）之下，无需抽奖`, 'warning');
             return;
         }
 
@@ -2038,7 +2216,7 @@
 
         const status = $('lottery-status');
         if (status) {
-            status.textContent = `运行中 · ${interval}s`;
+            status.textContent = settings.drainMode ? `一抽到底 · ${interval}s` : `运行中 · ${interval}s`;
             status.style.color = '#4d8a3a';
         }
 
@@ -2050,7 +2228,9 @@
         const stopButton = $('stop-lottery');
         if (stopButton) stopButton.disabled = false;
 
-        addLog(`🚀 开始抽奖 · ${maxCount} 次 · 间隔 ${interval} 秒`, 'success');
+        addLog(settings.drainMode
+            ? `🔥 一抽到底 · 保留 ${fmt(reserve)} 憨豆 · 间隔 ${interval} 秒`
+            : `🚀 开始抽奖 · ${maxCount} 次 · 间隔 ${interval} 秒`, 'success');
 
         lotteryLoop(maxCount);
     }
@@ -2263,18 +2443,117 @@
 
         // 带 BOM，Excel 打开中文不乱码
         const blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
-        const url = URL.createObjectURL(blob);
         const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+        downloadBlob(blob, `hhclub-lottery-${settings.viewMode}-${stamp}.csv`);
 
+        addLog(`📤 已导出${scope}明细`, 'success');
+    }
+
+    function downloadBlob(blob, filename) {
+        const url = URL.createObjectURL(blob);
         const link = document.createElement('a');
+
         link.href = url;
-        link.download = `hhclub-lottery-${settings.viewMode}-${stamp}.csv`;
+        link.download = filename;
         document.body.appendChild(link);
         link.click();
         link.remove();
         setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
 
-        addLog(`📤 已导出${scope}明细`, 'success');
+    /* 完整备份。和 CSV 不同：CSV 是给表格看的，这份是能原样导回来的。 */
+    function backupStats() {
+        const payload = {
+            kind: 'hhclub-lottery-backup',
+            version: 4,
+            exportedAt: new Date().toISOString(),
+            current: currentStats,
+            total: loadStats()
+        };
+
+        const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+        const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+
+        downloadBlob(blob, `hhclub-lottery-backup-${stamp}.json`);
+        addLog('💾 已导出备份', 'success');
+    }
+
+    /* 两份统计相加。导入时选「合并」走这里，两边结构同构所以能逐项累加。 */
+    function mergeStats(base, extra) {
+        const result = normalizeStats(base);
+        const other = normalizeStats(extra);
+
+        result.draws += other.draws;
+        result.cost += other.cost;
+        Object.keys(result.gains).forEach(key => {
+            result.gains[key] += other.gains[key] || 0;
+        });
+
+        Object.entries(other.prizes).forEach(([type, bucket]) => {
+            const target = ensureBucket(result, type);
+            target.count += bucket.count;
+            target.value += bucket.value;
+            Object.entries(bucket.tiers).forEach(([label, count]) => {
+                target.tiers[label] = (target.tiers[label] || 0) + count;
+            });
+        });
+
+        Object.entries(other.raw).forEach(([text, count]) => {
+            result.raw[text] = (result.raw[text] || 0) + count;
+        });
+
+        const firsts = [base?.firstAt, extra?.firstAt].filter(Boolean);
+        if (firsts.length) result.firstAt = Math.min(...firsts);
+        result.lastAt = Math.max(base?.lastAt || 0, extra?.lastAt || 0) || null;
+
+        return result;
+    }
+
+    function importStats() {
+        if (running) {
+            addLog('⚠️ 请先停止自动抽奖', 'warning');
+            return;
+        }
+
+        const picker = document.createElement('input');
+        picker.type = 'file';
+        picker.accept = 'application/json,.json';
+
+        picker.addEventListener('change', async () => {
+            const file = picker.files?.[0];
+            if (!file) return;
+
+            let payload;
+            try {
+                payload = JSON.parse(await file.text());
+            } catch (error) {
+                addLog('❌ 备份文件不是合法 JSON', 'error');
+                return;
+            }
+
+            // 备份文件和裸的统计对象都收
+            const incoming = payload?.total || payload?.current || payload;
+            if (!incoming || typeof incoming !== 'object' || incoming.draws === undefined) {
+                addLog('❌ 认不出这个文件的格式', 'error');
+                return;
+            }
+
+            const parsed = normalizeStats(incoming);
+            const replace = confirm(
+                `读到 ${fmt(parsed.draws)} 抽记录。\n\n` +
+                '确定 = 覆盖现有历史统计\n' +
+                '取消 = 与现有历史统计合并'
+            );
+
+            const merged = replace ? parsed : mergeStats(loadStats(), parsed);
+            saveStats(merged);
+            totalStats = merged;
+            render();
+
+            addLog(`📥 已${replace ? '覆盖' : '合并'}导入 · 历史共 ${fmt(merged.draws)} 抽`, 'success');
+        });
+
+        picker.click();
     }
 
     /* =========================================================
@@ -2417,6 +2696,23 @@
             saveSettings();
         });
 
+        on('refresh-balance', 'click', () => calibrateBalance());
+        on('backup-stats', 'click', backupStats);
+        on('import-stats', 'click', importStats);
+
+        on('drain-mode', 'change', event => {
+            settings.drainMode = event.target.checked;
+            saveSettings();
+            applyDrainUI();
+        });
+
+        on('reserve-beans', 'change', event => {
+            const value = Math.max(0, parseInt(event.target.value, 10) || 0);
+            event.target.value = value;
+            settings.reserveBeans = value;
+            saveSettings();
+        });
+
         on('reset-current-data', 'click', resetCurrentData);
         on('clear-total-data', 'click', clearTotalData);
         on('export-stats', 'click', exportStats);
@@ -2466,11 +2762,33 @@
         const viewSelect = $('view-mode');
         if (viewSelect) viewSelect.value = settings.viewMode;
 
+        const drainToggle = $('drain-mode');
+        if (drainToggle) drainToggle.checked = !!settings.drainMode;
+
+        const reserveInput = $('reserve-beans');
+        if (reserveInput) reserveInput.value = Math.max(0, settings.reserveBeans);
+
+        applyDrainUI();
+
         setText('toggle-animation', `🎉 中奖动画：${settings.animation ? '开' : '关'}`);
         setText('toggle-all-tiers', settings.detailOpen === 'all' ? '🔼 收起全部档位' : '🔽 展开全部档位');
 
         dynamicInterval = settings.interval * 1000;
         setCurrentIntervalDisplay();
+    }
+
+    /* 一抽到底开着时「最大抽奖次数」不起作用，置灰，免得以为设了有用 */
+    function applyDrainUI() {
+        const maxInput = $('max-lottery-count');
+        if (maxInput) {
+            maxInput.disabled = !!settings.drainMode;
+            maxInput.style.opacity = settings.drainMode ? '.45' : '';
+        }
+
+        const setMaxButton = $('set-max-possible');
+        if (setMaxButton) setMaxButton.disabled = !!settings.drainMode;
+
+        $('drain-hint')?.classList.toggle('is-on', !!settings.drainMode);
     }
 
     function init() {

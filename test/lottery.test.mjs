@@ -22,7 +22,7 @@ function check(name, cond, extra = '') {
     else { failed++; console.log(`  ✗ ${name} ${extra}`); }
 }
 
-function makeDom({ legacy = null, pool = null, useBean = '每次消耗 2,000 憨豆' } = {}) {
+function makeDom({ legacy = null, pool = null, useBean = '每次消耗 2,000 憨豆', balance = '1,234,567' } = {}) {
     // pool 传入时按抽奖页真实的内联脚本形状渲染一段 <script>，
     // 让脚本走和线上完全一样的奖池读取路径。
     const poolScript = pool
@@ -35,7 +35,7 @@ function makeDom({ legacy = null, pool = null, useBean = '每次消耗 2,000 憨
 
     const dom = new JSDOM(`<!doctype html><html><body>
         <div class="use-bean">${useBean}</div>
-        <div class="bean-number">1,234,567</div>
+        <div class="bean-number">${balance}</div>
         ${poolScript}
     </body></html>`, {
         url: 'https://hhanclub.net/lucky.php',
@@ -578,8 +578,9 @@ console.log('\n[12] 余额随抽奖本地扣减（站点不刷新 .bean-number�
     check('DOM 里的余额确实没被站点更新',
         d.querySelector('.bean-number').textContent === '1,234,567',
         d.querySelector('.bean-number').textContent);
-    check('面板余额已本地扣掉 3 × 2000',
-        d.getElementById('bean-balance').textContent === (1234567 - 6000).toLocaleString(),
+    // 每抽净变化 = 中的憨豆 − 单抽消耗。这一轮每次中 100 憨豆，所以是 −1,900/抽。
+    check('面板余额按「扣消耗 + 中奖回血」结算',
+        d.getElementById('bean-balance').textContent === (1234567 - 6000 + 300).toLocaleString(),
         d.getElementById('bean-balance').textContent);
     check('最多可抽随之减少到 614',
         d.getElementById('max-possible').textContent === '614',
@@ -698,6 +699,243 @@ console.log('\n[15] 关掉中奖动画后大奖也不弹');
     check('也仍然打了大奖日志',
         Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('大奖')),
         '未找到大奖日志');
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[16] 一抽到底');
+{
+    // 余额 20,000、单抽 2,000、保留 6,000，每次都中 100 憨豆（几乎不回血）
+    // → 大约抽到余额剩 6,000 出头就该停，而不是抽满「最大抽奖次数」10 次
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000', balance: '20000' });
+    const w = dom.window;
+
+    let calls = 0;
+    w.fetch = async url => {
+        // 余额校准会去拉 lucky.php，这里回一个不带 .bean-number 的空页面，
+        // 让脚本继续用本地估算，把一抽到底的停止条件单独测出来
+        if (String(url).includes('lucky.php')) {
+            return { ok: true, status: 200, text: async () => '<html><body></body></html>' };
+        }
+        calls++;
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ret: 0, data: { prize_text: '魔力 100 ' } })
+        };
+    };
+
+    await run(dom);
+    const d = w.document;
+
+    d.getElementById('drain-mode').checked = true;
+    d.getElementById('drain-mode').dispatchEvent(new w.Event('change'));
+
+    check('勾选后最大次数输入被置灰',
+        d.getElementById('max-lottery-count').disabled === true);
+    check('勾选后提示可见',
+        d.getElementById('drain-hint').classList.contains('is-on'));
+
+    d.getElementById('reserve-beans').value = '6000';
+    d.getElementById('reserve-beans').dispatchEvent(new w.Event('change'));
+    d.getElementById('lottery-interval').value = '3';
+    d.getElementById('max-lottery-count').value = '10';
+
+    d.getElementById('start-lottery').click();
+    check('状态栏显示一抽到底',
+        d.getElementById('lottery-status').textContent.includes('一抽到底'),
+        d.getElementById('lottery-status').textContent);
+
+    for (let i = 0; i < 40 && d.getElementById('lottery-status').textContent !== '已停止'; i++) {
+        await sleep(1000);
+    }
+
+    // 每抽净减 1,900，从 20,000 抽到「再抽一次就跌破 6,000」
+    // → 停在余额 7,650（再抽会剩 5,750 < 6,000），共 7 抽
+    check(`抽了 7 次而不是最大次数 10 次（实际 ${calls}）`, calls === 7, `实际 ${calls}`);
+    check('已停止', d.getElementById('lottery-status').textContent === '已停止');
+    check('停止原因是一抽到底完成',
+        Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('一抽到底完成')),
+        '未找到完成日志');
+    check('余额停在保留线之上',
+        Number(d.getElementById('bean-balance').textContent.replace(/,/g, '')) >= 6000,
+        d.getElementById('bean-balance').textContent);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[17] 余额随中奖回血（魔力就是憨豆）');
+{
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000', balance: '10000' });
+    const w = dom.window;
+    w.fetch = async url => {
+        if (String(url).includes('lucky.php')) {
+            return { ok: true, status: 200, text: async () => '<html><body></body></html>' };
+        }
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ret: 0, data: { prize_text: '魔力 5000 ' } })
+        };
+    };
+
+    await run(dom);
+    const d = w.document;
+    d.getElementById('lottery-interval').value = '3';
+    d.getElementById('max-lottery-count').value = '2';
+    d.getElementById('start-lottery').click();
+    await sleep(8000);
+
+    // 10,000 - 2×2,000 + 2×5,000 = 16,000
+    check('中的憨豆当场加回余额',
+        d.getElementById('bean-balance').textContent === '16,000',
+        d.getElementById('bean-balance').textContent);
+    check('校准状态显示是估算值',
+        d.getElementById('balance-freshness').textContent.includes('估算'),
+        d.getElementById('balance-freshness').textContent);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[18] 手动校准余额');
+{
+    const dom = makeDom({ useBean: '每次消耗憨豆： 2000', balance: '10000' });
+    const w = dom.window;
+    w.fetch = async url => {
+        if (String(url).includes('lucky.php')) {
+            // 服务端的权威值和本地估算不一样
+            return {
+                ok: true, status: 200,
+                text: async () => '<html><body><div class="bean-number">88888.0</div></body></html>'
+            };
+        }
+        return { ok: false, status: 500, text: async () => '' };
+    };
+
+    await run(dom);
+    const d = w.document;
+    check('初始读的是页面上的值',
+        d.getElementById('bean-balance').textContent === '10,000',
+        d.getElementById('bean-balance').textContent);
+
+    d.getElementById('refresh-balance').click();
+    await sleep(600);
+
+    check('校准后采用服务端值',
+        d.getElementById('bean-balance').textContent === '88,888',
+        d.getElementById('bean-balance').textContent);
+    check('校准后状态是已校准',
+        d.getElementById('balance-freshness').textContent === '已校准',
+        d.getElementById('balance-freshness').textContent);
+    check('最多可抽随之更新',
+        d.getElementById('max-possible').textContent === '44',
+        d.getElementById('max-possible').textContent);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[19] 备份导出与导入');
+{
+    const dom = makeDom();
+    const w = dom.window;
+
+    // jsdom 的 Blob 没有 .text()，包一层把写进去的内容截下来
+    const NativeBlob = w.Blob;
+    let blobParts = null, blobType = null;
+    w.Blob = function (parts, options) {
+        blobParts = parts;
+        blobType = options?.type;
+        return new NativeBlob(parts, options);
+    };
+    w.URL.createObjectURL = () => 'blob:stub';
+
+    const seed = {
+        version: 4, draws: 10, cost: 20000,
+        gains: { beans: 3000, magic: 0, invite: 1, rainbow: 0, vip: 0, makeup: 0, upload: 0 },
+        prizes: {
+            beans: { count: 9, value: 3000, tiers: { '500 憨豆': 9 } },
+            invite: { count: 1, value: 1, tiers: { '1 邀请': 1 } }
+        },
+        raw: { '魔力 500': 9 }
+    };
+    w.localStorage.setItem('hhanclub_lottery_stats_v4', JSON.stringify(seed));
+
+    await run(dom);
+    const d = w.document;
+
+    d.getElementById('backup-stats').click();
+    await sleep(80);
+
+    check('点备份产生了 JSON blob', blobType === 'application/json', String(blobType));
+    const payload = JSON.parse(blobParts[0]);
+    check('备份带识别标记', payload.kind === 'hhclub-lottery-backup', payload.kind);
+    check('备份含历史统计 10 抽', payload.total.draws === 10, payload.total.draws);
+    check('备份含分奖项明细', payload.total.prizes.beans.count === 9);
+
+    // 真正走一遍 importStats：拦下它 new 出来的 file input，塞个假文件再触发 change
+    const backupJson = blobParts[0];
+    const nativeCreate = d.createElement.bind(d);
+    let picker = null;
+    d.createElement = tag => {
+        const el = nativeCreate(tag);
+        if (tag === 'input') picker = el;
+        return el;
+    };
+
+    const feed = async (json, replace) => {
+        picker = null;
+        w.confirm = () => replace;
+        d.getElementById('import-stats').click();
+        Object.defineProperty(picker, 'files', {
+            configurable: true,
+            get: () => [{ name: 'backup.json', text: async () => json }]
+        });
+        picker.dispatchEvent(new w.Event('change'));
+        await sleep(200);
+    };
+
+    // 取消 = 合并：把同一份备份再叠加一次
+    await feed(backupJson, false);
+    let stored = JSON.parse(w.localStorage.getItem('hhanclub_lottery_stats_v4'));
+    check('合并导入：抽数相加为 20', stored.draws === 20, stored.draws);
+    check('合并导入：消耗相加为 40,000', stored.cost === 40000, stored.cost);
+    check('合并导入：档位次数相加为 18',
+        stored.prizes.beans.tiers['500 憨豆'] === 18, stored.prizes.beans.tiers['500 憨豆']);
+    check('合并导入：兜底文案相加为 18', stored.raw['魔力 500'] === 18, stored.raw['魔力 500']);
+
+    d.getElementById('view-mode').value = 'total';
+    d.getElementById('view-mode').dispatchEvent(new w.Event('change'));
+    await sleep(50);
+    check('合并后面板同步刷新',
+        d.getElementById('draw-count').textContent === '20',
+        d.getElementById('draw-count').textContent);
+
+    // 确定 = 覆盖：回到备份里的 10 抽
+    await feed(backupJson, true);
+    stored = JSON.parse(w.localStorage.getItem('hhanclub_lottery_stats_v4'));
+    check('覆盖导入：抽数回到 10', stored.draws === 10, stored.draws);
+    check('覆盖导入：档位次数回到 9',
+        stored.prizes.beans.tiers['500 憨豆'] === 9, stored.prizes.beans.tiers['500 憨豆']);
+
+    // 垃圾文件不能把已有数据搞坏
+    await feed('{ not json', false);
+    stored = JSON.parse(w.localStorage.getItem('hhanclub_lottery_stats_v4'));
+    check('非法 JSON 被拒绝且不动已有数据', stored.draws === 10, stored.draws);
+    check('非法 JSON 打了错误日志',
+        Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('不是合法 JSON')),
+        '未找到错误日志');
+
+    await feed(JSON.stringify({ hello: 'world' }), false);
+    stored = JSON.parse(w.localStorage.getItem('hhanclub_lottery_stats_v4'));
+    check('认不出的结构被拒绝', stored.draws === 10, stored.draws);
+
+    d.createElement = nativeCreate;
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[20] 面板底部横幅已移除');
+{
+    const dom = makeDom();
+    await run(dom);
+    const d = dom.window.document;
+
+    check('没有 .hh-footer 节点', !d.querySelector('#lottery-control-panel .hh-footer'));
+    check('面板里不再出现 4TH ANNIVERSARY 底栏文案',
+        !d.getElementById('lottery-control-panel').textContent.includes('HHCLUB 4TH ANNIVERSARY'));
 }
 
 /* ---------------------------------------------------------------- */
