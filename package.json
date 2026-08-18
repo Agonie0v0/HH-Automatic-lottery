@@ -1,7 +1,7 @@
 {
   "name": "hhclub-auto-lottery",
-  "version": "1.1.0",
-  "description": "HHCLUB 自动抽奖 · 庆典版 —— 带分奖项中奖次数统计的油猴脚本",
+  "version": "1.2.0",
+  "description": "HHCLUB 自动抽奖 · 情绪价值拉满版 —— 分奖项统计 / 官方爆率对比 / 官方记录同步的油猴脚本",
   "private": true,
   "type": "module",
   "scripts": {

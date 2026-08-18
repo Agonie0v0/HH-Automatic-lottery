@@ -1,11 +1,13 @@
 // ==UserScript==
-// @name         HHCLUB 自动抽奖 · 庆典版
+// @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.1.0
-// @description  HHCLUB 自动抽奖增强版 · 周年宝可梦庆典主题 Dashboard · 分奖项中奖次数统计
-// @author       Timi
+// @version      1.2.0
+// @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 官方爆率对比 · 官方记录同步
+// @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
 // @grant        none
+// @homepageURL  https://github.com/SAGIRIxr/HH-Automatic-lottery
+// @supportURL   https://github.com/SAGIRIxr/HH-Automatic-lottery/issues
 // @run-at       document-idle
 // @license      MIT
 // ==/UserScript==
@@ -20,6 +22,7 @@
     const SITE_ORIGIN = 'https://hhanclub.net';
     const LOTTERY_PAGE = `${SITE_ORIGIN}/lucky.php`;
     const LOTTERY_API = `${SITE_ORIGIN}/plugin/lucky-draw`;
+    const RECORDS_API = `${SITE_ORIGIN}/plugin/lucky-draw/winning-records`;
 
     const STATS_KEY = 'hhanclub_lottery_stats_v4';
     const LEGACY_STATS_KEY = 'hhanclub_lottery_stats_v3';
@@ -40,30 +43,50 @@
         // 连续被限流多少次后放弃，避免退避到上限后一直空转
         maxRateLimitRetries: 12,
         // 日志保留条数
-        logLimit: 50
+        logLimit: 50,
+        // 官方爆率低于这个值的奖品算大奖，走全屏庆祝。
+        // 现奖池里够格的是 VIP（0.02%）和 780,000 憨豆（0.11%），
+        // 邀请（0.38%）刚好不算 —— 大奖太廉价就不叫大奖了。
+        jackpotMaxRate: 0.002,
+        // 读不到奖池时的兜底判定：VIP，或单笔十万以上的憨豆
+        jackpotBeansFloor: 100000,
+        // 同步官方记录时每页拉多少条，以及两页之间歇多久
+        syncPageSize: 200,
+        syncPageDelay: 300,
+        // 安全上限，防止接口异常时无限翻页
+        syncMaxPages: 200
     };
 
     /* 奖项分类元数据：决定明细列表的图标 / 名称 / 单位 */
+    /* 站点奖池里 type 1001 的 typeText 写作「魔力」，但它的图标是 bean_icon，
+       消耗侧也叫憨豆 —— 那就是同一种货币，NexusPHP 的默认叫法没改干净。
+       所以魔力一律归到 beans。magic 只为兼容早期版本存下来的数据保留。 */
     const PRIZE_META = {
         beans: { name: '憨豆', icon: '💰', unit: '' },
-        magic: { name: '魔力值', icon: '🔮', unit: '' },
+        magic: { name: '憨豆（旧魔力）', icon: '💰', unit: '' },
         invite: { name: '邀请', icon: '📧', unit: '' },
         rainbow: { name: '彩虹ID', icon: '🌈', unit: '天' },
         vip: { name: 'VIP', icon: '⭐', unit: '天' },
         makeup: { name: '补签卡', icon: '🎫', unit: '个' },
         upload: { name: '上传量', icon: '⬆️', unit: 'GB' },
+        rename: { name: '改名卡', icon: '📛', unit: '张' },
         unknown: { name: '其他奖品', icon: '🎁', unit: '' }
     };
 
-    const PRIZE_ORDER = ['beans', 'magic', 'invite', 'rainbow', 'vip', 'makeup', 'upload', 'unknown'];
+    const PRIZE_ORDER = ['beans', 'magic', 'invite', 'rainbow', 'vip', 'makeup', 'upload', 'rename', 'unknown'];
 
     /* =========================================================
        运行时状态
     ========================================================= */
 
     let singleCost = 2000;
+    let beanBalance = 0;
+    let domBalanceSeen = null;
     let running = false;
-    let consecutiveErrors = 0;
+    // 限流和接口错误分开计数：以前共用一个计数器，几次限流叠上一两次网络抖动
+    // 就会凑够 maxConsecutiveErrors 被误判成接口异常而提前停机。
+    let errorStreak = 0;
+    let rateLimitStreak = 0;
     let dynamicInterval = 7000;
     let roundStartDraws = 0;
     let sleepTimer = null;
@@ -172,7 +195,7 @@
             version: 4,
             draws: 0,
             cost: 0,
-            gains: { beans: 0, magic: 0, invite: 0, rainbow: 0, vip: 0, makeup: 0, upload: 0 },
+            gains: { beans: 0, magic: 0, invite: 0, rainbow: 0, vip: 0, makeup: 0, upload: 0, rename: 0 },
             prizes: {},
             raw: {},
             firstAt: null,
@@ -188,17 +211,24 @@
         stats.cost = Number(data.cost) || 0;
         stats.firstAt = data.firstAt || null;
         stats.lastAt = data.lastAt || null;
+        if (data.syncedAt) stats.syncedAt = data.syncedAt;
 
         Object.keys(stats.gains).forEach(key => {
             stats.gains[key] = Number(data.gains?.[key]) || 0;
         });
+        stats.gains.beans += Number(data.gains?.magic) || 0;
+        stats.gains.magic = 0;
 
+        // 早期版本把魔力当成独立奖项存过，这里合回 beans，
+        // 免得同一种憨豆在明细里split成两行、盈亏还少算一半。
         Object.entries(data.prizes || {}).forEach(([type, bucket]) => {
-            stats.prizes[type] = {
-                count: Number(bucket?.count) || 0,
-                value: Number(bucket?.value) || 0,
-                tiers: { ...(bucket?.tiers || {}) }
-            };
+            const target = type === 'magic' ? 'beans' : type;
+            const merged = ensureBucket(stats, target);
+            merged.count += Number(bucket?.count) || 0;
+            merged.value += Number(bucket?.value) || 0;
+            Object.entries(bucket?.tiers || {}).forEach(([label, count]) => {
+                merged.tiers[label] = (merged.tiers[label] || 0) + (Number(count) || 0);
+            });
         });
 
         stats.raw = { ...(data.raw || {}) };
@@ -298,6 +328,17 @@
         } catch (error) {
             console.error('HHCLUB 读取设置失败:', error);
         }
+
+        // 存下来的值可能来自旧版本、别的合法区间，或者被手改过。
+        // 不在这里收敛的话，输入框会显示一个和实际生效值不一样的数字。
+        settings.interval = Math.min(
+            CONFIG.maxInterval,
+            Math.max(CONFIG.minInterval, parseInt(settings.interval, 10) || 7)
+        );
+        settings.maxCount = Math.max(1, parseInt(settings.maxCount, 10) || 10);
+        if (settings.viewMode !== 'total') settings.viewMode = 'current';
+        if (settings.detailOpen !== 'all') settings.detailOpen = 'none';
+        settings.animation = settings.animation !== false;
     }
 
     function saveSettings() {
@@ -323,13 +364,14 @@
         if (!compact) return fallback;
 
         const rules = [
-            { type: 'magic', test: t => t.includes('魔力') },
-            { type: 'beans', test: t => t.includes('憨豆') },
+            // 「魔力 5000」和「5000 憨豆」是同一件事
+            { type: 'beans', test: t => t.includes('魔力') || t.includes('憨豆') },
             { type: 'invite', test: t => t.includes('邀请') },
             { type: 'rainbow', test: t => t.includes('彩虹') },
             { type: 'vip', test: t => /VIP/i.test(t) },
             { type: 'makeup', test: t => t.includes('补签') },
-            { type: 'upload', test: t => t.includes('上传') }
+            { type: 'upload', test: t => t.includes('上传') },
+            { type: 'rename', test: t => t.includes('改名') }
         ];
 
         for (const rule of rules) {
@@ -365,36 +407,132 @@
     }
 
     /* =========================================================
+       奖池与官方爆率
+
+       抽奖页的内联脚本里带着完整奖池，且站点自己算好了 probability_real
+       （小数形式，11 项相加 ≈ 1）。读出来就能把实测爆率和官方公布值并排比，
+       不用自己拿样本去猜理论值。读不到时全部功能降级，不影响抽奖。
+    ========================================================= */
+
+    let prizePool = null;
+
+    function readPrizePool() {
+        if (prizePool) return prizePool;
+        prizePool = [];
+
+        let raw = null;
+        for (const script of document.querySelectorAll('script:not([src])')) {
+            const match = script.textContent.match(/\blet\s+prizes\s*=\s*(\[[\s\S]*?\])\s*;/);
+            if (match) {
+                raw = match[1];
+                break;
+            }
+        }
+        if (!raw) return prizePool;
+
+        let list;
+        try {
+            list = JSON.parse(raw);
+        } catch (error) {
+            return prizePool;
+        }
+        if (!Array.isArray(list)) return prizePool;
+
+        // 奖池文案拼法和接口返回的 prize_text 一致（typeText + ' ' + amountText），
+        // 所以档位 label 天然对得上，可以直接按 label 匹配。
+        prizePool = list.map(item => {
+            const prize = parsePrizeText(`${item.typeText || ''} ${item.amountText || ''}`);
+            return {
+                type: prize.type,
+                label: prize.label,
+                value: prize.value,
+                probability: Number(item.probability_real) || 0
+            };
+        });
+        return prizePool;
+    }
+
+    /* 官方爆率查表：按类别汇总一份，按具体档位汇总一份 */
+    function officialRates() {
+        const byType = {};
+        const byTier = {};
+
+        readPrizePool().forEach(item => {
+            byType[item.type] = (byType[item.type] || 0) + item.probability;
+            const key = `${item.type}|${item.label}`;
+            byTier[key] = (byTier[key] || 0) + item.probability;
+        });
+
+        return { byType, byTier };
+    }
+
+    /* 这一注算不算大奖。优先用站点公布的爆率判定，读不到奖池时退回硬规则。 */
+    function isJackpot(prize) {
+        const pool = readPrizePool();
+        const hit = pool.find(item => item.type === prize.type && item.label === prize.label);
+
+        if (hit) return hit.probability > 0 && hit.probability <= CONFIG.jackpotMaxRate;
+
+        return prize.type === 'vip'
+            || (prize.type === 'beans' && prize.value >= CONFIG.jackpotBeansFloor);
+    }
+
+    /* 每抽的理论期望产出，用来和实测效率对比 */
+    function poolExpectation() {
+        const gains = {};
+        readPrizePool().forEach(item => {
+            if (item.type === 'unknown') return;
+            gains[item.type] = (gains[item.type] || 0) + item.value * item.probability;
+        });
+        return gains;
+    }
+
+    /* =========================================================
        记录一次抽奖
 
        抽奖次数、消耗、分奖项统计一次性写入，
        避免以前 updatePrizeStats / updateCostStats 分两步导致的中间态不一致。
     ========================================================= */
 
+    /* 把一次中奖累加进 stats。本地抽奖和同步官方记录都走这里，
+       保证两条路径算出来的结构完全一致。 */
+    function applyPrize(stats, prizeText, cost, prize) {
+        const parsed = prize || parsePrizeText(prizeText);
+
+        stats.draws += 1;
+        stats.cost += cost;
+
+        if (parsed.type !== 'unknown') {
+            stats.gains[parsed.type] = (stats.gains[parsed.type] || 0) + parsed.value;
+        }
+
+        const bucket = ensureBucket(stats, parsed.type);
+        bucket.count += 1;
+        bucket.value += parsed.value;
+        bucket.tiers[parsed.label] = (bucket.tiers[parsed.label] || 0) + 1;
+
+        // 接口返回的文案常带尾随空格，同步记录那边又 trim 过，
+        // 不统一的话同一个奖会在兜底表里留下两条 key
+        const rawKey = String(prizeText).trim();
+        stats.raw[rawKey] = (stats.raw[rawKey] || 0) + 1;
+    }
+
     function recordDraw(prizeText) {
         const prize = parsePrizeText(prizeText);
 
-        const apply = stats => {
-            stats.draws += 1;
-            stats.cost += singleCost;
-
-            if (prize.type !== 'unknown') {
-                stats.gains[prize.type] = (stats.gains[prize.type] || 0) + prize.value;
-            }
-
-            const bucket = ensureBucket(stats, prize.type);
-            bucket.count += 1;
-            bucket.value += prize.value;
-            bucket.tiers[prize.label] = (bucket.tiers[prize.label] || 0) + 1;
-
-            stats.raw[prizeText] = (stats.raw[prizeText] || 0) + 1;
-        };
+        const apply = stats => applyPrize(stats, prizeText, singleCost, prize);
 
         apply(currentStats);
         commitTotal(apply);
 
         render();
-        if (settings.animation) showWinAnimation(prizeText);
+
+        const jackpot = isJackpot(prize);
+        if (jackpot) addLog(`👑 大奖！${prizeText}`, 'success');
+        if (settings.animation) {
+            if (jackpot) showJackpotAnimation(prizeText);
+            else showWinAnimation(prizeText);
+        }
     }
 
     /* =========================================================
@@ -877,12 +1015,32 @@
     transition: transform .15s ease;
 }
 #lottery-control-panel .hh-row.is-open .hh-row-caret { transform: rotate(90deg); }
+#lottery-control-panel .hh-row-official {
+    flex-shrink: 0;
+    width: 46px;
+    text-align: right;
+    font-size: 9px;
+    font-weight: 500;
+    color: #b09a84;
+    white-space: nowrap;
+}
 #lottery-control-panel .hh-row-bar {
+    position: relative;
     height: 4px;
     margin-top: 5px;
     border-radius: 3px;
     background: #ece0d2;
     overflow: hidden;
+}
+/* 官方爆率刻度线，和实测填充条比长短 */
+#lottery-control-panel .hh-row-bar-mark {
+    position: absolute;
+    top: -1px;
+    width: 2px;
+    height: 6px;
+    border-radius: 1px;
+    background: #6a5240;
+    opacity: .55;
 }
 #lottery-control-panel .hh-row-bar-fill {
     height: 100%;
@@ -913,8 +1071,17 @@
     color: #6a5240;
 }
 #lottery-control-panel .hh-tier-name {
+    flex: 1;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
+    white-space: nowrap;
+}
+#lottery-control-panel .hh-tier-rate {
+    flex-shrink: 0;
+    font-size: 9px;
+    font-weight: 500;
+    color: #b09a84;
     white-space: nowrap;
 }
 #lottery-control-panel .hh-tier-count {
@@ -1014,6 +1181,87 @@
     }
 }
 
+/* ===== 大奖全屏庆祝 ===== */
+.hh-jackpot-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 2147483647;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+    background: radial-gradient(ellipse at center, rgba(70, 40, 10, .55) 0%, rgba(10, 6, 2, .82) 70%);
+    animation: hhJackpotFade .45s ease-out;
+}
+.hh-jackpot-overlay.is-out {
+    animation: hhJackpotFade .5s ease-in reverse forwards;
+}
+/* 背后缓慢旋转的金色光芒 */
+.hh-jackpot-rays {
+    position: absolute;
+    width: 150vmax;
+    height: 150vmax;
+    background: repeating-conic-gradient(
+        from 0deg,
+        rgba(255, 214, 110, .20) 0deg 7deg,
+        transparent 7deg 14deg
+    );
+    animation: hhJackpotSpin 9s linear infinite;
+}
+.hh-jackpot-card {
+    position: relative;
+    text-align: center;
+    padding: 0 24px;
+    animation: hhJackpotPop .7s cubic-bezier(.2, 1.5, .4, 1);
+}
+.hh-jackpot-kicker {
+    font-size: clamp(14px, 3.4vw, 22px);
+    font-weight: 800;
+    letter-spacing: .5em;
+    text-indent: .5em;
+    color: #ffe9a8;
+    text-shadow: 0 0 18px rgba(255, 190, 60, .9);
+}
+.hh-jackpot-prize {
+    margin: 10px 0 8px;
+    font-size: clamp(30px, 8vw, 68px);
+    font-weight: 900;
+    line-height: 1.15;
+    background: linear-gradient(180deg, #fff6d0 0%, #ffd166 45%, #f0a12e 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    filter: drop-shadow(0 4px 18px rgba(255, 160, 30, .75));
+}
+.hh-jackpot-sub {
+    font-size: clamp(11px, 2.4vw, 15px);
+    font-weight: 600;
+    color: rgba(255, 233, 180, .8);
+}
+.hh-firework {
+    position: fixed;
+    z-index: 2147483647;
+    pointer-events: none;
+    animation: hhFirework 2.6s cubic-bezier(.15, .7, .3, 1) forwards;
+}
+@keyframes hhJackpotFade {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+}
+@keyframes hhJackpotSpin {
+    to { transform: rotate(360deg); }
+}
+@keyframes hhJackpotPop {
+    0%   { transform: scale(.4) rotate(-6deg); opacity: 0; }
+    60%  { transform: scale(1.08) rotate(1.5deg); opacity: 1; }
+    100% { transform: scale(1) rotate(0); opacity: 1; }
+}
+@keyframes hhFirework {
+    0%   { transform: translate(0, 0) rotate(0); opacity: 1; }
+    70%  { opacity: 1; }
+    100% { transform: translate(var(--tx), var(--ty)) rotate(var(--rot)); opacity: 0; }
+}
+
 /* ===== 降低动画偏好 ===== */
 @media (prefers-reduced-motion: reduce) {
     #lottery-control-panel,
@@ -1021,6 +1269,11 @@
     #lottery-control-panel .hh-dot {
         animation: none;
     }
+    /* 大奖仍然给看，只是不转不飞 */
+    .hh-jackpot-overlay,
+    .hh-jackpot-card { animation: none; }
+    .hh-jackpot-rays { display: none; }
+    .hh-firework { display: none; }
 }
         `;
         document.head.appendChild(style);
@@ -1108,11 +1361,11 @@
             <!-- Profit -->
             <div class="hh-profit">
                 <div>
-                    <div class="hh-profit-left">🍰 憨豆盈亏</div>
+                    <div class="hh-profit-left" id="profit-label">🍰 憨豆盈亏</div>
                     <div class="hh-profit-value" id="profit-loss">-</div>
                 </div>
                 <div style="text-align:right;">
-                    <div class="hh-profit-left">盈亏率</div>
+                    <div class="hh-profit-left" id="profit-rate-label">盈亏率</div>
                     <div class="hh-profit-rate" id="profit-rate">-</div>
                 </div>
             </div>
@@ -1202,14 +1455,15 @@
                         <div class="hh-prize-value" id="total-upload">0GB</div>
                     </div>
                     <div class="hh-prize">
-                        <div class="hh-prize-name">🔮 魔力值</div>
-                        <div class="hh-prize-value" id="total-magic">0</div>
+                        <div class="hh-prize-name">🎯 理论盈亏率</div>
+                        <div class="hh-prize-value" id="theory-rate">-</div>
                     </div>
                 </div>
 
                 <div class="hh-small-actions">
                     <button id="reset-current-data" class="hh-small-btn">↻ 重置本次</button>
                     <button id="export-stats" class="hh-small-btn">📤 导出 CSV</button>
+                    <button id="sync-official" class="hh-small-btn">☁ 同步官方记录</button>
                     <button id="clear-total-data" class="hh-small-btn">🗑 清空历史</button>
                 </div>
             </div>
@@ -1263,12 +1517,20 @@
         return singleCost;
     }
 
+    /* 站点的 lottery() 抽完只转转盘、弹窗，从不刷新 .bean-number，
+       所以自动抽奖期间那个元素一直是进页面时的旧值 —— 面板上的余额和
+       「最多可抽」会一路冻结。这里改成：DOM 值自己变了（刷新页面、站点
+       以后加了更新）才采信，其余时间用每抽扣一次的本地估算值。 */
     function getBeanBalance() {
         const element = document.querySelector('.bean-number');
-        if (!element) return 0;
+        const domValue = element ? firstNumber(element.textContent) : null;
 
-        const value = firstNumber(element.textContent);
-        return value === null ? 0 : value;
+        if (domValue !== null && domValue !== domBalanceSeen) {
+            domBalanceSeen = domValue;
+            beanBalance = domValue;
+        }
+
+        return beanBalance;
     }
 
     function updateBalanceDisplay() {
@@ -1338,33 +1600,54 @@
         setText('total-vip-days', `${fmt(stats.gains.vip)}天`);
         setText('total-makeup-cards', fmt(stats.gains.makeup));
         setText('total-upload', `${fmt(stats.gains.upload)}GB`);
-        setText('total-magic', fmt(stats.gains.magic));
 
         renderProfit(stats);
         renderPrizeDetail(stats);
     }
 
+    /* 憨豆盈亏。奖池里 type 1001 就是憨豆，所以这个数字是实打实的：
+       按官方爆率算，每抽期望产出 2,312 憨豆、消耗 2,000，理论盈亏率 +15.6%，
+       转盘本身是正期望的。副标题把实测盈亏率和这个理论值放一起比。 */
     function renderProfit(stats) {
-        const profit = stats.gains.beans - stats.cost;
         const tone = value => (value > 0 ? '#4d8a3a' : value < 0 ? '#d94a44' : '#a08066');
 
+        const profit = stats.gains.beans - stats.cost;
         const profitElement = $('profit-loss');
+
         if (profitElement) {
             profitElement.textContent = (profit > 0 ? '+' : '') + fmt(profit);
             profitElement.style.color = tone(profit);
         }
 
+        const baseline = theoreticalProfitRate();
+        setText('theory-rate', baseline === null
+            ? '-'
+            : `${baseline > 0 ? '+' : ''}${baseline.toFixed(1)}%`);
+
         const rateElement = $('profit-rate');
-        if (rateElement) {
-            if (stats.cost > 0) {
-                const rate = (profit / stats.cost) * 100;
-                rateElement.textContent = `${rate > 0 ? '+' : ''}${rate.toFixed(1)}%`;
-                rateElement.style.color = tone(rate);
-            } else {
-                rateElement.textContent = '-';
-                rateElement.style.color = '#a08066';
-            }
+        if (!rateElement) return;
+
+        if (stats.cost <= 0) {
+            rateElement.textContent = '-';
+            rateElement.style.color = '#a08066';
+            rateElement.title = '';
+            return;
         }
+
+        const rate = (profit / stats.cost) * 100;
+        rateElement.textContent = `${rate > 0 ? '+' : ''}${rate.toFixed(1)}%`;
+        rateElement.style.color = tone(rate);
+
+        rateElement.title = baseline === null
+            ? ''
+            : `理论盈亏率 ${baseline > 0 ? '+' : ''}${baseline.toFixed(1)}%（按官方爆率）`;
+    }
+
+    /* 按官方爆率算出来的期望盈亏率，读不到奖池时返回 null */
+    function theoreticalProfitRate() {
+        const expected = poolExpectation().beans;
+        if (!expected || singleCost <= 0) return null;
+        return ((expected - singleCost) / singleCost) * 100;
     }
 
     /* 分奖项明细：一级按类别聚合，二级展开具体档位 */
@@ -1377,6 +1660,7 @@
             .sort((a, b) => b[1].count - a[1].count || PRIZE_ORDER.indexOf(a[0]) - PRIZE_ORDER.indexOf(b[0]));
 
         const totalCount = rows.reduce((sum, [, bucket]) => sum + bucket.count, 0);
+        const official = officialRates();
 
         setText('detail-summary', `共 ${fmt(totalCount)} 抽 · ${rows.length} 种`);
 
@@ -1408,17 +1692,33 @@
 
             const tiers = Object.entries(bucket.tiers)
                 .sort((a, b) => b[1] - a[1])
-                .map(([label, count]) => `
+                .map(([label, count]) => {
+                    const tierOfficial = official.byTier[`${type}|${label}`];
+                    const rateLine = tierOfficial === undefined
+                        ? ''
+                        : `<span class="hh-tier-rate">实测 ${((count / totalCount) * 100).toFixed(2)}% · 官方 ${(tierOfficial * 100).toFixed(2)}%</span>`;
+                    return `
                     <div class="hh-tier">
                         <span class="hh-tier-name">${escapeHtml(label)}</span>
+                        ${rateLine}
                         <span class="hh-tier-count">${fmt(count)} 次</span>
                     </div>
-                `)
+                `;
+                })
                 .join('');
 
             const sumLine = bucket.value > 0
                 ? `<div class="hh-row-sum">累计 ${fmt(bucket.value)}${meta.unit ? ' ' + meta.unit : ''}</div>`
                 : '';
+
+            // 官方爆率读不到时（页面结构变了 / 非抽奖页）整块降级，只显示实测
+            const typeOfficial = official.byType[type];
+            const officialCell = typeOfficial === undefined
+                ? ''
+                : `<span class="hh-row-official">官方 ${(typeOfficial * 100).toFixed(1)}%</span>`;
+            const officialMark = typeOfficial === undefined
+                ? ''
+                : `<div class="hh-row-bar-mark" style="left:calc(${Math.min(100, typeOfficial * 100).toFixed(1)}% - 1px)" title="官方爆率 ${(typeOfficial * 100).toFixed(2)}%"></div>`;
 
             row.innerHTML = `
                 <div class="hh-row-head">
@@ -1427,9 +1727,11 @@
                     <span class="hh-row-name">${escapeHtml(meta.name)}</span>
                     <span class="hh-row-count">${fmt(bucket.count)} 次</span>
                     <span class="hh-row-pct">${percentage}%</span>
+                    ${officialCell}
                 </div>
                 <div class="hh-row-bar">
                     <div class="hh-row-bar-fill" style="width:${percentage}%"></div>
+                    ${officialMark}
                 </div>
                 ${sumLine}
                 <div class="hh-tiers">${tiers}</div>
@@ -1448,6 +1750,9 @@
     ========================================================= */
 
     function showWinAnimation(prizeText) {
+        // 切到别的标签页时没人看，省掉每次 20+ 个粒子节点的创建与回收
+        if (document.hidden) return;
+
         const old = document.querySelector('.hh-win-overlay');
         if (old) old.remove();
 
@@ -1462,6 +1767,66 @@
         createConfetti();
 
         setTimeout(() => popup.remove(), 2000);
+    }
+
+    /* 大奖专用全屏庆祝：整屏压暗 + 金色光爆 + 奖品名放大登场 + 双向礼花。
+       和普通中奖动画一样受「中奖动画」开关和 document.hidden 控制，
+       prefers-reduced-motion 下由 CSS 收敛成静态显示。 */
+    function showJackpotAnimation(prizeText) {
+        if (document.hidden) return;
+
+        document.querySelectorAll('.hh-jackpot-overlay').forEach(node => node.remove());
+
+        const overlay = document.createElement('div');
+        overlay.className = 'hh-jackpot-overlay';
+        overlay.innerHTML = `
+            <div class="hh-jackpot-rays"></div>
+            <div class="hh-jackpot-card">
+                <div class="hh-jackpot-kicker">✨ 大 奖 ✨</div>
+                <div class="hh-jackpot-prize">${escapeHtml(prizeText)}</div>
+                <div class="hh-jackpot-sub">这一注值得截图</div>
+            </div>
+        `;
+
+        document.body.appendChild(overlay);
+        createFireworks();
+
+        setTimeout(() => overlay.classList.add('is-out'), 3200);
+        setTimeout(() => overlay.remove(), 3800);
+    }
+
+    /* 从屏幕左右下角各打一束，比普通粒子更密、更慢、带重力感 */
+    function createFireworks() {
+        const symbols = ['🎆', '🎇', '⭐', '✨', '🌟', '💰', '👑', '🎉'];
+        const origins = [
+            { x: 0.12, y: 0.92 },
+            { x: 0.88, y: 0.92 },
+            { x: 0.5, y: 0.15 }
+        ];
+
+        origins.forEach((origin, index) => {
+            for (let i = 0; i < 26; i++) {
+                const item = document.createElement('div');
+                item.className = 'hh-firework';
+                item.textContent = symbols[Math.floor(Math.random() * symbols.length)];
+
+                const angle = Math.random() * Math.PI * 2;
+                const distance = 180 + Math.random() * 420;
+
+                item.style.cssText = `
+                    left: ${window.innerWidth * origin.x}px;
+                    top: ${window.innerHeight * origin.y}px;
+                    font-size: ${14 + Math.random() * 16}px;
+                    --tx: ${Math.cos(angle) * distance}px;
+                    --ty: ${Math.sin(angle) * distance - 120}px;
+                    --rot: ${(Math.random() - .5) * 1080}deg;
+                    animation-delay: ${index * .18 + Math.random() * .3}s;
+                `;
+
+                document.body.appendChild(item);
+                setTimeout(() => item.remove(), 3600);
+            }
+        });
     }
 
     function createConfetti() {
@@ -1504,8 +1869,12 @@
                     'accept': '*/*',
                     'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
                     'referer': LOTTERY_PAGE,
-                    'x-requested-with': 'XMLHttpRequest'
-                }
+                    'x-requested-with': 'XMLHttpRequest',
+                    // 站点自己用的是 jQuery.post，带 form 类型的 Content-Type，
+                    // 这里对齐，免得请求特征和正常点击不一样
+                    'content-type': 'application/x-www-form-urlencoded; charset=UTF-8'
+                },
+                body: ''
             });
 
             const resultText = await response.text();
@@ -1559,16 +1928,17 @@
         if (!running) return;
 
         if (!result.success || !result.parsed) {
-            consecutiveErrors++;
+            errorStreak++;
             addLog(`❌ 请求失败：${result.error || result.status || '未知错误'}`, 'error');
-            guardConsecutiveErrors();
+            guardErrorStreak();
             return;
         }
 
         const data = result.parsed;
 
         if (data.ret === 0) {
-            consecutiveErrors = 0;
+            errorStreak = 0;
+            rateLimitStreak = 0;
             dynamicInterval = baseIntervalMs();
             setCurrentIntervalDisplay();
 
@@ -1577,24 +1947,26 @@
 
             addLog(`🎉 抽中：${prizeText}${recordId ? ` · ID ${recordId}` : ''}`, 'success');
             recordDraw(prizeText);
-            setTimeout(updateBalanceDisplay, 250);
+
+            beanBalance = Math.max(0, beanBalance - singleCost);
+            updateBalanceDisplay();
             return;
         }
 
         const msg = decodeUnicode(data.msg || '未知错误');
 
         if (msg.includes('重复点击') || msg.includes('请稍后') || msg.includes('频繁')) {
-            consecutiveErrors++;
+            rateLimitStreak++;
             addLog(`⏳ ${msg}`, 'warning');
 
-            if (consecutiveErrors >= CONFIG.backoffAfterErrors) {
+            if (rateLimitStreak >= CONFIG.backoffAfterErrors) {
                 dynamicInterval = Math.min(dynamicInterval * CONFIG.backoffFactor, CONFIG.maxBackoffMs);
                 setCurrentIntervalDisplay();
                 addLog(`🔄 请求频繁，间隔自动调整至 ${(dynamicInterval / 1000).toFixed(1)} 秒`, 'warning');
             }
 
-            if (consecutiveErrors >= CONFIG.maxRateLimitRetries) {
-                addLog(`🛑 连续 ${consecutiveErrors} 次被限流，自动停止`, 'error');
+            if (rateLimitStreak >= CONFIG.maxRateLimitRetries) {
+                addLog(`🛑 连续 ${rateLimitStreak} 次被限流，自动停止`, 'error');
                 stopLottery('🛑 持续被限流，已停止');
             }
             return;
@@ -1606,15 +1978,15 @@
             return;
         }
 
-        consecutiveErrors++;
+        errorStreak++;
         addLog(`❌ ${msg}`, 'error');
-        guardConsecutiveErrors();
+        guardErrorStreak();
     }
 
     /* 接口持续异常时兜底停止，避免无限重试 */
-    function guardConsecutiveErrors() {
-        if (consecutiveErrors >= CONFIG.maxConsecutiveErrors) {
-            addLog(`🛑 连续 ${consecutiveErrors} 次失败，自动停止`, 'error');
+    function guardErrorStreak() {
+        if (errorStreak >= CONFIG.maxConsecutiveErrors) {
+            addLog(`🛑 连续 ${errorStreak} 次失败，自动停止`, 'error');
             stopLottery('🛑 接口连续异常，已停止');
         }
     }
@@ -1657,7 +2029,8 @@
         }
 
         dynamicInterval = interval * 1000;
-        consecutiveErrors = 0;
+        errorStreak = 0;
+        rateLimitStreak = 0;
         roundStartDraws = currentStats.draws;
         running = true;
 
@@ -1728,6 +2101,120 @@
         addLog('🗑 历史统计已清空', 'success');
     }
 
+    /* =========================================================
+       同步官方中奖记录
+
+       站点自己有一个分页接口能取回账号的全部中奖记录，每条都带
+       result（奖品文案）和 cost_bonus（那一抽实际扣了多少憨豆）。
+       用它重建「历史总计」，统计就不再依赖本脚本抽过多少次 ——
+       手点的、换电脑抽的、清过 localStorage 的，全都能补回来。
+    ========================================================= */
+
+    async function fetchRecordsPage(start, length) {
+        const query = new URLSearchParams({
+            __format: 'data-table',
+            start: String(start),
+            length: String(length),
+            draw: '1'
+        });
+
+        const response = await fetch(`${RECORDS_API}?${query}`, {
+            credentials: 'include',
+            headers: {
+                'accept': '*/*',
+                'referer': LOTTERY_PAGE,
+                'x-requested-with': 'XMLHttpRequest'
+            }
+        });
+
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+        const payload = await response.json();
+        if (payload.code !== 0) throw new Error(decodeUnicode(payload.msg || '接口返回异常'));
+
+        return {
+            rows: Array.isArray(payload.data) ? payload.data : [],
+            total: Number(payload.recordsTotal) || 0
+        };
+    }
+
+    async function syncOfficialRecords() {
+        if (running) {
+            addLog('⚠️ 请先停止自动抽奖再同步', 'warning');
+            return;
+        }
+        if (!confirm(`从站点拉取全部官方中奖记录，用真实数据重建「历史总计」？
+
+本次会话数据不受影响。`)) return;
+
+        const button = $('sync-official');
+        if (button) {
+            button.disabled = true;
+            setText('sync-official', '☁ 同步中...');
+        }
+
+        try {
+            const stats = emptyStats();
+            const size = CONFIG.syncPageSize;
+            let start = 0;
+            let total = 0;
+            let page = 0;
+
+            while (page < CONFIG.syncMaxPages) {
+                const { rows, total: reported } = await fetchRecordsPage(start, size);
+                if (page === 0) {
+                    total = reported;
+                    addLog(`☁️ 官方记录共 ${fmt(total)} 条，开始拉取`, 'info');
+                }
+                if (!rows.length) break;
+
+                rows.forEach(row => {
+                    const text = String(row.result || '').trim();
+                    if (!text) return;
+                    applyPrize(stats, text, Number(row.cost_bonus) || 0);
+
+                    const at = Date.parse(String(row.created_at || '').replace(' ', 'T'));
+                    if (!Number.isNaN(at)) {
+                        if (!stats.firstAt || at < stats.firstAt) stats.firstAt = at;
+                        if (!stats.lastAt || at > stats.lastAt) stats.lastAt = at;
+                    }
+                });
+
+                start += rows.length;
+                page += 1;
+                addLog(`☁️ 已拉取 ${fmt(stats.draws)}/${fmt(total)} 条`, 'info');
+
+                if (rows.length < size || (total && start >= total)) break;
+                // 用独立的等待：sleep() 的 timer 是给抽奖循环留着被 cancelSleep 打断的
+                await new Promise(resolve => setTimeout(resolve, CONFIG.syncPageDelay));
+            }
+
+            if (!stats.draws) {
+                addLog('⚠️ 没有拉到任何记录，历史统计保持不变', 'warning');
+                return;
+            }
+
+            stats.syncedAt = Date.now();
+            saveStats(stats);
+            totalStats = stats;
+
+            settings.viewMode = 'total';
+            saveSettings();
+            const viewSelect = $('view-mode');
+            if (viewSelect) viewSelect.value = 'total';
+
+            render();
+            addLog(`✅ 已用 ${fmt(stats.draws)} 条官方记录重建历史统计`, 'success');
+        } catch (error) {
+            addLog(`❌ 同步失败：${error.message}`, 'error');
+        } finally {
+            if (button) {
+                button.disabled = false;
+                setText('sync-official', '☁ 同步官方记录');
+            }
+        }
+    }
+
     /* 导出分奖项明细，方便自己拉表算真实爆率 */
     function exportStats() {
         const stats = activeStats();
@@ -1735,7 +2222,7 @@
 
         const rows = Object.entries(stats.prizes)
             .filter(([, bucket]) => bucket.count > 0)
-            .sort((a, b) => b[1].count - a[1].count);
+            .sort((a, b) => b[1].count - a[1].count || PRIZE_ORDER.indexOf(a[0]) - PRIZE_ORDER.indexOf(b[0]));
 
         const totalCount = rows.reduce((sum, [, bucket]) => sum + bucket.count, 0);
 
@@ -1820,6 +2307,9 @@
         const move = event => {
             if (!dragging) return;
 
+            // 触屏上不拦下来的话，拖面板会同时把页面滚走
+            if (event.cancelable) event.preventDefault();
+
             const point = pointOf(event);
             const maxLeft = Math.max(5, window.innerWidth - panel.offsetWidth);
             const maxTop = Math.max(5, window.innerHeight - panel.offsetHeight);
@@ -1859,6 +2349,24 @@
         panel.style.left = `${left}px`;
         panel.style.top = `${top}px`;
         panel.style.right = 'auto';
+    }
+
+    /* 窗口缩小后面板可能被留在视口外，标题栏都抓不到就再也拖不回来了 */
+    function keepPanelInViewport() {
+        const panel = $('lottery-control-panel');
+        if (!panel || panel.style.left === '') return;
+
+        const maxLeft = Math.max(5, window.innerWidth - panel.offsetWidth);
+        const maxTop = Math.max(5, window.innerHeight - panel.offsetHeight);
+        const left = Math.max(5, Math.min(parseInt(panel.style.left, 10) || 5, maxLeft));
+        const top = Math.max(5, Math.min(parseInt(panel.style.top, 10) || 5, maxTop));
+
+        panel.style.left = `${left}px`;
+        panel.style.top = `${top}px`;
+
+        settings.panelLeft = left;
+        settings.panelTop = top;
+        saveSettings();
     }
 
     /* =========================================================
@@ -1912,6 +2420,7 @@
         on('reset-current-data', 'click', resetCurrentData);
         on('clear-total-data', 'click', clearTotalData);
         on('export-stats', 'click', exportStats);
+        on('sync-official', 'click', syncOfficialRecords);
 
         on('toggle-all-tiers', 'click', () => {
             const rows = Array.from(document.querySelectorAll('#detail-list .hh-row'));
@@ -1936,6 +2445,8 @@
             totalStats = loadStats();
             if (settings.viewMode === 'total') render();
         });
+
+        window.addEventListener('resize', keepPanelInViewport);
 
         // 关页面时如果还在抽，提醒一下
         window.addEventListener('beforeunload', event => {
@@ -1979,12 +2490,16 @@
         updateBalanceDisplay();
         render();
 
-        addLog('🎈 HHCLUB 4周年庆典版已加载', 'success');
+        addLog('🎈 HHCLUB 自动抽奖 · 情绪价值拉满版已加载', 'success');
         addLog('🌐 当前站点：hhanclub.net', 'info');
         addLog('🎁 自动抽奖 Dashboard 已准备就绪', 'info');
 
         if (totalStats.migratedFrom === 'v3') {
             addLog('📦 已迁移旧版历史统计数据', 'success');
+        }
+
+        if (totalStats.syncedAt) {
+            addLog(`☁️ 历史统计同步自官方记录 · ${new Date(totalStats.syncedAt).toLocaleString()}`, 'info');
         }
 
         setInterval(() => {

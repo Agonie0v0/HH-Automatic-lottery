@@ -1,5 +1,5 @@
 /**
- * HHCLUB 自动抽奖 · 庆典版 —— 行为测试
+ * HHCLUB 自动抽奖 · 情绪价值拉满版 —— 行为测试
  *
  * 在 jsdom 里加载真实脚本，stub 掉抽奖接口，验证：
  *   - 分奖项统计的聚合结果
@@ -22,11 +22,28 @@ function check(name, cond, extra = '') {
     else { failed++; console.log(`  ✗ ${name} ${extra}`); }
 }
 
-function makeDom({ legacy = null } = {}) {
+function makeDom({ legacy = null, pool = null, useBean = '每次消耗 2,000 憨豆' } = {}) {
+    // pool 传入时按抽奖页真实的内联脚本形状渲染一段 <script>，
+    // 让脚本走和线上完全一样的奖池读取路径。
+    const poolScript = pool
+        ? `<script>
+    let imgPath = 'pic/lucky';
+    let prizes = ${JSON.stringify(pool)};
+    let awards = [];
+</script>`
+        : '';
+
     const dom = new JSDOM(`<!doctype html><html><body>
-        <div class="use-bean">每次消耗 2,000 憨豆</div>
+        <div class="use-bean">${useBean}</div>
         <div class="bean-number">1,234,567</div>
-    </body></html>`, { url: 'https://hhanclub.net/lucky.php', runScripts: 'outside-only' });
+        ${poolScript}
+    </body></html>`, {
+        url: 'https://hhanclub.net/lucky.php',
+        runScripts: 'outside-only',
+        // 不开这个的话 jsdom 的 visibilityState 是 prerender、document.hidden 为 true，
+        // 脚本会把中奖动画全部当成「页面在后台」跳过，动画相关断言就全是假阴性。
+        pretendToBeVisual: true
+    });
 
     const w = dom.window;
     w.confirm = () => true;
@@ -315,6 +332,372 @@ console.log('\n[8] 设置持久化');
 
     const saved = JSON.parse(w.localStorage.getItem('hhanclub_lottery_settings_v1'));
     check('间隔已持久化', saved.interval === 15, JSON.stringify(saved));
+}
+
+/* ----------------------------------------------------------------
+   以下夹具直接取自 hhanclub.net/lucky.php 的线上真实数据（2026-08）：
+   REAL_POOL 是抽奖页内联脚本里的 prizes 数组，
+   REAL_COUNTS 是 winning-records 接口最近 500 条记录的文案分布。
+   注意 typeText 写的「魔力」就是憨豆：站点奖池里 type 1001 用的是 bean_icon，
+   消耗侧也叫憨豆，只是 NexusPHP 的默认叫法没改干净。所以它们必须归到同一类。
+------------------------------------------------------------------ */
+const REAL_POOL = [
+    { typeText: '彩虹 ID', amountText: '7 Day(s)', probability_real: '0.0301' },
+    { typeText: '魔力', amountText: '780000 ', probability_real: '0.0011' },
+    { typeText: '魔力', amountText: '5000 ', probability_real: '0.1507' },
+    { typeText: 'VIP', amountText: '7 Day(s)', probability_real: '0.0002' },
+    { typeText: '魔力', amountText: '100 ', probability_real: '0.2261' },
+    { typeText: '补签卡', amountText: '1 ', probability_real: '0.0603' },
+    { typeText: '魔力', amountText: '2000 ', probability_real: '0.2261' },
+    { typeText: '上传量', amountText: '2 GB', probability_real: '0.0603' },
+    { typeText: '魔力', amountText: '1000 ', probability_real: '0.2261' },
+    { typeText: '上传量', amountText: '5 GB', probability_real: '0.0151' },
+    { typeText: '邀请', amountText: '1 ', probability_real: '0.0038' }
+];
+
+const REAL_COUNTS = {
+    '魔力 100 ': 122, '魔力 5000 ': 67, '魔力 2000 ': 136, '魔力 1000 ': 100,
+    '上传量 2 GB': 28, '彩虹 ID 7 Day(s)': 9, '上传量 5 GB': 6,
+    '补签卡 1 ': 28, '魔力 780000 ': 2, '邀请 1 ': 2
+};
+
+// 「魔力」档位的憨豆总额
+const REAL_BEANS = 100 * 122 + 5000 * 67 + 2000 * 136 + 1000 * 100 + 780000 * 2;
+
+function realRecords() {
+    const rows = [];
+    let id = 3900000;
+    for (const [result, times] of Object.entries(REAL_COUNTS)) {
+        for (let i = 0; i < times; i++) {
+            rows.push({ id: id++, cost_bonus: 2000, created_at: '2026-08-18 19:30', result });
+        }
+    }
+    return rows;
+}
+
+/* 把 winning-records 分页接口 stub 掉，返回真实记录 */
+function stubRecordsApi(w, rows, onServe) {
+    w.fetch = async url => {
+        const u = new URL(String(url), 'https://hhanclub.net');
+        const start = Number(u.searchParams.get('start'));
+        const length = Number(u.searchParams.get('length'));
+        const slice = rows.slice(start, start + length);
+        if (onServe) onServe(slice.length);
+        return { ok: true, status: 200, json: async () => ({ code: 0, data: slice, recordsTotal: rows.length }) };
+    };
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[9] 同步官方记录 + 官方爆率对比（线上真实夹具）');
+{
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+    await run(dom);
+    const d = dom.window.document;
+
+    check('线上写法「每次消耗憨豆： 2000」解析为 2,000',
+        d.getElementById('single-cost').textContent === '2,000',
+        d.getElementById('single-cost').textContent);
+
+    const rows = realRecords();
+    let served = 0;
+    stubRecordsApi(dom.window, rows, n => { served += n; });
+
+    d.getElementById('sync-official').click();
+    await sleep(3000);
+
+    check(`分页拉全 ${rows.length} 条记录（实际 ${served}）`, served === rows.length);
+
+    const stats = JSON.parse(dom.window.localStorage.getItem('hhanclub_lottery_stats_v4'));
+    check('抽奖次数 = 500', stats.draws === 500, `实际 ${stats.draws}`);
+    check('消耗按 cost_bonus 累加 = 1,000,000', stats.cost === 1000000, `实际 ${stats.cost}`);
+    check(`「魔力」档位全部归到憨豆，累计 = ${REAL_BEANS}`,
+        stats.gains.beans === REAL_BEANS, `实际 ${stats.gains.beans}`);
+    check('没有留下独立的 magic 类别', !stats.prizes.magic, JSON.stringify(stats.prizes.magic));
+    check('憨豆中奖 427 次', stats.prizes.beans?.count === 427, `实际 ${stats.prizes.beans?.count}`);
+    check('上传量累计 = 2×28 + 5×6 = 86 GB', stats.gains.upload === 86, `实际 ${stats.gains.upload}`);
+    check('彩虹 ID 累计 63 天', stats.gains.rainbow === 63, `实际 ${stats.gains.rainbow}`);
+    check('补签卡 28 张', stats.prizes.makeup?.count === 28, `实际 ${stats.prizes.makeup?.count}`);
+    check('线上 10 种文案没有一种落进「其他奖品」',
+        !stats.prizes.unknown, JSON.stringify(stats.prizes.unknown));
+
+    // 奖池档位和接口文案必须归一化成同一个 label，否则爆率对不上号
+    const tierRates = Array.from(d.querySelectorAll('#detail-list .hh-tier-rate'));
+    check('档位行渲染出爆率对比', tierRates.length === 10, `实际 ${tierRates.length}`);
+    check('每个档位都配到了官方爆率',
+        tierRates.every(el => /官方 \d/.test(el.textContent)),
+        tierRates.map(el => el.textContent).join(' | '));
+
+    const official = Array.from(d.querySelectorAll('#detail-list .hh-row-official'));
+    // 样本里 VIP 一次没中（官方爆率 0.02%），所以只有 5 个类别成行
+    check('5 个中过奖的类别都显示官方爆率', official.length === 5, `实际 ${official.length}`);
+    check('憨豆类别官方爆率合并为 83.0%',
+        official.some(el => el.textContent === '官方 83.0%'),
+        official.map(el => el.textContent).join(' | '));
+    check('憨豆实测占比 85.4%',
+        d.querySelector('#detail-list .hh-row-pct').textContent === '85.4%',
+        d.querySelector('#detail-list .hh-row-pct').textContent);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[10] 憨豆盈亏与理论盈亏率');
+{
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+    await run(dom);
+    const d = dom.window.document;
+
+    // 理论盈亏率只依赖奖池，没抽过也该算得出来
+    const expected = 780000 * 0.0011 + 5000 * 0.1507 + 100 * 0.2261 + 2000 * 0.2261 + 1000 * 0.2261;
+    const baseline = ((expected - 2000) / 2000) * 100;
+    check(`未抽奖也显示理论盈亏率 ${baseline.toFixed(1)}%`,
+        d.getElementById('theory-rate').textContent === `+${baseline.toFixed(1)}%`,
+        d.getElementById('theory-rate').textContent);
+    check('转盘是正期望的', baseline > 0, `实际 ${baseline.toFixed(2)}%`);
+
+    stubRecordsApi(dom.window, realRecords());
+    d.getElementById('sync-official').click();
+    await sleep(3000);
+
+    const profit = REAL_BEANS - 1000000;
+    check(`盈亏 = ${REAL_BEANS} - 1,000,000`,
+        d.getElementById('profit-loss').textContent === `+${profit.toLocaleString()}`,
+        d.getElementById('profit-loss').textContent);
+
+    const rate = (profit / 1000000) * 100;
+    check(`实测盈亏率 ${rate.toFixed(1)}%`,
+        d.getElementById('profit-rate').textContent === `+${rate.toFixed(1)}%`,
+        d.getElementById('profit-rate').textContent);
+    check('悬停提示带理论盈亏率',
+        /理论盈亏率 \+[\d.]+%/.test(d.getElementById('profit-rate').title),
+        d.getElementById('profit-rate').title);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[10b] 旧版拆出来的 magic 数据会被合回憨豆');
+{
+    const dom = makeDom();
+    const w = dom.window;
+    // 模拟本脚本早期版本存下的 v4 数据：魔力被当成独立奖项
+    w.localStorage.setItem('hhanclub_lottery_stats_v4', JSON.stringify({
+        version: 4, draws: 3, cost: 6000,
+        gains: { beans: 500, magic: 7000, invite: 0, rainbow: 0, vip: 0, makeup: 0, upload: 0 },
+        prizes: {
+            beans: { count: 1, value: 500, tiers: { '500 憨豆': 1 } },
+            magic: { count: 2, value: 7000, tiers: { '5,000 憨豆': 1, '2,000 憨豆': 1 } }
+        },
+        raw: {}
+    }));
+
+    await run(dom);
+    const d = w.document;
+    d.getElementById('view-mode').value = 'total';
+    d.getElementById('view-mode').dispatchEvent(new w.Event('change'));
+    await sleep(50);
+
+    check('憨豆累计合并为 7,500',
+        d.getElementById('total-beans-won').textContent === '7,500',
+        d.getElementById('total-beans-won').textContent);
+    check('明细只剩一行憨豆',
+        d.querySelectorAll('#detail-list .hh-row').length === 1,
+        d.querySelectorAll('#detail-list .hh-row').length);
+    check('憨豆合计 3 次',
+        d.querySelector('#detail-list .hh-row-count')?.textContent === '3 次',
+        d.querySelector('#detail-list .hh-row-count')?.textContent);
+    check('三个档位都在',
+        d.querySelectorAll('#detail-list .hh-tier').length === 3,
+        d.querySelectorAll('#detail-list .hh-tier').length);
+    check('盈亏 = 7500 - 6000 = +1,500',
+        d.getElementById('profit-loss').textContent === '+1,500',
+        d.getElementById('profit-loss').textContent);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[11] 限流与接口错误分开计数');
+{
+    const dom = makeDom();
+    const w = dom.window;
+    let calls = 0;
+
+    // 3 次限流 + 2 次网络错误。旧版两者共用一个计数器，
+    // 到第 5 次就会凑够 maxConsecutiveErrors 被误判成接口异常停机。
+    w.fetch = async () => {
+        calls++;
+        if (calls <= 3) {
+            return { ok: true, status: 200, text: async () => JSON.stringify({ ret: 1, msg: '请勿重复点击' }) };
+        }
+        if (calls <= 5) throw new Error('network down');
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ret: 0, data: { prize_text: '魔力 100 ' } })
+        };
+    };
+
+    await run(dom);
+    const d = w.document;
+    d.getElementById('lottery-interval').value = '3';
+    d.getElementById('max-lottery-count').value = '1';
+    d.getElementById('start-lottery').click();
+
+    await sleep(60000);
+
+    check(`没有在第 5 次被误停（共发出 ${calls} 次请求）`, calls > 5, `实际 ${calls}`);
+    check('最终抽到了奖', Number(d.getElementById('draw-count').textContent) === 1,
+        d.getElementById('draw-count').textContent);
+    check('「魔力 100」记成 100 憨豆',
+        JSON.parse(w.localStorage.getItem('hhanclub_lottery_stats_v4')).gains.beans === 100);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[12] 余额随抽奖本地扣减（站点不刷新 .bean-number）');
+{
+    const dom = makeDom();
+    const w = dom.window;
+    let calls = 0;
+    w.fetch = async () => {
+        calls++;
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ret: 0, data: { prize_text: '魔力 100 ' } })
+        };
+    };
+
+    await run(dom);
+    const d = w.document;
+
+    check('初始余额取自 DOM', d.getElementById('bean-balance').textContent === '1,234,567',
+        d.getElementById('bean-balance').textContent);
+    check('初始最多可抽 617', d.getElementById('max-possible').textContent === '617',
+        d.getElementById('max-possible').textContent);
+
+    d.getElementById('lottery-interval').value = '3';
+    d.getElementById('max-lottery-count').value = '3';
+    d.getElementById('start-lottery').click();
+    await sleep(20000);
+
+    check(`抽了 3 次（实际 ${calls}）`, calls === 3);
+    // 站点从不改这个元素，所以 DOM 里仍是 1,234,567
+    check('DOM 里的余额确实没被站点更新',
+        d.querySelector('.bean-number').textContent === '1,234,567',
+        d.querySelector('.bean-number').textContent);
+    check('面板余额已本地扣掉 3 × 2000',
+        d.getElementById('bean-balance').textContent === (1234567 - 6000).toLocaleString(),
+        d.getElementById('bean-balance').textContent);
+    check('最多可抽随之减少到 614',
+        d.getElementById('max-possible').textContent === '614',
+        d.getElementById('max-possible').textContent);
+
+    // 页面自己把余额改了（比如刷新后），应当重新采信 DOM
+    d.querySelector('.bean-number').textContent = '900000.0';
+    d.getElementById('view-mode').dispatchEvent(new w.Event('change'));
+    await sleep(50);
+    d.getElementById('set-max-possible').click();
+    check('DOM 值变化后重新采信',
+        d.getElementById('bean-balance').textContent === '900,000',
+        d.getElementById('bean-balance').textContent);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[13] 大奖全屏庆祝');
+{
+    // 按官方爆率判定：VIP 0.02% 和 780,000 憨豆 0.11% 够格，
+    // 邀请 0.38% 和 5,000 憨豆 15.07% 不够格。
+    const cases = [
+        { text: '魔力 780000 ', jackpot: true, why: '780,000 憨豆（0.11%）' },
+        { text: 'VIP 7 Day(s)', jackpot: true, why: 'VIP（0.02%）' },
+        { text: '邀请 1 ', jackpot: false, why: '邀请（0.38%）' },
+        { text: '魔力 5000 ', jackpot: false, why: '5,000 憨豆（15.07%）' }
+    ];
+
+    for (const item of cases) {
+        const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+        const w = dom.window;
+        w.fetch = async () => ({
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ret: 0, data: { prize_text: item.text } })
+        });
+
+        await run(dom);
+        const d = w.document;
+        d.getElementById('lottery-interval').value = '3';
+        d.getElementById('max-lottery-count').value = '1';
+        d.getElementById('start-lottery').click();
+        await sleep(1200);
+
+        const jackpotShown = !!d.querySelector('.hh-jackpot-overlay');
+        const normalShown = !!d.querySelector('.hh-win-overlay');
+
+        check(`${item.why} → ${item.jackpot ? '全屏庆祝' : '普通动画'}`,
+            jackpotShown === item.jackpot && normalShown === !item.jackpot,
+            `jackpot=${jackpotShown} normal=${normalShown}`);
+
+        if (item.jackpot) {
+            check(`  ${item.why} 面板上打了大奖日志`,
+                Array.from(d.querySelectorAll('#lottery-log div'))
+                    .some(el => el.textContent.includes('大奖')),
+                '未找到大奖日志');
+            check(`  ${item.why} 遮罩里带奖品文案`,
+                d.querySelector('.hh-jackpot-prize')?.textContent.includes(item.text.trim()),
+                d.querySelector('.hh-jackpot-prize')?.textContent);
+            check(`  ${item.why} 礼花已生成`,
+                d.querySelectorAll('.hh-firework').length > 0,
+                d.querySelectorAll('.hh-firework').length);
+        }
+    }
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[14] 读不到奖池时大奖判定退回硬规则');
+{
+    // 没有 pool script，isJackpot 走 VIP / 十万憨豆 的兜底分支
+    const dom = makeDom();
+    const w = dom.window;
+    w.fetch = async () => ({
+        ok: true, status: 200,
+        text: async () => JSON.stringify({ ret: 0, data: { prize_text: '魔力 780000 ' } })
+    });
+
+    await run(dom);
+    const d = w.document;
+    d.getElementById('lottery-interval').value = '3';
+    d.getElementById('max-lottery-count').value = '1';
+    d.getElementById('start-lottery').click();
+    await sleep(1200);
+
+    check('无奖池时 780,000 憨豆仍判为大奖',
+        !!d.querySelector('.hh-jackpot-overlay'), '未触发');
+    check('无奖池时不渲染官方爆率',
+        d.querySelectorAll('#detail-list .hh-row-official').length === 0,
+        d.querySelectorAll('#detail-list .hh-row-official').length);
+    check('无奖池时理论盈亏率显示 -',
+        d.getElementById('theory-rate').textContent === '-',
+        d.getElementById('theory-rate').textContent);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[15] 关掉中奖动画后大奖也不弹');
+{
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+    const w = dom.window;
+    w.fetch = async () => ({
+        ok: true, status: 200,
+        text: async () => JSON.stringify({ ret: 0, data: { prize_text: '魔力 780000 ' } })
+    });
+
+    await run(dom);
+    const d = w.document;
+    d.getElementById('toggle-animation').click();
+
+    d.getElementById('lottery-interval').value = '3';
+    d.getElementById('max-lottery-count').value = '1';
+    d.getElementById('start-lottery').click();
+    await sleep(1200);
+
+    check('动画关闭时没有全屏遮罩', !d.querySelector('.hh-jackpot-overlay'));
+    check('但仍然记进了统计',
+        d.getElementById('draw-count').textContent === '1',
+        d.getElementById('draw-count').textContent);
+    check('也仍然打了大奖日志',
+        Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('大奖')),
+        '未找到大奖日志');
 }
 
 /* ---------------------------------------------------------------- */
