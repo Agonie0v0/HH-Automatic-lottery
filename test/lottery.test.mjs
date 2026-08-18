@@ -56,6 +56,18 @@ function makeDom({ legacy = null, pool = null, useBean = '每次消耗 2,000 憨
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// 固定 sleep 会白等一大截 —— 轮询到条件成立就往下走，全套能省一半时间
+async function until(fn, timeoutMs = 90000, stepMs = 200) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (fn()) return true;
+        await sleep(stepMs);
+    }
+    return false;
+}
+const untilStopped = (d, timeoutMs) =>
+    until(() => d.getElementById('lottery-status').textContent === '已停止', timeoutMs);
+
 // jsdom 构造完成时 readyState 可能还是 loading，脚本会等 DOMContentLoaded，
 // 所以 eval 之后要让出一拍再断言。
 async function run(dom) {
@@ -245,7 +257,7 @@ console.log('\n[5] B5：接口连续失败自动停止');
     d.getElementById('max-lottery-count').value = '100';
     d.getElementById('start-lottery').click();
 
-    await sleep(22000);
+    await untilStopped(d);
 
     check(`连续失败 5 次后停止（发出 ${calls} 次请求）`, calls === 5, `实际 ${calls}`);
     check('状态显示已停止', d.getElementById('lottery-status').textContent === '已停止');
@@ -276,11 +288,12 @@ console.log('\n[6] B3：限流退避后成功能恢复间隔');
     d.getElementById('start-lottery').click();
 
     // 等到第 3 次限流触发退避
-    await sleep(9000);
+    await until(() => parseFloat(d.getElementById('current-interval').textContent) > 3);
     const backedOff = parseFloat(d.getElementById('current-interval').textContent);
     check(`限流后间隔被拉长（当前 ${backedOff}s）`, backedOff > 3, `实际 ${backedOff}`);
 
-    await sleep(26000);
+    // 后续成功会把间隔降回基础值
+    await until(() => parseFloat(d.getElementById('current-interval').textContent) === 3);
     const recovered = parseFloat(d.getElementById('current-interval').textContent);
     check(`成功后间隔降回 3s（当前 ${recovered}s）`, recovered === 3, `实际 ${recovered}`);
     check('限流不计入抽奖次数，最终抽了 4 次',
@@ -396,9 +409,7 @@ console.log('\n[9] 线上真实文案的归类与官方爆率对比');
     d.getElementById('max-lottery-count').value = String(TEXTS.length);
     d.getElementById('start-lottery').click();
 
-    for (let n = 0; n < 60 && d.getElementById('lottery-status').textContent !== '已停止'; n++) {
-        await sleep(1000);
-    }
+    await untilStopped(d);
 
     const stats = JSON.parse(w.localStorage.getItem('hhanclub_lottery_stats_v4'));
     check(`抽满 ${TEXTS.length} 次`, stats.draws === TEXTS.length, `实际 ${stats.draws}`);
@@ -578,7 +589,7 @@ console.log('\n[12] 余额随抽奖本地扣减（站点不刷新 .bean-number�
     d.getElementById('lottery-interval').value = '3';
     d.getElementById('max-lottery-count').value = '3';
     d.getElementById('start-lottery').click();
-    await sleep(20000);
+    await untilStopped(d);
 
     check(`抽了 3 次（实际 ${calls}）`, calls === 3);
     // 站点从不改这个元素，所以 DOM 里仍是 1,234,567
@@ -751,9 +762,7 @@ console.log('\n[16] 一抽到底');
         d.getElementById('lottery-status').textContent.includes('一抽到底'),
         d.getElementById('lottery-status').textContent);
 
-    for (let i = 0; i < 40 && d.getElementById('lottery-status').textContent !== '已停止'; i++) {
-        await sleep(1000);
-    }
+    await untilStopped(d);
 
     // 每抽净减 1,900，从 20,000 抽到「再抽一次就跌破 6,000」
     // → 停在余额 7,650（再抽会剩 5,750 < 6,000），共 7 抽
@@ -1016,6 +1025,121 @@ console.log('\n[21] 校准值必须压过过期的页面数字');
     check('DOM 之后再变化时仍然重新采信',
         d.getElementById('bean-balance').textContent === '500,000',
         d.getElementById('bean-balance').textContent);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[22] 站点调整爆率后奖池会跟着刷新');
+{
+    // 站点把 780,000 憨豆的爆率从 0.11% 调到 0.30%，
+    // 理论盈亏率和大奖判定都该跟着变
+    const TUNED = REAL_POOL.map(item =>
+        (item.typeText === '魔力' && item.amountText === '780000 ')
+            ? { ...item, probability_real: '0.0030' }
+            : item);
+
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000', balance: '100000' });
+    const w = dom.window;
+
+    w.fetch = async url => {
+        if (String(url).includes('lucky.php')) {
+            // 抓回来的页面带的是调整后的奖池
+            return {
+                ok: true, status: 200,
+                text: async () => `<html><body>
+                    <div class="bean-number">100000.0</div>
+                    <script>let prizes = ${JSON.stringify(TUNED)};</script>
+                </body></html>`
+            };
+        }
+        return { ok: false, status: 500, text: async () => '' };
+    };
+
+    await run(dom);
+    const d = w.document;
+
+    const before = d.getElementById('theory-rate').textContent;
+    check('初始理论盈亏率来自页面上的奖池', before === '+15.6%', before);
+
+    d.getElementById('refresh-balance').click();
+    await until(() => d.getElementById('theory-rate').textContent !== before, 5000);
+
+    // 780000 从 0.0011 提到 0.0030，期望产出多 780000×0.0019 = 1482
+    const expected = 780000 * 0.0030 + 5000 * 0.1507 + 100 * 0.2261 + 2000 * 0.2261 + 1000 * 0.2261;
+    const baseline = ((expected - 2000) / 2000) * 100;
+    check(`理论盈亏率跟着调整为 ${baseline.toFixed(1)}%`,
+        d.getElementById('theory-rate').textContent === `+${baseline.toFixed(1)}%`,
+        d.getElementById('theory-rate').textContent);
+    check('日志提示了爆率变动',
+        Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('调整了奖池爆率')),
+        '未找到爆率变动日志');
+    check('提示里带上了理论盈亏率的前后变化',
+        Array.from(d.querySelectorAll('#lottery-log div')).some(el => /\+15\.6% → \+/.test(el.textContent)),
+        '未找到变化区间');
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[23] 爆率没变时不重复打扰');
+{
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000', balance: '100000' });
+    const w = dom.window;
+    w.fetch = async url => {
+        if (String(url).includes('lucky.php')) {
+            return {
+                ok: true, status: 200,
+                text: async () => `<html><body>
+                    <div class="bean-number">100000.0</div>
+                    <script>let prizes = ${JSON.stringify(REAL_POOL)};</script>
+                </body></html>`
+            };
+        }
+        return { ok: false, status: 500, text: async () => '' };
+    };
+
+    await run(dom);
+    const d = w.document;
+
+    d.getElementById('refresh-balance').click();
+    await sleep(600);
+    d.getElementById('refresh-balance').click();
+    await sleep(600);
+
+    check('奖池没变就不打爆率变动日志',
+        !Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('调整了奖池爆率')),
+        '不该出现的日志');
+    check('理论盈亏率保持 +15.6%',
+        d.getElementById('theory-rate').textContent === '+15.6%',
+        d.getElementById('theory-rate').textContent);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[24] 抓回来的页面读不到奖池时保留原有爆率');
+{
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000', balance: '100000' });
+    const w = dom.window;
+    w.fetch = async url => {
+        if (String(url).includes('lucky.php')) {
+            // 站点改版 / 返回了不带奖池的页面
+            return {
+                ok: true, status: 200,
+                text: async () => '<html><body><div class="bean-number">777777.0</div></body></html>'
+            };
+        }
+        return { ok: false, status: 500, text: async () => '' };
+    };
+
+    await run(dom);
+    const d = w.document;
+
+    d.getElementById('refresh-balance').click();
+    await until(() => d.getElementById('bean-balance').textContent === '777,777', 5000);
+
+    check('余额照常校准', d.getElementById('bean-balance').textContent === '777,777',
+        d.getElementById('bean-balance').textContent);
+    check('奖池读不到时沿用原有爆率，不清空',
+        d.getElementById('theory-rate').textContent === '+15.6%',
+        d.getElementById('theory-rate').textContent);
+    check('明细里的官方爆率还在',
+        d.querySelectorAll('#detail-list .hh-row-official').length >= 0);
 }
 
 /* ---------------------------------------------------------------- */

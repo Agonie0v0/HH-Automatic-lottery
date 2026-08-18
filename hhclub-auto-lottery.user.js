@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.7.0
+// @version      1.8.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 官方爆率对比 · 一抽到底 · 实时余额
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -1702,11 +1702,30 @@
             const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
             return {
                 balance: firstNumber(doc.querySelector('.bean-number')?.textContent ?? ''),
+                // .use-bean 和 .bean-number 一样，不刷新页面就永远不变。
+                // 一抽到底可能挂好几个小时，中途站点调价的话，停止判断
+                // 会拿旧成本去算，保留线就守不住了。
+                cost: firstNumber(doc.querySelector('.use-bean')?.textContent ?? ''),
                 pool: parsePrizePoolFrom(doc)
             };
         } catch (error) {
             return null;
         }
+    }
+
+    /* 单抽消耗变了就换掉。这个值影响一抽到底的停止判断和全部盈亏计算，
+       挂机跑着的时候尤其不能用旧的。 */
+    function adoptSingleCost(cost) {
+        if (cost === null || !(cost > 0)) return false;
+
+        const next = Math.round(cost);
+        if (next === singleCost) return false;
+
+        const before = singleCost;
+        singleCost = next;
+        setText('single-cost', fmt(singleCost));
+        addLog(`💱 站点把单次消耗从 ${fmt(before)} 调成了 ${fmt(singleCost)} 憨豆`, 'warning');
+        return true;
     }
 
     /* 爆率变了就换掉缓存。变了要说一声 —— 理论盈亏率和大奖判定都跟着它走。 */
@@ -1736,8 +1755,11 @@
             const snapshot = await fetchServerSnapshot();
             const value = snapshot ? snapshot.balance : null;
 
-            // 爆率先换，后面 render() 才会用上新的官方数据
-            if (snapshot) adoptPool(snapshot.pool);
+            // 爆率和单抽消耗都先换，后面 render() 才会用上新数据
+            if (snapshot) {
+                adoptPool(snapshot.pool);
+                adoptSingleCost(snapshot.cost);
+            }
 
             if (value === null) {
                 if (!quiet) addLog('⚠️ 余额校准失败，继续用本地估算', 'warning');
