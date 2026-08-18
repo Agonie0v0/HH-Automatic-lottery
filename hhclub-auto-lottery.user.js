@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.8.0
+// @version      1.8.1
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 官方爆率对比 · 一抽到底 · 实时余额
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -78,6 +78,7 @@
     let singleCost = 2000;
     let beanBalance = 0;
     let domBalanceSeen = null;
+    let domCostSeen = null;
     let running = false;
     // 限流和接口错误分开计数：以前共用一个计数器，几次限流叠上一两次网络抖动
     // 就会凑够 maxConsecutiveErrors 被误判成接口异常而提前停机。
@@ -1659,16 +1660,20 @@
        余额 / 单次消耗
     ========================================================= */
 
+    /* 和 getBeanBalance() 一个套路：.use-bean 不刷新页面就永远不变，
+       所以只有 DOM 数字自己变过才采信。以前每次调用都无条件回读，
+       校准从服务端拿回来的新价会被页面上的旧价当场冲掉。
+       注意要兼容 "2,000" 这种千分位写法，否则会被截成 2。 */
     function getSingleCost() {
         const element = document.querySelector('.use-bean');
-        if (!element) return singleCost;
+        const domValue = element ? firstNumber(element.textContent) : null;
 
-        // 注意要兼容 "2,000" 这种千分位写法，否则会被截成 2
-        const value = firstNumber(element.textContent);
-        if (value === null || value <= 0) return singleCost;
+        if (domValue !== null && domValue > 0 && domValue !== domCostSeen) {
+            domCostSeen = domValue;
+            singleCost = Math.round(domValue);
+            setText('single-cost', fmt(singleCost));
+        }
 
-        singleCost = Math.round(value);
-        setText('single-cost', fmt(singleCost));
         return singleCost;
     }
 
@@ -1724,6 +1729,12 @@
         const before = singleCost;
         singleCost = next;
         setText('single-cost', fmt(singleCost));
+
+        // 对齐到 DOM 当前值，理由同 calibrateBalance：
+        // 不对齐的话下一次 getSingleCost() 会把这里的新价冲掉
+        const element = document.querySelector('.use-bean');
+        const domValue = element ? firstNumber(element.textContent) : null;
+        if (domValue !== null) domCostSeen = domValue;
         addLog(`💱 站点把单次消耗从 ${fmt(before)} 调成了 ${fmt(singleCost)} 憨豆`, 'warning');
         return true;
     }

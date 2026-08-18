@@ -296,6 +296,9 @@ console.log('\n[6] B3：限流退避后成功能恢复间隔');
     await until(() => parseFloat(d.getElementById('current-interval').textContent) === 3);
     const recovered = parseFloat(d.getElementById('current-interval').textContent);
     check(`成功后间隔降回 3s（当前 ${recovered}s）`, recovered === 3, `实际 ${recovered}`);
+
+    // 间隔一恢复就往下走的话，后面几次还没抽 —— 等抽满再断言
+    await until(() => d.getElementById('draw-count').textContent === '4');
     check('限流不计入抽奖次数，最终抽了 4 次',
         d.getElementById('draw-count').textContent === '4',
         d.getElementById('draw-count').textContent);
@@ -1140,6 +1143,113 @@ console.log('\n[24] 抓回来的页面读不到奖池时保留原有爆率');
         d.getElementById('theory-rate').textContent);
     check('明细里的官方爆率还在',
         d.querySelectorAll('#detail-list .hh-row-official').length >= 0);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[25] 挂机期间站点调价：跟进但不打断');
+{
+    // 一抽到底是挂机用的。中途站点把单抽消耗从 2,000 调到 4,000，
+    // 脚本要跟上新成本，但不能弹窗、不能停。
+    const TUNED_POOL = REAL_POOL.map(item =>
+        (item.typeText === '魔力' && item.amountText === '780000 ')
+            ? { ...item, probability_real: '0.0030' }
+            : item);
+
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000', balance: '30000' });
+    const w = dom.window;
+
+    // 任何弹窗都算打断挂机
+    let interrupted = 0;
+    w.confirm = () => { interrupted++; return true; };
+    w.alert = () => { interrupted++; };
+
+    let draws = 0;
+    w.fetch = async url => {
+        if (String(url).includes('lucky.php')) {
+            return {
+                ok: true, status: 200,
+                text: async () => `<html><body>
+                    <div class="bean-number">${30000 - draws * 1900}.0</div>
+                    <div class="use-bean">每次消耗憨豆： 4000</div>
+                    <script>let prizes = ${JSON.stringify(TUNED_POOL)};</script>
+                </body></html>`
+            };
+        }
+        draws++;
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ret: 0, data: { prize_text: '魔力 100 ' } })
+        };
+    };
+
+    await run(dom);
+    const d = w.document;
+
+    check('起步用页面上的 2,000', d.getElementById('single-cost').textContent === '2,000',
+        d.getElementById('single-cost').textContent);
+
+    d.getElementById('drain-mode').checked = true;
+    d.getElementById('drain-mode').dispatchEvent(new w.Event('change'));
+    d.getElementById('reserve-beans').value = '12000';
+    d.getElementById('reserve-beans').dispatchEvent(new w.Event('change'));
+    d.getElementById('lottery-interval').value = '3';
+    d.getElementById('start-lottery').click();
+
+    // 第一次校准发生在余额估算逼近保留线时，会带回新的成本和爆率
+    await until(() => d.getElementById('single-cost').textContent === '4,000', 90000);
+    check('跟进了站点的新单次消耗 4,000',
+        d.getElementById('single-cost').textContent === '4,000',
+        d.getElementById('single-cost').textContent);
+
+    await untilStopped(d);
+
+    check('挂机全程没有弹出任何对话框', interrupted === 0, `弹了 ${interrupted} 次`);
+    check('调价日志有记录',
+        Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('单次消耗')),
+        '未找到调价日志');
+    check('爆率变动日志也有记录',
+        Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('调整了奖池爆率')),
+        '未找到爆率日志');
+    check('是按一抽到底的条件停的，不是被打断的',
+        Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('一抽到底完成')),
+        '未按保留线停止');
+
+    // 用新成本判断，余额必须停在保留线之上
+    const finalBalance = Number(d.getElementById('bean-balance').textContent.replace(/,/g, ''));
+    check(`按新成本守住保留线 12,000（余额 ${finalBalance}）`,
+        finalBalance >= 12000, `实际 ${finalBalance}`);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[26] 单次消耗没变时不打扰');
+{
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000', balance: '100000' });
+    const w = dom.window;
+    w.fetch = async url => {
+        if (String(url).includes('lucky.php')) {
+            return {
+                ok: true, status: 200,
+                text: async () => `<html><body>
+                    <div class="bean-number">100000.0</div>
+                    <div class="use-bean">每次消耗憨豆： 2000</div>
+                </body></html>`
+            };
+        }
+        return { ok: false, status: 500, text: async () => '' };
+    };
+
+    await run(dom);
+    const d = w.document;
+
+    d.getElementById('refresh-balance').click();
+    await sleep(600);
+
+    check('消耗没变就不打日志',
+        !Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('单次消耗')),
+        '不该出现的日志');
+    check('单次消耗保持 2,000',
+        d.getElementById('single-cost').textContent === '2,000',
+        d.getElementById('single-cost').textContent);
 }
 
 /* ---------------------------------------------------------------- */
