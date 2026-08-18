@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.4.0
+// @version      1.5.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 官方爆率对比 · 一抽到底 · 实时余额
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -50,10 +50,7 @@
         // 读不到奖池时的兜底判定：VIP，或单笔十万以上的憨豆
         jackpotBeansFloor: 100000,
         // 每抽多少次回服务端校准一次余额，纠正本地估算的累计漂移
-        balanceSyncEveryDraws: 25,
-        // 一抽到底的硬上限。转盘是正期望的（期望产出 > 单抽消耗），
-        // 余额很可能一路往上涨，光靠「抽到没钱」这个条件是会停不下来的。
-        drainHardCap: 5000
+        balanceSyncEveryDraws: 25
     };
 
     /* 奖项分类元数据：决定明细列表的图标 / 名称 / 单位 */
@@ -1457,7 +1454,7 @@
                     </div>
                 </div>
                 <div id="drain-hint" class="hh-drain-hint">
-                    勾选后忽略最大次数，一直抽到余额跌破保留线（上限 ${fmt(CONFIG.drainHardCap)} 抽）
+                    勾选后忽略最大次数，一直抽到余额跌破保留线为止
                 </div>
 
                 <div style="display:flex;align-items:center;justify-content:space-between;margin-top:7px;">
@@ -2060,7 +2057,7 @@
 
     async function runSingleDraw(maxCount) {
         const roundCount = currentStats.draws - roundStartDraws;
-        // 一抽到底没有「总共几次」可言，报余额比报硬上限有意义
+        // 一抽到底没有「总共几次」可言，报余额更有意义
         addLog(settings.drainMode
             ? `🎲 第 ${roundCount + 1} 次抽奖 · 余额 ${fmt(beanBalance)}`
             : `🎲 第 ${roundCount + 1}/${maxCount} 次抽奖`, 'info');
@@ -2134,7 +2131,7 @@
         }
     }
 
-    /* 一抽到底：抽到「再抽一次就会跌破保留线」为止。
+    /* 一抽到底：抽到「再抽一次就会跌破保留线」为止，不设次数上限。
        余额用的是本地估算，所以真要停之前先回服务端校准一次，
        免得因为估算漂移多抽或少抽。 */
     async function shouldStopForReserve() {
@@ -2158,10 +2155,6 @@
                     stopLottery(`🏁 一抽到底完成 · 保留 ${fmt(Math.max(0, settings.reserveBeans))} 憨豆`);
                     return;
                 }
-                if (roundCount >= CONFIG.drainHardCap) {
-                    stopLottery(`🛑 已达一抽到底上限 ${fmt(CONFIG.drainHardCap)} 抽`);
-                    return;
-                }
             } else if (roundCount >= maxCount) {
                 stopLottery('🎯 本轮达到最大抽奖次数');
                 return;
@@ -2169,7 +2162,7 @@
 
             if (!running) return;
 
-            await runSingleDraw(settings.drainMode ? CONFIG.drainHardCap : maxCount);
+            await runSingleDraw(maxCount);
             if (!running) return;
 
             await sleep(nextDelayMs());
