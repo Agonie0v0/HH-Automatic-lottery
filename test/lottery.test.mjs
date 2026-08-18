@@ -883,20 +883,31 @@ console.log('\n[19] 备份导出与导入');
         return el;
     };
 
-    const feed = async (json, replace) => {
+    // mode: 'merge' | 'replace' | 'cancel'，对应弹窗上的三个按钮
+    const feed = async (json, mode) => {
         picker = null;
-        w.confirm = () => replace;
         d.getElementById('import-stats').click();
         Object.defineProperty(picker, 'files', {
             configurable: true,
             get: () => [{ name: 'backup.json', text: async () => json }]
         });
         picker.dispatchEvent(new w.Event('change'));
-        await sleep(200);
+        await sleep(150);
+
+        const dialog = d.querySelector('.hh-modal-overlay');
+        if (!dialog) return null;
+
+        const button = dialog.querySelector(`[data-mode="${mode}"]`);
+        button.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+        await sleep(150);
+        return button.textContent;
     };
 
-    // 取消 = 合并：把同一份备份再叠加一次
-    await feed(backupJson, false);
+    // 合并：把同一份备份再叠加一次
+    const mergeLabel = await feed(backupJson, 'merge');
+    check('弹窗把合并后的总抽数算给用户看',
+        /共 20 抽/.test(mergeLabel || ''), mergeLabel);
+    check('选完之后弹窗关掉了', !d.querySelector('.hh-modal-overlay'));
     let stored = JSON.parse(w.localStorage.getItem('hhanclub_lottery_stats_v4'));
     check('合并导入：抽数相加为 20', stored.draws === 20, stored.draws);
     check('合并导入：消耗相加为 40,000', stored.cost === 40000, stored.cost);
@@ -911,22 +922,30 @@ console.log('\n[19] 备份导出与导入');
         d.getElementById('draw-count').textContent === '20',
         d.getElementById('draw-count').textContent);
 
-    // 确定 = 覆盖：回到备份里的 10 抽
-    await feed(backupJson, true);
+    // 覆盖：回到备份里的 10 抽
+    await feed(backupJson, 'replace');
     stored = JSON.parse(w.localStorage.getItem('hhanclub_lottery_stats_v4'));
     check('覆盖导入：抽数回到 10', stored.draws === 10, stored.draws);
     check('覆盖导入：档位次数回到 9',
         stored.prizes.beans.tiers['500 憨豆'] === 9, stored.prizes.beans.tiers['500 憨豆']);
 
+    // 取消必须真的什么都不做
+    await feed(backupJson, 'cancel');
+    stored = JSON.parse(w.localStorage.getItem('hhanclub_lottery_stats_v4'));
+    check('取消导入不改动任何数据', stored.draws === 10, stored.draws);
+    check('取消打了对应日志',
+        Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('已取消导入')),
+        '未找到取消日志');
+
     // 垃圾文件不能把已有数据搞坏
-    await feed('{ not json', false);
+    await feed('{ not json', 'merge');
     stored = JSON.parse(w.localStorage.getItem('hhanclub_lottery_stats_v4'));
     check('非法 JSON 被拒绝且不动已有数据', stored.draws === 10, stored.draws);
     check('非法 JSON 打了错误日志',
         Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('不是合法 JSON')),
         '未找到错误日志');
 
-    await feed(JSON.stringify({ hello: 'world' }), false);
+    await feed(JSON.stringify({ hello: 'world' }), 'merge');
     stored = JSON.parse(w.localStorage.getItem('hhanclub_lottery_stats_v4'));
     check('认不出的结构被拒绝', stored.draws === 10, stored.draws);
 
