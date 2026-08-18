@@ -20,7 +20,7 @@ HHCLUB 四周年庆典抽奖的油猴脚本，在 `lucky.php` 页面挂一个悬
 装好 [Tampermonkey](https://www.tampermonkey.net/) 后，打开 [`hhclub-auto-lottery.user.js`](hhclub-auto-lottery.user.js) 的 Raw 链接，油猴会自动识别并提示安装：
 
 ```
-https://raw.githubusercontent.com/SAGIRIxr/HH-Automatic-lottery/main/hhclub-auto-lottery.user.js
+https://raw.githubusercontent.com/SAGIRIxr/HH-Automatic-lottery/claude/hhclub-prize-stats-optimize-nc1dz4/hhclub-auto-lottery.user.js
 ```
 
 ---
@@ -123,10 +123,14 @@ npm test        # 行为测试，约 90 秒（用的是真实计时器）
 在 GreasyFork 脚本管理页选择「从代码仓库同步」，同步地址填：
 
 ```
-https://raw.githubusercontent.com/SAGIRIxr/HH-Automatic-lottery/main/hhclub-auto-lottery.user.js
+https://raw.githubusercontent.com/SAGIRIxr/HH-Automatic-lottery/claude/hhclub-prize-stats-optimize-nc1dz4/hhclub-auto-lottery.user.js
 ```
 
-之后每次改动只要提交到默认分支并升高 `@version`，GreasyFork 就会自动拉取新版本。
+之后每次改动只要提交到该分支并升高 `@version`，GreasyFork 就会自动拉取新版本。
+
+> 当前默认分支是 `claude/hhclub-prize-stats-optimize-nc1dz4`（仓库初始为空，首次推送的分支会自动成为默认分支）。
+> 如果在 GitHub 的 Settings → Branches 里把它重命名为 `main`，同步地址相应改成：
+> `https://raw.githubusercontent.com/SAGIRIxr/HH-Automatic-lottery/main/hhclub-auto-lottery.user.js`
 
 ---
 
