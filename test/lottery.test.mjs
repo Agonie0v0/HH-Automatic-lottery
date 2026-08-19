@@ -123,7 +123,12 @@ console.log('\n[3] 分奖项统计聚合（A2 核心）');
     ];
     let i = 0;
     let calls = 0;
-    w.fetch = async () => {
+    w.fetch = async url => {
+        // 序列里有一注 VIP，脚本中到 VIP 会回服务端核一次余额 ——
+        // 那一发不是抽奖请求，不能从奖品序列里取，否则整条序列错位
+        if (String(url).includes('lucky.php')) {
+            return { ok: true, status: 200, text: async () => '<html><body></body></html>' };
+        }
         calls++;
         const text = prizes[i % prizes.length];
         i++;
