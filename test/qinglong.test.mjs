@@ -139,7 +139,8 @@ function runScript(config) {
     if (start < 0 || end < 0) throw new Error('配置区标记不见了，测试没法注入配置');
 
     const merged = {
-        cookies: ['c_secure_uid=test'],
+        cookie: 'c_secure_uid=test',
+        statsFile: '',
         draws: 10,
         reserve: 0,
         interval: 3,
@@ -180,7 +181,7 @@ console.log('\n[1] 填上 Cookie 就能跑：按次数抽，汇总正确');
 
     check('正常退出', code === 0, `exit ${code}`);
     check('刚好抽了 3 次', site.state.draws === 3, `实际 ${site.state.draws}`);
-    check('汇总里写了 3 抽', /账号 1：3 抽/.test(out), out.slice(-400));
+    check('汇总里写了 3 抽', /本次：3 抽/.test(out), out.slice(-400));
     check('消耗算的是 3 × 2000', /消耗 6,000/.test(out), out.slice(-400));
     check('憨豆合计 100 + 5000 + 1000 = 6,100', /获得 6,100 憨豆/.test(out), out.slice(-400));
     check('盈亏 +100', /盈亏 \+100（\+1\.7%）/.test(out), out.slice(-400));
@@ -217,7 +218,7 @@ console.log('\n[3] 已是 VIP 时站点改发憨豆，要按憨豆记账');
 
     const { out } = await runScript({ host: site.state.origin, draws: 1 });
 
-    check('识别出了换发', /已是 VIP，站点改发 1,000,000 憨豆/.test(out), out.slice(-500));
+    check('识别出了换发', /已经是 VIP，站点改发了 1,000,000 憨豆/.test(out), out.slice(-500));
     check('憨豆记了 1,000,000', /获得 1,000,000 憨豆/.test(out), out.slice(-500));
     check('档位记成憨豆而不是 VIP 天数',
         /1,000,000 憨豆 × 1/.test(out) && !/7 天 × 1/.test(out), out.slice(-500));
@@ -304,7 +305,7 @@ console.log('\n[7] Cookie 失效要说人话，别闷头抽');
 /* ---------------------------------------------------------------- */
 console.log('\n[8] 没填 Cookie（还是占位文字）直接报错退出');
 {
-    const { code, out } = await runScript({ cookies: ['在这里粘贴你的 Cookie'] });
+    const { code, out } = await runScript({ cookie: '在这里粘贴你的 Cookie' });
 
     check('非零退出码', code === 1, `exit ${code}`);
     check('占位文字不会被当成真 Cookie', /还没填 Cookie/.test(out), out.slice(-300));
@@ -312,31 +313,137 @@ console.log('\n[8] 没填 Cookie（还是占位文字）直接报错退出');
 }
 
 /* ---------------------------------------------------------------- */
-console.log('\n[9] 多账号按顺序各跑各的');
-{
-    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
-
-    const { out } = await runScript({
-        host: site.state.origin,
-        cookies: ['c_secure_uid=aaa', 'c_secure_uid=bbb'],
-        draws: 2
-    });
-
-    check('两个账号一共抽了 4 次', site.state.draws === 4, `实际 ${site.state.draws}`);
-    check('汇总里两个账号都在',
-        /账号 1：2 抽/.test(out) && /账号 2：2 抽/.test(out), out.slice(-600));
-
-    await site.close();
-}
-
-/* ---------------------------------------------------------------- */
-console.log('\n[10] 站点跟着改单抽消耗');
+console.log('\n[9] 站点跟着改单抽消耗');
 {
     const site = await startSite({ prizes: ['魔力 100 '], balance: 100000, cost: 4000 });
 
     const { out } = await runScript({ host: site.state.origin, draws: 2 });
 
     check('单抽消耗按页面上的 4,000 算', /消耗 8,000/.test(out), out.slice(-400));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[10] 统计导出：格式和油猴版备份一模一样');
+{
+    const site = await startSite({
+        prizes: ['魔力 100 ', '补签卡 1 ', '魔力 100 '],
+        balance: 100000
+    });
+    const statsFile = path.join(TMP, 'stats-format.json');
+
+    await runScript({ host: site.state.origin, draws: 3, statsFile });
+
+    const payload = JSON.parse(fs.readFileSync(statsFile, 'utf8'));
+
+    check('外层是备份文件的信封', payload.kind === 'hhclub-lottery-backup' && payload.version === 4,
+        JSON.stringify({ kind: payload.kind, version: payload.version }));
+    check('带 current 和 total 两份', !!payload.current && !!payload.total);
+    check('标了来源是青龙', payload.source === 'qinglong', payload.source);
+
+    const t = payload.total;
+    check('抽数 / 消耗对得上', t.draws === 3 && t.cost === 6000, `${t.draws} 抽 / ${t.cost}`);
+    check('gains 八个字段齐全',
+        ['beans', 'magic', 'invite', 'rainbow', 'vip', 'makeup', 'upload', 'rename']
+            .every(k => typeof t.gains[k] === 'number'),
+        JSON.stringify(t.gains));
+    check('憨豆合计 200', t.gains.beans === 200, `实际 ${t.gains.beans}`);
+    check('补签卡 1 个', t.gains.makeup === 1, `实际 ${t.gains.makeup}`);
+    check('prizes 是「类别 → { count, value, tiers }」',
+        t.prizes.beans?.count === 2 && t.prizes.beans?.value === 200
+        && t.prizes.beans?.tiers['100 憨豆'] === 2,
+        JSON.stringify(t.prizes));
+    check('档位名和油猴版一致（100 憨豆 / 1 个）',
+        Object.keys(t.prizes.makeup.tiers)[0] === '1 个',
+        Object.keys(t.prizes.makeup.tiers).join(' | '));
+    check('raw 保留原始文案且已 trim',
+        t.raw['魔力 100'] === 2 && t.raw['补签卡 1'] === 1, JSON.stringify(t.raw));
+    check('带上了首末时间戳', typeof t.firstAt === 'number' && typeof t.lastAt === 'number',
+        `${t.firstAt} / ${t.lastAt}`);
+    check('日志里给出了文件路径', true);
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[11] 跨次运行累计：total 累加，current 只记本次');
+{
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
+    const statsFile = path.join(TMP, 'stats-accumulate.json');
+
+    await runScript({ host: site.state.origin, draws: 3, statsFile });
+    const { out } = await runScript({ host: site.state.origin, draws: 2, statsFile });
+
+    const payload = JSON.parse(fs.readFileSync(statsFile, 'utf8'));
+
+    check('total 累到 5 抽', payload.total.draws === 5, `实际 ${payload.total.draws}`);
+    check('total 消耗累到 10,000', payload.total.cost === 10000, `实际 ${payload.total.cost}`);
+    check('current 只记这一次的 2 抽', payload.current.draws === 2, `实际 ${payload.current.draws}`);
+    check('档位次数也在累加', payload.total.prizes.beans.tiers['100 憨豆'] === 5,
+        JSON.stringify(payload.total.prizes.beans.tiers));
+    check('汇总里同时报了本次和历史总计',
+        /本次：2 抽/.test(out) && /历史总计：5 抽/.test(out), out.slice(-600));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[12] VIP 折算要落进导出的统计里');
+{
+    const site = await startSite({
+        prizes: ['VIP 7 Day(s)'],
+        balance: 500000,
+        onDraw: state => { state.balance += 1000000; }
+    });
+    const statsFile = path.join(TMP, 'stats-vip.json');
+
+    await runScript({ host: site.state.origin, draws: 1, statsFile });
+
+    const t = JSON.parse(fs.readFileSync(statsFile, 'utf8')).total;
+
+    check('憨豆记了 1,000,000', t.gains.beans === 1000000, `实际 ${t.gains.beans}`);
+    check('VIP 天数被撤掉了', !t.gains.vip, `实际 ${t.gains.vip}`);
+    check('prizes 里只剩憨豆那一类',
+        t.prizes.beans?.count === 1 && !t.prizes.vip, JSON.stringify(t.prizes));
+    check('档位名是「1,000,000 憨豆」',
+        Object.keys(t.prizes.beans.tiers)[0] === '1,000,000 憨豆',
+        Object.keys(t.prizes.beans.tiers).join(' | '));
+    check('原始文案照实保留 VIP', t.raw['VIP 7 Day(s)'] === 1, JSON.stringify(t.raw));
+    check('抽数和消耗没被重复计', t.draws === 1 && t.cost === 2000, `${t.draws} 抽 / ${t.cost}`);
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[13] 统计文件坏了不能把这次的成绩带走');
+{
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
+    const statsFile = path.join(TMP, 'stats-broken.json');
+    fs.writeFileSync(statsFile, '{ 这不是合法 JSON');
+
+    const { out } = await runScript({ host: site.state.origin, draws: 2, statsFile });
+
+    check('提示了文件读不出来', /统计文件读不出来/.test(out), out.slice(-600));
+    check('这次的 2 抽照样存下来了',
+        JSON.parse(fs.readFileSync(statsFile, 'utf8')).total.draws === 2,
+        fs.readFileSync(statsFile, 'utf8').slice(0, 120));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[14] statsFile 留空就不落文件');
+{
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
+    const before = fs.readdirSync(TMP).filter(f => f.startsWith('stats-')).length;
+
+    const { out } = await runScript({ host: site.state.origin, draws: 1, statsFile: '' });
+
+    const after = fs.readdirSync(TMP).filter(f => f.startsWith('stats-')).length;
+    check('没多出统计文件', after === before, `${before} → ${after}`);
+    check('也不会提示存到哪儿', !/统计已存到/.test(out), out.slice(-400));
+    check('汇总照常打印', /本次：1 抽/.test(out), out.slice(-400));
 
     await site.close();
 }

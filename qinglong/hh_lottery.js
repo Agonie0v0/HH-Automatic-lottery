@@ -7,12 +7,19 @@
  * 用法：把下面「配置区」里的 Cookie 填上就能跑，其余按需改。
  * 详细说明见同目录 README.md。
  *
+ * 统计会存成一份 JSON，格式和油猴版的「💾 备份 JSON」完全一致 ——
+ * 从 NAS 上把这个文件拿下来，在浏览器面板里点「📥 导入备份」就能合进去。
+ *
  * 依赖：Node 18+（用的是内置 fetch，不需要 npm install 任何东西）
  * 仓库：https://github.com/SAGIRIxr/HH-Automatic-lottery
  * 协议：MIT
  */
 
 'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+
 /* =========================================================
    ⚙️ 配置区 —— 只用改这一块，下面的都不用动
 ========================================================= */
@@ -20,12 +27,8 @@
 const CONFIG = {
     /* ① Cookie（必填）
           浏览器登录 hhanclub.net → F12 → Network → 随便点一个请求
-          → 请求头里的 Cookie 整行复制过来。
-          多账号就多写几行，一行一个，记得每行末尾的逗号。 */
-    cookies: [
-        '在这里粘贴你的 Cookie',
-        // 'c_secure_uid=...; c_secure_pass=...; 第二个账号',
-    ],
+          → 请求头里的 Cookie 整行复制过来 */
+    cookie: '在这里粘贴你的 Cookie',
 
     /* ② 每次运行抽多少次。
           填 0 = 一抽到底，一直抽到余额跌破下面的保留线为止 */
@@ -46,8 +49,10 @@ const CONFIG = {
           只删这一种，「种子被删除」之类的一封不碰 */
     cleanMail: false,
 
-    /* ⑦ 多账号之间隔几秒再跑下一个 */
-    accountGap: 10,
+    /* ⑦ 统计存到哪个文件。跨次运行累计，格式和油猴版备份一致，
+          拿下来就能在浏览器面板里「📥 导入备份」。
+          留空字符串 '' 就是不记 */
+    statsFile: 'hh_lottery_stats.json',
 
     /* ⑧ 站点域名，一般不用改 */
     host: 'hhanclub.net',
@@ -63,7 +68,7 @@ const CONFIG = {
 const RUNTIME = {
     // 请求节奏抖动比例，避免固定频率特征
     jitter: 0.15,
-    // 连续失败多少次放弃这个账号
+    // 连续失败多少次放弃
     maxErrors: 5,
     // 连续被限流多少次放弃
     maxRateLimits: 12,
@@ -93,16 +98,15 @@ function normalizeConfig() {
     CONFIG.reserve = int(CONFIG.reserve, 0, 0);
     CONFIG.interval = int(CONFIG.interval, 8, 3);
     CONFIG.maxMinutes = int(CONFIG.maxMinutes, 60, 1);
-    CONFIG.accountGap = int(CONFIG.accountGap, 10, 0);
     CONFIG.cleanMail = CONFIG.cleanMail === true;
     CONFIG.host = String(CONFIG.host || 'hhanclub.net').trim().replace(/\/+$/, '');
+    CONFIG.statsFile = String(CONFIG.statsFile || '').trim();
 }
 
-/* 还没填 Cookie 的占位行要挑出来，不然会拿着「在这里粘贴」去请求 */
-function readCookies() {
-    return (Array.isArray(CONFIG.cookies) ? CONFIG.cookies : [CONFIG.cookies])
-        .map(item => String(item || '').trim())
-        .filter(item => item.length > 0 && !item.includes('在这里粘贴'));
+/* 还没填 Cookie 的占位文字要认出来，不然会拿着「在这里粘贴」去请求 */
+function readCookie() {
+    const cookie = String(CONFIG.cookie || '').trim();
+    return cookie && !cookie.includes('在这里粘贴') ? cookie : '';
 }
 
 /* =========================================================
@@ -163,6 +167,7 @@ function numberAfterClass(html, className) {
 
 const PRIZE_META = {
     beans: { name: '憨豆', unit: '' },
+    magic: { name: '憨豆（旧魔力）', unit: '' },
     invite: { name: '邀请', unit: '' },
     rainbow: { name: '彩虹ID', unit: '天' },
     vip: { name: 'VIP', unit: '天' },
@@ -219,22 +224,166 @@ function parsePrizeText(text) {
 }
 
 /* =========================================================
-   一个账号
+   统计
+
+   结构和油猴版的 v4 完全一致，所以存出来的文件能直接被面板上的
+   「📥 导入备份」吃下去：
+     draws  抽奖次数
+     cost   累计消耗憨豆
+     gains  各类奖品累计数值
+     prizes 分奖项统计 { 类别: { count, value, tiers: { 档位: 次数 } } }
+     raw    原始奖品文案计数
 ========================================================= */
 
-class Account {
-    constructor(cookie, index) {
+function emptyStats() {
+    return {
+        version: 4,
+        draws: 0,
+        cost: 0,
+        gains: { beans: 0, magic: 0, invite: 0, rainbow: 0, vip: 0, makeup: 0, upload: 0, rename: 0 },
+        prizes: {},
+        raw: {},
+        firstAt: null,
+        lastAt: null
+    };
+}
+
+function ensureBucket(stats, type) {
+    if (!stats.prizes[type]) stats.prizes[type] = { count: 0, value: 0, tiers: {} };
+    return stats.prizes[type];
+}
+
+/* 读进来的文件可能是手改过的、或者早期版本存的，收一遍。
+   早期版本把「魔力」当独立类别存过，这里合回 beans。 */
+function normalizeStats(data) {
+    const stats = emptyStats();
+    if (!data || typeof data !== 'object') return stats;
+
+    stats.draws = Number(data.draws) || 0;
+    stats.cost = Number(data.cost) || 0;
+    stats.firstAt = data.firstAt || null;
+    stats.lastAt = data.lastAt || null;
+
+    Object.keys(stats.gains).forEach(key => {
+        stats.gains[key] = Number(data.gains?.[key]) || 0;
+    });
+    stats.gains.beans += Number(data.gains?.magic) || 0;
+    stats.gains.magic = 0;
+
+    Object.entries(data.prizes || {}).forEach(([type, bucket]) => {
+        const merged = ensureBucket(stats, type === 'magic' ? 'beans' : type);
+        merged.count += Number(bucket?.count) || 0;
+        merged.value += Number(bucket?.value) || 0;
+        Object.entries(bucket?.tiers || {}).forEach(([label, count]) => {
+            merged.tiers[label] = (merged.tiers[label] || 0) + (Number(count) || 0);
+        });
+    });
+
+    stats.raw = { ...(data.raw || {}) };
+    return stats;
+}
+
+function applyPrize(stats, prizeText, cost, prize) {
+    stats.draws += 1;
+    stats.cost += cost;
+
+    if (prize.type !== 'unknown') {
+        stats.gains[prize.type] = (stats.gains[prize.type] || 0) + prize.value;
+    }
+
+    const bucket = ensureBucket(stats, prize.type);
+    bucket.count += 1;
+    bucket.value += prize.value;
+    bucket.tiers[prize.label] = (bucket.tiers[prize.label] || 0) + 1;
+
+    // 接口返回的文案常带尾随空格，不 trim 的话同一个奖会留下两条 key
+    const rawKey = String(prizeText).trim();
+    stats.raw[rawKey] = (stats.raw[rawKey] || 0) + 1;
+
+    stats.lastAt = Date.now();
+    if (!stats.firstAt) stats.firstAt = stats.lastAt;
+}
+
+/* 把已经记成 from 的那一注改记成 to。抽数和消耗不动，只挪奖品归属。 */
+function reclassifyLastDraw(stats, from, to) {
+    if (from.type !== 'unknown') {
+        stats.gains[from.type] = (stats.gains[from.type] || 0) - from.value;
+    }
+    const old = ensureBucket(stats, from.type);
+    old.count -= 1;
+    old.value -= from.value;
+    old.tiers[from.label] = (old.tiers[from.label] || 0) - 1;
+    if (old.tiers[from.label] <= 0) delete old.tiers[from.label];
+    if (old.count <= 0) delete stats.prizes[from.type];
+
+    if (to.type !== 'unknown') {
+        stats.gains[to.type] = (stats.gains[to.type] || 0) + to.value;
+    }
+    const next = ensureBucket(stats, to.type);
+    next.count += 1;
+    next.value += to.value;
+    next.tiers[to.label] = (next.tiers[to.label] || 0) + 1;
+}
+
+function statsPath() {
+    if (!CONFIG.statsFile) return '';
+    return path.isAbsolute(CONFIG.statsFile)
+        ? CONFIG.statsFile
+        : path.join(__dirname, CONFIG.statsFile);
+}
+
+function loadTotal() {
+    const file = statsPath();
+    if (!file || !fs.existsSync(file)) return emptyStats();
+
+    try {
+        const payload = JSON.parse(fs.readFileSync(file, 'utf8'));
+        // 备份文件和裸的统计对象都收
+        return normalizeStats(payload?.total || payload?.current || payload);
+    } catch (error) {
+        report(`⚠️ 统计文件读不出来（${error.message}），这次从零开始记`);
+        return emptyStats();
+    }
+}
+
+/* 存的就是油猴版备份文件那个格式，拿去导入即可 */
+function saveStats(current, total) {
+    const file = statsPath();
+    if (!file) return '';
+
+    const payload = {
+        kind: 'hhclub-lottery-backup',
+        version: 4,
+        exportedAt: new Date().toISOString(),
+        source: 'qinglong',
+        current,
+        total
+    };
+
+    try {
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, JSON.stringify(payload, null, 2));
+        return file;
+    } catch (error) {
+        report(`⚠️ 统计写不进去（${error.message}）`);
+        return '';
+    }
+}
+
+/* =========================================================
+   抽奖
+========================================================= */
+
+class Lottery {
+    constructor(cookie) {
         this.cookie = cookie;
-        this.index = index;
         this.origin = /^https?:\/\//.test(CONFIG.host) ? CONFIG.host : `https://${CONFIG.host}`;
-        this.name = `账号 ${index + 1}`;
 
         this.balance = 0;
         this.cost = 2000;
-        this.draws = 0;
-        this.spent = 0;
-        this.gains = {};
-        this.tiers = {};
+
+        this.current = emptyStats();
+        this.total = loadTotal();
 
         this.errorStreak = 0;
         this.rateLimitStreak = 0;
@@ -252,14 +401,13 @@ class Account {
         };
     }
 
-    async get(path) {
-        const response = await fetch(`${this.origin}${path}`, { headers: this.headers() });
-        if (!response.ok) throw new Error(`${path} 请求失败（HTTP ${response.status}）`);
+    async get(urlPath) {
+        const response = await fetch(`${this.origin}${urlPath}`, { headers: this.headers() });
+        if (!response.ok) throw new Error(`${urlPath} 请求失败（HTTP ${response.status}）`);
         return response.text();
     }
 
-    /* 一次请求同时拿余额、单抽消耗。站点抽完不刷新页面，
-       这两个数只能主动来取。 */
+    /* 一次请求同时拿余额、单抽消耗。站点抽完不刷新页面，这两个数只能主动来取。 */
     async snapshot() {
         const html = await this.get('/lucky.php');
 
@@ -294,16 +442,18 @@ class Account {
         }
     }
 
-    record(prize) {
-        this.draws += 1;
-        this.spent += this.cost;
-        this.gains[prize.type] = (this.gains[prize.type] || 0) + prize.value;
-        this.tiers[prize.label] = (this.tiers[prize.label] || 0) + 1;
+    record(prizeText, prize) {
+        applyPrize(this.current, prizeText, this.cost, prize);
+        applyPrize(this.total, prizeText, this.cost, prize);
     }
 
     /* 抽奖页写着：「当中奖 [VIP] 时，如果用户已经是 VIP 或以上等级，
        奖励憨豆：1000000」。接口返回的文案还是 VIP，替换是发奖时做的。
-       所以中到 VIP 就回服务端核一次余额，真多出一大笔就改记成憨豆。 */
+       所以中到 VIP 就回服务端核一次余额，真多出一大笔就改记成憨豆。
+
+       不用去猜用户是不是 VIP —— 余额说了算。而且要是哪天 prize_text
+       本身就返回「魔力 1000000」，那笔憨豆已经记进去了、估算和实际对得上，
+       这里不会重复计。 */
     async reconcileVip(prize) {
         const estimated = this.balance;
 
@@ -318,17 +468,11 @@ class Account {
         this.balance = actual;
         if (drift < RUNTIME.vipSwapMinBeans) return;
 
-        // 撤掉按 VIP 记的那一笔，改记成憨豆
-        this.gains.vip = (this.gains.vip || 0) - prize.value;
-        if (this.gains.vip <= 0) delete this.gains.vip;
-        this.tiers[prize.label] -= 1;
-        if (this.tiers[prize.label] <= 0) delete this.tiers[prize.label];
-
         const swapped = parsePrizeText(`魔力 ${Math.round(drift)}`);
-        this.gains.beans = (this.gains.beans || 0) + swapped.value;
-        this.tiers[swapped.label] = (this.tiers[swapped.label] || 0) + 1;
+        reclassifyLastDraw(this.current, prize, swapped);
+        reclassifyLastDraw(this.total, prize, swapped);
 
-        report(`👑 ${this.name} 已是 VIP，站点改发 ${fmt(swapped.value)} 憨豆，已按憨豆记账`);
+        report(`👑 你已经是 VIP，站点改发了 ${fmt(swapped.value)} 憨豆，已按憨豆记账`);
     }
 
     nextDelay() {
@@ -336,17 +480,16 @@ class Account {
         return Math.max(1000, Math.round(this.intervalMs * jitter));
     }
 
-    /* 该不该再抽一次 */
     shouldContinue() {
         if (Date.now() > this.deadline) {
-            report(`⏰ ${this.name} 到达单次运行时间上限（${CONFIG.maxMinutes} 分钟），收工`);
+            report(`⏰ 到达单次运行时间上限（${CONFIG.maxMinutes} 分钟），收工`);
             return false;
         }
-        if (CONFIG.draws > 0) return this.draws < CONFIG.draws;
+        if (CONFIG.draws > 0) return this.current.draws < CONFIG.draws;
 
         // 一抽到底：留够保留线
         if (this.balance - this.cost < CONFIG.reserve) {
-            report(`🏁 ${this.name} 一抽到底完成，余额 ${fmt(this.balance)}（保留线 ${fmt(CONFIG.reserve)}）`);
+            report(`🏁 一抽到底完成，余额 ${fmt(this.balance)}（保留线 ${fmt(CONFIG.reserve)}）`);
             return false;
         }
         return true;
@@ -357,14 +500,14 @@ class Account {
         this.balance = start.balance;
         if (start.cost) this.cost = start.cost;
 
-        report(`\n▶ ${this.name} 开始 · 余额 ${fmt(this.balance)} 憨豆 · 单抽 ${fmt(this.cost)}`);
+        report(`▶ 开始 · 余额 ${fmt(this.balance)} 憨豆 · 单抽 ${fmt(this.cost)}`);
 
         if (this.balance < this.cost) {
-            report(`💸 ${this.name} 憨豆不足，跳过`);
+            report('💸 憨豆不足，跳过');
             return;
         }
         if (CONFIG.draws === 0 && this.balance - this.cost < CONFIG.reserve) {
-            report(`💸 ${this.name} 余额已在保留线之下，跳过`);
+            report('💸 余额已在保留线之下，跳过');
             return;
         }
 
@@ -380,9 +523,9 @@ class Account {
 
             if (!result.data) {
                 this.errorStreak++;
-                log(`❌ ${this.name} 请求失败（HTTP ${result.status}）`);
+                log(`❌ 请求失败（HTTP ${result.status}）`);
                 if (this.errorStreak >= RUNTIME.maxErrors) {
-                    report(`🛑 ${this.name} 连续 ${this.errorStreak} 次失败，停止`);
+                    report(`🛑 连续 ${this.errorStreak} 次失败，停止`);
                     return;
                 }
                 continue;
@@ -396,11 +539,11 @@ class Account {
                 const prizeText = decodeUnicode(result.data.data?.prize_text || '未知奖品');
                 const prize = parsePrizeText(prizeText);
 
-                this.record(prize);
+                this.record(prizeText, prize);
                 // 中的憨豆是真回血，本地结算一次，省得每抽都去要余额
                 this.balance = Math.max(0, this.balance - this.cost + (prize.type === 'beans' ? prize.value : 0));
 
-                log(`🎲 ${this.name} 第 ${this.draws} 抽：${prizeText.trim()} · 余额 ${fmt(this.balance)}`);
+                log(`🎲 第 ${this.current.draws} 抽：${prizeText.trim()} · 余额 ${fmt(this.balance)}`);
 
                 if (prize.type === 'vip') await this.reconcileVip(prize);
                 continue;
@@ -410,14 +553,14 @@ class Account {
 
             if (msg.includes('重复点击') || msg.includes('请稍后') || msg.includes('频繁')) {
                 this.rateLimitStreak++;
-                log(`⏳ ${this.name} ${msg}`);
+                log(`⏳ ${msg}`);
 
                 if (this.rateLimitStreak >= RUNTIME.backoffAfter) {
                     this.intervalMs = Math.min(this.intervalMs * RUNTIME.backoffFactor, RUNTIME.maxBackoffMs);
-                    log(`🔄 ${this.name} 间隔上调到 ${(this.intervalMs / 1000).toFixed(1)} 秒`);
+                    log(`🔄 间隔上调到 ${(this.intervalMs / 1000).toFixed(1)} 秒`);
                 }
                 if (this.rateLimitStreak >= RUNTIME.maxRateLimits) {
-                    report(`🛑 ${this.name} 连续 ${this.rateLimitStreak} 次被限流，停止`);
+                    report(`🛑 连续 ${this.rateLimitStreak} 次被限流，停止`);
                     return;
                 }
                 continue;
@@ -425,14 +568,14 @@ class Account {
 
             // 憨豆不足 / 次数用完这类是明确的终止信号，不重试
             if (msg.includes('次数') || msg.includes('用完') || msg.includes('不足')) {
-                report(`🛑 ${this.name} ${msg}，停止`);
+                report(`🛑 ${msg}，停止`);
                 return;
             }
 
             this.errorStreak++;
-            log(`❌ ${this.name} ${msg}`);
+            log(`❌ ${msg}`);
             if (this.errorStreak >= RUNTIME.maxErrors) {
-                report(`🛑 ${this.name} 连续 ${this.errorStreak} 次失败，停止`);
+                report(`🛑 连续 ${this.errorStreak} 次失败，停止`);
                 return;
             }
         }
@@ -493,8 +636,8 @@ class Account {
             // 翻完整个收件箱，把要删的 id 收齐
             const doomed = [];
             const seen = new Set();
-            let first = await this.mailPage(0);
-            let totalPages = first.pageCount > 0 ? first.pageCount : RUNTIME.mailMaxPages;
+            const first = await this.mailPage(0);
+            const totalPages = first.pageCount > 0 ? first.pageCount : RUNTIME.mailMaxPages;
 
             for (let page = 0; page < Math.min(totalPages, RUNTIME.mailMaxPages); page++) {
                 const { items } = page === 0 ? first : await this.mailPage(page);
@@ -521,38 +664,49 @@ class Account {
                 removed += await this.deleteMail(ids);
             }
         } catch (error) {
-            report(`⚠️ ${this.name} 站内信清理失败：${error.message}`);
+            report(`⚠️ 站内信清理失败：${error.message}`);
             return;
         }
 
-        if (removed) report(`📪 ${this.name} 清掉 ${fmt(removed)} 封抽奖通知`);
+        if (removed) report(`📪 清掉 ${fmt(removed)} 封抽奖通知`);
     }
 
-    summary() {
-        if (!this.draws) return `${this.name}：一抽未成`;
+    /* ---------------- 汇总 ---------------- */
 
-        const beans = this.gains.beans || 0;
-        const profit = beans - this.spent;
-        const rate = this.spent > 0 ? (profit / this.spent) * 100 : 0;
+    summarize(stats, title) {
+        if (!stats.draws) return `${title}：一抽未成`;
 
-        const others = Object.entries(this.gains)
-            .filter(([type]) => type !== 'beans' && type !== 'unknown')
+        const beans = stats.gains.beans || 0;
+        const profit = beans - stats.cost;
+        const rate = stats.cost > 0 ? (profit / stats.cost) * 100 : 0;
+
+        const others = Object.entries(stats.gains)
+            .filter(([type, value]) => type !== 'beans' && type !== 'magic' && value > 0)
             .map(([type, value]) => `${PRIZE_META[type]?.name || type} ${fmt(value)}${PRIZE_META[type]?.unit || ''}`)
             .join(' · ');
 
-        const tierLines = Object.entries(this.tiers)
+        const tiers = Object.values(stats.prizes)
+            .flatMap(bucket => Object.entries(bucket.tiers))
             .sort((a, b) => b[1] - a[1])
             .map(([label, count]) => `    ${label} × ${count}`)
             .join('\n');
 
         return [
-            `${this.name}：${this.draws} 抽`,
-            `  消耗 ${fmt(this.spent)} · 获得 ${fmt(beans)} 憨豆`,
+            `${title}：${fmt(stats.draws)} 抽`,
+            `  消耗 ${fmt(stats.cost)} · 获得 ${fmt(beans)} 憨豆`,
             `  盈亏 ${profit >= 0 ? '+' : ''}${fmt(profit)}（${rate >= 0 ? '+' : ''}${rate.toFixed(1)}%）`,
-            `  余额 ${fmt(this.balance)}`,
             others ? `  其他：${others}` : '',
-            tierLines
+            tiers
         ].filter(Boolean).join('\n');
+    }
+
+    summary() {
+        const lines = [this.summarize(this.current, '本次')];
+        if (CONFIG.statsFile && this.total.draws > this.current.draws) {
+            lines.push('', this.summarize(this.total, '历史总计'));
+        }
+        lines.push('', `余额 ${fmt(this.balance)}`);
+        return lines.join('\n');
     }
 }
 
@@ -562,9 +716,9 @@ class Account {
 
 async function notify(title, content) {
     let sender = null;
-    for (const path of ['./sendNotify', '/ql/data/scripts/sendNotify', '/ql/scripts/sendNotify']) {
+    for (const modulePath of ['./sendNotify', '/ql/data/scripts/sendNotify', '/ql/scripts/sendNotify']) {
         try {
-            sender = require(path);
+            sender = require(modulePath);
             break;
         } catch (error) {
             // 没装通知模块就算了，日志里一样看得到
@@ -590,37 +744,34 @@ async function main() {
 
     normalizeConfig();
 
-    const cookies = readCookies();
-    if (!cookies.length) {
-        log('❌ 还没填 Cookie。打开脚本，把最上面「配置区」里 cookies 那一行换成你的 Cookie：');
+    const cookie = readCookie();
+    if (!cookie) {
+        log('❌ 还没填 Cookie。打开脚本，把最上面「配置区」里 cookie 那一行换成你的 Cookie：');
         log('   浏览器登录 hhanclub.net → F12 → Network → 任意请求 → 请求头里的 Cookie 整行复制');
         process.exit(1);
     }
 
-    log(`🎡 HHCLUB 幸运大转盘 · 共 ${cookies.length} 个账号`);
+    log('🎡 HHCLUB 幸运大转盘');
     log(CONFIG.draws > 0
-        ? `   每个账号抽 ${CONFIG.draws} 次 · 间隔 ${CONFIG.interval} 秒`
+        ? `   抽 ${CONFIG.draws} 次 · 间隔 ${CONFIG.interval} 秒`
         : `   一抽到底 · 保留 ${fmt(CONFIG.reserve)} 憨豆 · 间隔 ${CONFIG.interval} 秒`);
 
-    const accounts = [];
+    const lottery = new Lottery(cookie);
 
-    for (let i = 0; i < cookies.length; i++) {
-        const account = new Account(cookies[i], i);
-        accounts.push(account);
-
-        try {
-            await account.run();
-            if (CONFIG.cleanMail) await account.cleanMail();
-        } catch (error) {
-            report(`❌ ${account.name} 出错：${error.message}`);
-        }
-
-        if (i < cookies.length - 1 && CONFIG.accountGap > 0) {
-            await sleep(CONFIG.accountGap * 1000);
-        }
+    try {
+        await lottery.run();
+        if (CONFIG.cleanMail) await lottery.cleanMail();
+    } catch (error) {
+        report(`❌ ${error.message}`);
     }
 
-    const summary = accounts.map(account => account.summary()).join('\n\n');
+    // 抽出来的成绩不能因为后面出岔子就丢了，无论如何先落盘
+    if (lottery.current.draws > 0) {
+        const file = saveStats(lottery.current, lottery.total);
+        if (file) report(`💾 统计已存到 ${file}（可直接在油猴面板里「导入备份」）`);
+    }
+
+    const summary = lottery.summary();
     log(`\n${'─'.repeat(40)}\n${summary}`);
 
     await notify('HHCLUB 幸运大转盘', [...messages, '', summary].join('\n').trim());

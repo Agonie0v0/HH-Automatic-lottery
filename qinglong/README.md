@@ -2,6 +2,8 @@
 
 不用开浏览器、不用挂机。**所有配置都在脚本最上面那一块，改完保存就能跑，不用配环境变量。** 跟油猴版共用一套抽奖逻辑（限流退避、VIP 折算、站内信清理都在），只是把面板换成了日志和通知。
 
+统计会存成一份 JSON，**格式和油猴版的「💾 备份 JSON」完全一致** —— 挂 NAS 上跑，隔段时间把文件拿下来，在浏览器面板里点「📥 导入备份」就能合进电脑上的历史统计。
+
 **依赖：Node 18 以上。** 用的是内置 `fetch`，不需要 `npm install` 任何东西。
 
 ---
@@ -27,17 +29,14 @@ ql raw https://raw.githubusercontent.com/SAGIRIxr/HH-Automatic-lottery/main/qing
 ```js
 const CONFIG = {
     /* ① Cookie（必填） */
-    cookies: [
-        '在这里粘贴你的 Cookie',
-        // 'c_secure_uid=...; c_secure_pass=...; 第二个账号',
-    ],
+    cookie: '在这里粘贴你的 Cookie',
 
     draws: 10,          // ② 每次抽多少次。填 0 = 一抽到底
     reserve: 0,         // ③ 一抽到底时留多少憨豆
     interval: 8,        // ④ 每抽间隔（秒），最小 3
     maxMinutes: 60,     // ⑤ 单次运行时间上限（分钟）
     cleanMail: false,   // ⑥ 抽完顺手清抽奖站内信
-    accountGap: 10,     // ⑦ 多账号之间隔几秒
+    statsFile: 'hh_lottery_stats.json',   // ⑦ 统计存哪儿，留空 '' 就是不记
     host: 'hhanclub.net',
     userAgent: '...'
 };
@@ -45,17 +44,17 @@ const CONFIG = {
 
 | 项 | 默认 | 说明 |
 |---|---|---|
-| `cookies` | **必填** | 站点完整 Cookie，数组，一行一个账号 |
+| `cookie` | **必填** | 站点完整 Cookie |
 | `draws` | `10` | 每次运行抽多少次。**填 `0` 表示一抽到底** |
 | `reserve` | `0` | 一抽到底时留多少憨豆不动 |
 | `interval` | `8` | 每抽间隔（秒），最小 3。站点有重复点击风控，别贪快 |
 | `maxMinutes` | `60` | 单次运行时间上限（分钟），防止一抽到底把任务挂死 |
 | `cleanMail` | `false` | 抽完顺手清掉「幸运大转盘 中奖通知」站内信 |
-| `accountGap` | `10` | 多账号之间隔几秒 |
+| `statsFile` | `hh_lottery_stats.json` | 统计存到哪个文件，相对路径按脚本所在目录算。留空 `''` 就是不记 |
 | `host` | `hhanclub.net` | 站点域名，一般不用改 |
 | `userAgent` | Chrome | 一般不用改 |
 
-填错类型不会炸：数字项会收敛到合法范围，`cookies` 里没换掉的占位行会被跳过。
+填错类型不会炸：数字项会收敛到合法范围，`cookie` 没换掉的话会直接提示你去填而不是拿占位文字去请求。
 
 ### 几种常见配法
 
@@ -84,6 +83,8 @@ c_secure_uid=NzMyMQ%3D%3D; c_secure_pass=...; c_secure_ssl=...; c_secure_tracker
 ```
 
 **Cookie 等于你的账号。** 别往任何第三方脚本或聊天框里贴。
+
+（站点每人只能有一个号，所以这里没做多账号。）
 
 ---
 
@@ -117,6 +118,29 @@ c_secure_uid=NzMyMQ%3D%3D; c_secure_pass=...; c_secure_ssl=...; c_secure_tracker
 
 ---
 
+## 统计导出 / 导入电脑
+
+`statsFile` 指的那份 JSON 就是油猴版的备份格式，跨次运行一直累加：
+
+```json
+{
+  "kind": "hhclub-lottery-backup",
+  "version": 4,
+  "exportedAt": "2026-08-19T12:00:00.000Z",
+  "source": "qinglong",
+  "current": { "draws": 20, ... },   // 这一次跑的
+  "total":   { "draws": 860, ... }   // 累计
+}
+```
+
+默认落在脚本同目录（青龙里一般是 `/ql/data/scripts/hh_lottery_stats.json`），写绝对路径也行。
+
+**导到电脑上：** 把这个文件下载下来 → 打开 `hhanclub.net/lucky.php` → 面板上点「📥 导入备份」→ 选**合并**。两边记录本来就不重合，合并之后 NAS 上抽的和电脑上抽的就并到一块了。
+
+导入读的是 `total` 那一份，所以每次导的都是完整累计；要是你在电脑上也抽过，选「合并」会把两边相加 —— 别重复导同一个文件，不然会算两遍。
+
+---
+
 ## 它会自己处理的几件事
 
 - **限流退避** —— 连续被拦就把间隔往上调（最高 30 秒），连拦 12 次放弃这个账号
@@ -139,7 +163,7 @@ c_secure_uid=NzMyMQ%3D%3D; c_secure_pass=...; c_secure_ssl=...; c_secure_tracker
 npm run test:ql
 ```
 
-会在本地起一个假站点，把脚本当子进程真跑一遍，覆盖按次数抽 / 一抽到底 / VIP 折算两种走向 / 站内信清理（含每页 10 封的分页）/ Cookie 没填 / Cookie 失效 / 多账号，共 33 条断言。
+会在本地起一个假站点，把脚本当子进程真跑一遍，覆盖按次数抽 / 一抽到底 / VIP 折算两种走向 / 站内信清理（含每页 10 封的分页）/ 统计导出格式 / 跨次累计 / 统计文件损坏 / Cookie 没填 / Cookie 失效，共 59 条断言。
 
 测试是**照你的用法来的**：复制一份源码、把配置区整块换掉、再当子进程真跑，所以配置区的写法本身也在被测。
 
