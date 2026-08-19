@@ -4,7 +4,8 @@
  * new Env('HHCLUB抽奖');
  * cron: 5 9 * * *
  *
- * 只需要填 Cookie 就能跑。变量说明见同目录 README.md。
+ * 用法：把下面「配置区」里的 Cookie 填上就能跑，其余按需改。
+ * 详细说明见同目录 README.md。
  *
  * 依赖：Node 18+（用的是内置 fetch，不需要 npm install 任何东西）
  * 仓库：https://github.com/SAGIRIxr/HH-Automatic-lottery
@@ -12,34 +13,53 @@
  */
 
 'use strict';
-
 /* =========================================================
-   环境变量
+   ⚙️ 配置区 —— 只用改这一块，下面的都不用动
 ========================================================= */
 
 const CONFIG = {
-    // 站点域名，一般不用改。带不带 https:// 都认
-    host: (process.env.HH_HOST || 'hhanclub.net').replace(/\/+$/, ''),
+    /* ① Cookie（必填）
+          浏览器登录 hhanclub.net → F12 → Network → 随便点一个请求
+          → 请求头里的 Cookie 整行复制过来。
+          多账号就多写几行，一行一个，记得每行末尾的逗号。 */
+    cookies: [
+        '在这里粘贴你的 Cookie',
+        // 'c_secure_uid=...; c_secure_pass=...; 第二个账号',
+    ],
 
-    // 每次运行抽多少次。填 0 表示「一抽到底」，抽到余额跌破保留线为止
-    draws: intEnv('HH_DRAWS', 10, 0),
+    /* ② 每次运行抽多少次。
+          填 0 = 一抽到底，一直抽到余额跌破下面的保留线为止 */
+    draws: 10,
 
-    // 一抽到底时给自己留多少憨豆
-    reserve: intEnv('HH_RESERVE', 0, 0),
+    /* ③ 一抽到底时给自己留多少憨豆不动 */
+    reserve: 0,
 
-    // 请求间隔（秒）。站点有重复点击风控，别设太小
-    interval: intEnv('HH_INTERVAL', 8, 3),
+    /* ④ 每抽间隔（秒）。站点有重复点击风控，别贪快，最小 3 */
+    interval: 8,
 
-    // 单次运行的时间上限（分钟），防止「一抽到底」把青龙任务挂死
-    maxMinutes: intEnv('HH_MAX_MINUTES', 60, 1),
+    /* ⑤ 单次运行的时间上限（分钟）。
+          一抽到底可能跑很久，这个是防止把青龙任务挂死的保险 */
+    maxMinutes: 60,
 
-    // 抽完顺手清掉「幸运大转盘 中奖通知」站内信
-    cleanMail: boolEnv('HH_CLEAN_MAIL', false),
+    /* ⑥ 抽完顺手清掉「幸运大转盘 中奖通知」站内信。
+          站点每抽一次就发一封，不清的话收件箱很快被埋掉。
+          只删这一种，「种子被删除」之类的一封不碰 */
+    cleanMail: false,
 
-    // 多账号之间的间隔（秒）
-    accountGap: intEnv('HH_ACCOUNT_GAP', 10, 0)
+    /* ⑦ 多账号之间隔几秒再跑下一个 */
+    accountGap: 10,
+
+    /* ⑧ 站点域名，一般不用改 */
+    host: 'hhanclub.net',
+
+    /* ⑨ User-Agent，一般不用改 */
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+        + '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
 };
 
+/* ===== 配置区结束 ===== */
+
+/* 下面这些是内部节奏参数，除非站点风控变了，否则不用碰 */
 const RUNTIME = {
     // 请求节奏抖动比例，避免固定频率特征
     jitter: 0.15,
@@ -62,25 +82,27 @@ const RUNTIME = {
     lotteryMailKeyword: '幸运大转盘'
 };
 
-function intEnv(name, fallback, min) {
-    const value = parseInt(process.env[name], 10);
-    if (!Number.isFinite(value)) return fallback;
-    return Math.max(min, value);
+/* 配置是手填的，收一遍边界，免得填了个负数或者字符串就跑出怪结果 */
+function normalizeConfig() {
+    const int = (value, fallback, min) => {
+        const number = parseInt(value, 10);
+        return Number.isFinite(number) ? Math.max(min, number) : fallback;
+    };
+
+    CONFIG.draws = int(CONFIG.draws, 10, 0);
+    CONFIG.reserve = int(CONFIG.reserve, 0, 0);
+    CONFIG.interval = int(CONFIG.interval, 8, 3);
+    CONFIG.maxMinutes = int(CONFIG.maxMinutes, 60, 1);
+    CONFIG.accountGap = int(CONFIG.accountGap, 10, 0);
+    CONFIG.cleanMail = CONFIG.cleanMail === true;
+    CONFIG.host = String(CONFIG.host || 'hhanclub.net').trim().replace(/\/+$/, '');
 }
 
-function boolEnv(name, fallback) {
-    const raw = process.env[name];
-    if (raw === undefined || raw === '') return fallback;
-    return /^(1|true|yes|on|是)$/i.test(String(raw).trim());
-}
-
-/* Cookie 支持多账号：用 & 或换行分隔 */
+/* 还没填 Cookie 的占位行要挑出来，不然会拿着「在这里粘贴」去请求 */
 function readCookies() {
-    const raw = process.env.HH_COOKIE || process.env.HHCLUB_COOKIE || '';
-    return raw
-        .split(/[&\n\r]+/)
-        .map(item => item.trim())
-        .filter(item => item.length > 0);
+    return (Array.isArray(CONFIG.cookies) ? CONFIG.cookies : [CONFIG.cookies])
+        .map(item => String(item || '').trim())
+        .filter(item => item.length > 0 && !item.includes('在这里粘贴'));
 }
 
 /* =========================================================
@@ -223,9 +245,7 @@ class Account {
     headers(extra = {}) {
         return {
             'cookie': this.cookie,
-            'user-agent': process.env.HH_UA
-                || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                 + '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+            'user-agent': CONFIG.userAgent,
             'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
             'referer': `${this.origin}/lucky.php`,
             ...extra
@@ -568,10 +588,12 @@ async function main() {
         process.exit(1);
     }
 
+    normalizeConfig();
+
     const cookies = readCookies();
     if (!cookies.length) {
-        log('❌ 没读到 HH_COOKIE。去青龙「环境变量」里加一条 HH_COOKIE，值是站点的完整 Cookie');
-        log('   多账号用 & 或换行分隔');
+        log('❌ 还没填 Cookie。打开脚本，把最上面「配置区」里 cookies 那一行换成你的 Cookie：');
+        log('   浏览器登录 hhanclub.net → F12 → Network → 任意请求 → 请求头里的 Cookie 整行复制');
         process.exit(1);
     }
 

@@ -1,19 +1,26 @@
 /**
  * 青龙版行为测试
  *
- * 起一个本地 mock 站点，把 HH_HOST 指过去，然后真的把脚本当子进程跑起来，
+ * 起一个本地 mock 站点，复制一份脚本、把顶部配置区整块换掉指过去，
+ * 再当子进程真跑一遍 —— 和用户实际的用法一致。
  * 断言它发出的请求和最后打印的汇总。抽奖接口是要花憨豆的，没法拿线上验证，
  * 所以这层测试是它唯一的安全网。
  *
  * 运行：npm run test:ql
  */
 import http from 'node:http';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const SCRIPT = path.join(ROOT, 'qinglong', 'hh_lottery.js');
+// git 的 autocrlf 可能把脚本换成 CRLF，统一成 LF 再找标记
+// git 的 autocrlf 可能把脚本换成 CRLF，统一成 LF 再找标记
+const SOURCE = fs.readFileSync(SCRIPT, 'utf8').replace(/\r\n/g, '\n');
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'hh-ql-'));
 
 let passed = 0, failed = 0;
 function check(name, cond, extra = '') {
@@ -119,12 +126,40 @@ function startSite({ prizes = ['魔力 100 '], balance = 100000, cost = 2000, on
     });
 }
 
-function runScript(env) {
+/* 配置写在脚本顶部，所以测试就照用户的方式来：
+   复制一份源码、把「配置区」整块换掉，再当子进程跑。
+   顺带也就验证了那两个标记还在、配置块还能被整块替换。 */
+let copyIndex = 0;
+function runScript(config) {
+    const head = 'const CONFIG = {';
+    const foot = '\n};\n\n/* ===== 配置区结束 ===== */';
+
+    const start = SOURCE.indexOf(head);
+    const end = SOURCE.indexOf(foot);
+    if (start < 0 || end < 0) throw new Error('配置区标记不见了，测试没法注入配置');
+
+    const merged = {
+        cookies: ['c_secure_uid=test'],
+        draws: 10,
+        reserve: 0,
+        interval: 3,
+        maxMinutes: 60,
+        cleanMail: false,
+        accountGap: 0,
+        host: 'hhanclub.net',
+        userAgent: 'test-agent',
+        ...config
+    };
+
+    const patched = SOURCE.slice(0, start)
+        + `const CONFIG = ${JSON.stringify(merged, null, 4)};`
+        + SOURCE.slice(end + foot.length - '\n\n/* ===== 配置区结束 ===== */'.length);
+
+    const file = path.join(TMP, `run-${copyIndex++}.js`);
+    fs.writeFileSync(file, patched);
+
     return new Promise(resolve => {
-        const child = spawn(process.execPath, [SCRIPT], {
-            env: { ...process.env, HH_COOKIE: 'c_secure_uid=test', ...env },
-            cwd: ROOT
-        });
+        const child = spawn(process.execPath, [file], { cwd: ROOT });
 
         let out = '';
         child.stdout.on('data', d => { out += d; });
@@ -141,9 +176,7 @@ console.log('\n[1] 填上 Cookie 就能跑：按次数抽，汇总正确');
         balance: 100000
     });
 
-    const { code, out } = await runScript({
-        HH_HOST: site.state.origin, HH_DRAWS: '3', HH_INTERVAL: '3'
-    });
+    const { code, out } = await runScript({ host: site.state.origin, draws: 3 });
 
     check('正常退出', code === 0, `exit ${code}`);
     check('刚好抽了 3 次', site.state.draws === 3, `实际 ${site.state.draws}`);
@@ -165,9 +198,7 @@ console.log('\n[2] 一抽到底：抽到保留线就停');
     // 再抽一次会跌到 18600 < 20000，所以停在 5 抽
     const site = await startSite({ prizes: ['魔力 100 '], balance: 30000 });
 
-    const { out } = await runScript({
-        HH_HOST: site.state.origin, HH_DRAWS: '0', HH_RESERVE: '20000', HH_INTERVAL: '3'
-    });
+    const { out } = await runScript({ host: site.state.origin, draws: 0, reserve: 20000 });
 
     check('抽了 5 次就停', site.state.draws === 5, `实际 ${site.state.draws}`);
     check('日志说明是按保留线停的', /一抽到底完成/.test(out), out.slice(-500));
@@ -184,9 +215,7 @@ console.log('\n[3] 已是 VIP 时站点改发憨豆，要按憨豆记账');
         onDraw: state => { state.balance += 1000000; }
     });
 
-    const { out } = await runScript({
-        HH_HOST: site.state.origin, HH_DRAWS: '1', HH_INTERVAL: '3'
-    });
+    const { out } = await runScript({ host: site.state.origin, draws: 1 });
 
     check('识别出了换发', /已是 VIP，站点改发 1,000,000 憨豆/.test(out), out.slice(-500));
     check('憨豆记了 1,000,000', /获得 1,000,000 憨豆/.test(out), out.slice(-500));
@@ -202,9 +231,7 @@ console.log('\n[4] 不是 VIP 的用户中 VIP，照常记 VIP 天数');
 {
     const site = await startSite({ prizes: ['VIP 7 Day(s)'], balance: 500000 });
 
-    const { out } = await runScript({
-        HH_HOST: site.state.origin, HH_DRAWS: '1', HH_INTERVAL: '3'
-    });
+    const { out } = await runScript({ host: site.state.origin, draws: 1 });
 
     check('不会误报换发', !/站点改发/.test(out), out.slice(-500));
     check('记的是 VIP 7 天', /7 天 × 1/.test(out), out.slice(-500));
@@ -227,9 +254,7 @@ console.log('\n[5] 站内信清理：每页只有 10 封也要翻完，别的信
 
     const site = await startSite({ prizes: ['魔力 100 '], balance: 100000, mail, pageSize: 10 });
 
-    const { out } = await runScript({
-        HH_HOST: site.state.origin, HH_DRAWS: '1', HH_INTERVAL: '3', HH_CLEAN_MAIL: 'true'
-    });
+    const { out } = await runScript({ host: site.state.origin, draws: 1, cleanMail: true });
 
     const deletedIds = site.state.deleted.flatMap(item => item.ids);
 
@@ -255,7 +280,7 @@ console.log('\n[6] 不开清理开关就完全不碰收件箱');
         mail: [{ id: '1', subject: '幸运大转盘 中奖通知' }]
     });
 
-    await runScript({ HH_HOST: site.state.origin, HH_DRAWS: '1', HH_INTERVAL: '3' });
+    await runScript({ host: site.state.origin, draws: 1 });
 
     check('一次收件箱都没读', site.state.mailPageHits.length === 0, site.state.mailPageHits.join(','));
     check('一封都没删', site.state.deleted.length === 0, JSON.stringify(site.state.deleted));
@@ -268,9 +293,7 @@ console.log('\n[7] Cookie 失效要说人话，别闷头抽');
 {
     const site = await startSite({ loggedOut: true });
 
-    const { out } = await runScript({
-        HH_HOST: site.state.origin, HH_DRAWS: '5', HH_INTERVAL: '3'
-    });
+    const { out } = await runScript({ host: site.state.origin, draws: 5 });
 
     check('点出了 Cookie 失效', /Cookie 已失效/.test(out), out.slice(-500));
     check('一次都没抽', site.state.draws === 0, `实际 ${site.state.draws}`);
@@ -279,12 +302,13 @@ console.log('\n[7] Cookie 失效要说人话，别闷头抽');
 }
 
 /* ---------------------------------------------------------------- */
-console.log('\n[8] 没填 Cookie 直接报错退出');
+console.log('\n[8] 没填 Cookie（还是占位文字）直接报错退出');
 {
-    const { code, out } = await runScript({ HH_COOKIE: '' });
+    const { code, out } = await runScript({ cookies: ['在这里粘贴你的 Cookie'] });
 
     check('非零退出码', code === 1, `exit ${code}`);
-    check('提示去哪儿填', /HH_COOKIE/.test(out), out.slice(-300));
+    check('占位文字不会被当成真 Cookie', /还没填 Cookie/.test(out), out.slice(-300));
+    check('提示了去哪儿填', /配置区/.test(out) && /F12/.test(out), out.slice(-300));
 }
 
 /* ---------------------------------------------------------------- */
@@ -293,9 +317,9 @@ console.log('\n[9] 多账号按顺序各跑各的');
     const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
 
     const { out } = await runScript({
-        HH_HOST: site.state.origin,
-        HH_COOKIE: 'c_secure_uid=aaa&c_secure_uid=bbb',
-        HH_DRAWS: '2', HH_INTERVAL: '3', HH_ACCOUNT_GAP: '0'
+        host: site.state.origin,
+        cookies: ['c_secure_uid=aaa', 'c_secure_uid=bbb'],
+        draws: 2
     });
 
     check('两个账号一共抽了 4 次', site.state.draws === 4, `实际 ${site.state.draws}`);
@@ -310,9 +334,7 @@ console.log('\n[10] 站点跟着改单抽消耗');
 {
     const site = await startSite({ prizes: ['魔力 100 '], balance: 100000, cost: 4000 });
 
-    const { out } = await runScript({
-        HH_HOST: site.state.origin, HH_DRAWS: '2', HH_INTERVAL: '3'
-    });
+    const { out } = await runScript({ host: site.state.origin, draws: 2 });
 
     check('单抽消耗按页面上的 4,000 算', /消耗 8,000/.test(out), out.slice(-400));
 
@@ -320,5 +342,7 @@ console.log('\n[10] 站点跟着改单抽消耗');
 }
 
 /* ---------------------------------------------------------------- */
+fs.rmSync(TMP, { recursive: true, force: true });
+
 console.log(`\n=========== ${passed} passed, ${failed} failed ===========\n`);
 process.exit(failed ? 1 : 0);
