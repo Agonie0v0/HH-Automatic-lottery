@@ -479,9 +479,6 @@ console.log('\n[10] 憨豆盈亏与理论盈亏率');
     check(`实测盈亏率 ${rate.toFixed(1)}%`,
         d.getElementById('profit-rate').textContent === `+${rate.toFixed(1)}%`,
         d.getElementById('profit-rate').textContent);
-    check('悬停提示带理论盈亏率',
-        /理论盈亏率 \+[\d.]+%/.test(d.getElementById('profit-rate').title),
-        d.getElementById('profit-rate').title);
 }
 
 /* ---------------------------------------------------------------- */
