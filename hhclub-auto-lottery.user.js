@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.13.0
+// @version      1.14.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 一抽到底 · 实时余额 · 站内信清理
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -49,6 +49,10 @@
         jackpotMaxRate: 0.002,
         // 读不到奖池时的兜底判定：VIP，或单笔十万以上的憨豆
         jackpotBeansFloor: 100000,
+        // 中 VIP 但用户本来就是 VIP 时，站点改发憨豆。校准后余额比估算
+        // 多出这么多就认定发生了替换 —— 取值远高于任何单笔憨豆奖（780,000
+        // 那档除外，但那一注的 prize_text 就是魔力，走不到这里）
+        vipSwapMinBeans: 100000,
         // 每抽多少次回服务端校准一次余额，纠正本地估算的累计漂移
         balanceSyncEveryDraws: 25,
 
@@ -583,6 +587,54 @@
         // 会在兜底表里留下 "魔力 100" 和 "魔力 100 " 两条 key
         const rawKey = String(prizeText).trim();
         stats.raw[rawKey] = (stats.raw[rawKey] || 0) + 1;
+    }
+
+    /* 把已经记成 from 的那一注改记成 to。抽数和消耗不动，只挪奖品归属。 */
+    function reclassifyLastDraw(from, to) {
+        const fix = stats => {
+            if (from.type !== 'unknown') {
+                stats.gains[from.type] = (stats.gains[from.type] || 0) - from.value;
+            }
+            const old = ensureBucket(stats, from.type);
+            old.count -= 1;
+            old.value -= from.value;
+            old.tiers[from.label] = (old.tiers[from.label] || 0) - 1;
+            if (old.tiers[from.label] <= 0) delete old.tiers[from.label];
+            if (old.count <= 0) delete stats.prizes[from.type];
+
+            if (to.type !== 'unknown') {
+                stats.gains[to.type] = (stats.gains[to.type] || 0) + to.value;
+            }
+            const next = ensureBucket(stats, to.type);
+            next.count += 1;
+            next.value += to.value;
+            next.tiers[to.label] = (next.tiers[to.label] || 0) + 1;
+        };
+
+        fix(currentStats);
+        commitTotal(fix);
+        render();
+    }
+
+    /* 抽奖页上写着一条隐藏规则：
+         「当中奖 [VIP] 时，如果用户已经是 VIP 或以上等级，奖励憨豆：1000000」
+       接口返回的 prize_text 是转盘上停的那一格，未必反映这个替换，
+       所以中到 VIP 就立刻回服务端核一次余额：真多出一大笔，
+       就说明站点发的是憨豆，把这一注改记成憨豆。
+
+       不用去猜用户是不是 VIP —— 余额说了算。而且要是哪天 prize_text
+       本身就返回「魔力 1000000」，那笔憨豆已经记进去了、估算和实际对得上，
+       这里不会重复计。 */
+    async function reconcileVipPrize(prize) {
+        const estimated = beanBalance;
+        if (!await calibrateBalance({ quiet: true })) return;
+
+        const drift = beanBalance - estimated;
+        if (drift < CONFIG.vipSwapMinBeans) return;
+
+        const swapped = parsePrizeText(`魔力 ${Math.round(drift)}`);
+        reclassifyLastDraw(prize, swapped);
+        addLog(`👑 你已经是 VIP，站点改发了 ${fmt(swapped.value)} 憨豆，已按憨豆记账`, 'success');
     }
 
     function recordDraw(prizeText) {
@@ -2293,10 +2345,15 @@
 
             const prizeText = decodeUnicode(data.data?.prize_text || '未知奖品');
             const recordId = data.data?.winning_record_id || '';
+            const prize = parsePrizeText(prizeText);
 
             addLog(`🎉 抽中：${prizeText}${recordId ? ` · ID ${recordId}` : ''}`, 'success');
             recordDraw(prizeText);
-            applyDrawToBalance(parsePrizeText(prizeText));
+            applyDrawToBalance(prize);
+
+            // VIP 那一注可能被站点换成了憨豆，当场核一下
+            if (prize.type === 'vip') await reconcileVipPrize(prize);
+            if (!running) return;
 
             if (drawsSinceCalibration >= CONFIG.balanceSyncEveryDraws) {
                 await calibrateBalance({ quiet: true });

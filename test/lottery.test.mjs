@@ -1904,6 +1904,79 @@ console.log('\n[37] 「奖项种类」和明细里的「N 种」口径一致');
         d.getElementById('prize-type-count').textContent);
 }
 
+/* 中一注 VIP，服务端余额按 serverBalance() 给。抽奖页说明里那条规则：
+   已经是 VIP 的用户中到 VIP，站点改发 1,000,000 憨豆。 */
+async function drawOneVip(serverBalance) {
+    const START = 500000;
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000', balance: String(START) });
+    const w = dom.window;
+
+    w.fetch = async url => {
+        if (String(url).includes('lucky.php')) {
+            return {
+                ok: true, status: 200,
+                text: async () => `<html><body>
+                    <div class="bean-number">${serverBalance(START)}.0</div>
+                    <div class="use-bean">每次消耗憨豆： 2000</div>
+                </body></html>`
+            };
+        }
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ret: 0, data: { prize_text: 'VIP 7 Day(s)' } })
+        };
+    };
+
+    await run(dom);
+    const d = w.document;
+    d.getElementById('lottery-interval').value = '3';
+    d.getElementById('max-lottery-count').value = '1';
+    d.getElementById('start-lottery').click();
+    await untilStopped(d, 30000);
+
+    return { w, d, stats: JSON.parse(w.localStorage.getItem('hhanclub_lottery_stats_v4')), START };
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[38] 已是 VIP 时站点改发憨豆，要按憨豆记账');
+{
+    // 服务端余额 = 起始 - 2000 消耗 + 1,000,000 补偿
+    const { d, stats } = await drawOneVip(start => start - 2000 + 1000000);
+
+    check('这一注不再算成 VIP 天数', !stats.gains.vip, `实际 ${stats.gains.vip}`);
+    check('憨豆记了 1,000,000', stats.gains.beans === 1000000, `实际 ${stats.gains.beans}`);
+    check('明细里进的是憨豆那一类',
+        stats.prizes.beans?.count === 1 && !stats.prizes.vip,
+        JSON.stringify(stats.prizes));
+    check('档位名是「1,000,000 憨豆」',
+        Object.keys(stats.prizes.beans?.tiers || {})[0] === '1,000,000 憨豆',
+        Object.keys(stats.prizes.beans?.tiers || {}).join(' | '));
+    check('抽数还是 1，没被重复计',
+        stats.draws === 1 && stats.cost === 2000, `${stats.draws} 抽 / ${stats.cost} 消耗`);
+    check('原始文案照实保留 VIP',
+        stats.raw['VIP 7 Day(s)'] === 1, JSON.stringify(stats.raw));
+    check('日志说清楚了改发憨豆',
+        Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('已经是 VIP')),
+        '未找到说明日志');
+    check('大奖特效照样触发', !!d.querySelector('.hh-jackpot-overlay'), '没触发');
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[39] 不是 VIP 的用户中 VIP，照常记 VIP 天数');
+{
+    // 服务端余额只少了消耗，没有补偿
+    const { d, stats } = await drawOneVip(start => start - 2000);
+
+    check('VIP 天数记了 7', stats.gains.vip === 7, `实际 ${stats.gains.vip}`);
+    check('憨豆一分没加', stats.gains.beans === 0, `实际 ${stats.gains.beans}`);
+    check('明细里进的是 VIP 那一类',
+        stats.prizes.vip?.count === 1 && !stats.prizes.beans,
+        JSON.stringify(stats.prizes));
+    check('不会误报改发憨豆',
+        !Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('已经是 VIP')),
+        '误报了');
+}
+
 /* ---------------------------------------------------------------- */
 console.log(`\n=========== ${passed} passed, ${failed} failed ===========\n`);
 process.exit(failed ? 1 : 0);
