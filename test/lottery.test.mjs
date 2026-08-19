@@ -466,14 +466,6 @@ console.log('\n[10] 憨豆盈亏与理论盈亏率');
     await run(dom);
     const d = w.document;
 
-    // 理论盈亏率只依赖奖池，没抽过也该算得出来
-    const expected = 780000 * 0.0011 + 5000 * 0.1507 + 100 * 0.2261 + 2000 * 0.2261 + 1000 * 0.2261;
-    const baseline = ((expected - 2000) / 2000) * 100;
-    check(`显示理论盈亏率 ${baseline.toFixed(1)}%`,
-        d.getElementById('theory-rate').textContent === `+${baseline.toFixed(1)}%`,
-        d.getElementById('theory-rate').textContent);
-    check('转盘是正期望的', baseline > 0, `实际 ${baseline.toFixed(2)}%`);
-
     d.getElementById('view-mode').value = 'total';
     d.getElementById('view-mode').dispatchEvent(new w.Event('change'));
     await sleep(80);
@@ -689,9 +681,6 @@ console.log('\n[14] 读不到奖池时大奖判定退回硬规则');
     check('无奖池时不渲染官方爆率',
         d.querySelectorAll('#detail-list .hh-row-official').length === 0,
         d.querySelectorAll('#detail-list .hh-row-official').length);
-    check('无奖池时理论盈亏率显示 -',
-        d.getElementById('theory-rate').textContent === '-',
-        d.getElementById('theory-rate').textContent);
 }
 
 /* ---------------------------------------------------------------- */
@@ -1060,24 +1049,28 @@ console.log('\n[22] 站点调整爆率后奖池会跟着刷新');
     await run(dom);
     const d = w.document;
 
-    const before = d.getElementById('theory-rate').textContent;
-    check('初始理论盈亏率来自页面上的奖池', before === '+15.6%', before);
-
     d.getElementById('refresh-balance').click();
-    await until(() => d.getElementById('theory-rate').textContent !== before, 5000);
+    await until(() => Array.from(d.querySelectorAll('#lottery-log div'))
+        .some(el => el.textContent.includes('调整了奖池爆率')), 5000);
 
-    // 780000 从 0.0011 提到 0.0030，期望产出多 780000×0.0019 = 1482
-    const expected = 780000 * 0.0030 + 5000 * 0.1507 + 100 * 0.2261 + 2000 * 0.2261 + 1000 * 0.2261;
-    const baseline = ((expected - 2000) / 2000) * 100;
-    check(`理论盈亏率跟着调整为 ${baseline.toFixed(1)}%`,
-        d.getElementById('theory-rate').textContent === `+${baseline.toFixed(1)}%`,
-        d.getElementById('theory-rate').textContent);
     check('日志提示了爆率变动',
         Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('调整了奖池爆率')),
         '未找到爆率变动日志');
-    check('提示里带上了理论盈亏率的前后变化',
-        Array.from(d.querySelectorAll('#lottery-log div')).some(el => /\+15\.6% → \+/.test(el.textContent)),
-        '未找到变化区间');
+
+    // 抽一注 780,000，档位行上的官方爆率应该已经是调整后的 0.30%
+    w.fetch = async () => ({
+        ok: true, status: 200,
+        text: async () => JSON.stringify({ ret: 0, data: { prize_text: '魔力 780000 ' } })
+    });
+    d.getElementById('lottery-interval').value = '3';
+    d.getElementById('max-lottery-count').value = '1';
+    d.getElementById('start-lottery').click();
+    await untilStopped(d);
+
+    check('明细里的官方爆率换成了调整后的 0.30%',
+        Array.from(d.querySelectorAll('#detail-list .hh-tier-rate'))
+            .some(el => el.textContent.includes('官方 0.30%')),
+        Array.from(d.querySelectorAll('#detail-list .hh-tier-rate')).map(el => el.textContent).join(' | '));
 }
 
 /* ---------------------------------------------------------------- */
@@ -1109,9 +1102,9 @@ console.log('\n[23] 爆率没变时不重复打扰');
     check('奖池没变就不打爆率变动日志',
         !Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('调整了奖池爆率')),
         '不该出现的日志');
-    check('理论盈亏率保持 +15.6%',
-        d.getElementById('theory-rate').textContent === '+15.6%',
-        d.getElementById('theory-rate').textContent);
+    check('也不会误报站点撤掉了爆率',
+        !Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('不再公布')),
+        '不该出现的日志');
 }
 
 /* ---------------------------------------------------------------- */
@@ -1127,11 +1120,20 @@ console.log('\n[24] 抓回来的页面读不到奖池时保留原有爆率');
                 text: async () => '<html><body><div class="bean-number">777777.0</div></body></html>'
             };
         }
-        return { ok: false, status: 500, text: async () => '' };
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ret: 0, data: { prize_text: '魔力 100 ' } })
+        };
     };
 
     await run(dom);
     const d = w.document;
+
+    // 先抽一注，明细里才有行可看
+    d.getElementById('lottery-interval').value = '3';
+    d.getElementById('max-lottery-count').value = '1';
+    d.getElementById('start-lottery').click();
+    await untilStopped(d);
 
     d.getElementById('refresh-balance').click();
     await until(() => d.getElementById('bean-balance').textContent === '777,777', 5000);
@@ -1139,10 +1141,12 @@ console.log('\n[24] 抓回来的页面读不到奖池时保留原有爆率');
     check('余额照常校准', d.getElementById('bean-balance').textContent === '777,777',
         d.getElementById('bean-balance').textContent);
     check('奖池读不到时沿用原有爆率，不清空',
-        d.getElementById('theory-rate').textContent === '+15.6%',
-        d.getElementById('theory-rate').textContent);
-    check('明细里的官方爆率还在',
-        d.querySelectorAll('#detail-list .hh-row-official').length >= 0);
+        Array.from(d.querySelectorAll('#detail-list .hh-row-official'))
+            .some(el => el.textContent === '官方 83.0%'),
+        Array.from(d.querySelectorAll('#detail-list .hh-row-official')).map(el => el.textContent).join(' | '));
+    check('也不会误报站点撤掉了爆率',
+        !Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('不再公布')),
+        '不该出现的日志');
 }
 
 /* ---------------------------------------------------------------- */
@@ -1285,11 +1289,6 @@ console.log('\n[27] 站点撤掉 probability_real 时改用原始权重');
     await run(dom);
     const d = w.document;
 
-    // 总权重 14767，憨豆档位加权总值 31,011,100 → 每抽期望 2100.03
-    check('按权重归一化算出理论盈亏率 +5.0%',
-        d.getElementById('theory-rate').textContent === '+5.0%',
-        d.getElementById('theory-rate').textContent);
-
     d.getElementById('lottery-interval').value = '3';
     d.getElementById('max-lottery-count').value = '1';
     d.getElementById('start-lottery').click();
@@ -1326,9 +1325,9 @@ console.log('\n[28] 两个爆率字段都没有时整块降级，不摆 0.00%');
     await run(dom);
     const d = w.document;
 
-    check('理论盈亏率显示为 -，不是 -100%',
-        d.getElementById('theory-rate').textContent === '-',
-        d.getElementById('theory-rate').textContent);
+    check('日志说明了爆率为什么没了',
+        Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('不再公布')),
+        '未找到说明日志');
 
     d.getElementById('lottery-interval').value = '3';
     d.getElementById('max-lottery-count').value = '1';

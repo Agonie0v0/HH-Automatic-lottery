@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.8.3
+// @version      1.9.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 官方爆率对比 · 一抽到底 · 实时余额
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -495,7 +495,7 @@
         if (!pool.length || pool.some(item => item.probability > 0)) return;
 
         opaquePoolWarned = true;
-        addLog('ℹ️ 站点已不再公布奖品爆率，官方对比与理论盈亏率停用', 'warning');
+        addLog('ℹ️ 站点已不再公布奖品爆率，官方对比停用', 'warning');
         addLog('📊 实测统计不受影响，样本够大时占比就是爆率', 'info');
     }
 
@@ -529,16 +529,6 @@
 
         return prize.type === 'vip'
             || (prize.type === 'beans' && prize.value >= CONFIG.jackpotBeansFloor);
-    }
-
-    /* 每抽的理论期望产出，用来和实测效率对比 */
-    function poolExpectation() {
-        const gains = {};
-        readPrizePool().forEach(item => {
-            if (item.type === 'unknown') return;
-            gains[item.type] = (gains[item.type] || 0) + item.value * item.probability;
-        });
-        return gains;
     }
 
     /* =========================================================
@@ -1658,10 +1648,6 @@
                         <div class="hh-prize-name">⬆️ 上传量</div>
                         <div class="hh-prize-value" id="total-upload">0GB</div>
                     </div>
-                    <div class="hh-prize">
-                        <div class="hh-prize-name">🎯 理论盈亏率</div>
-                        <div class="hh-prize-value" id="theory-rate">-</div>
-                    </div>
                 </div>
 
                 <div class="hh-small-actions">
@@ -1783,23 +1769,19 @@
         return true;
     }
 
-    /* 爆率变了就换掉缓存。变了要说一声 —— 理论盈亏率和大奖判定都跟着它走。 */
+    /* 爆率变了就换掉缓存。变了要说一声 —— 明细里的官方对比和大奖判定都跟着它走。 */
     function adoptPool(pool, { quiet = false } = {}) {
         if (!pool || !pool.length) return false;
         if (poolFingerprint(pool) === poolFingerprint(prizePool)) return false;
 
-        const before = theoreticalProfitRate();
         prizePool = pool;
-        const after = theoreticalProfitRate();
+        if (quiet) return true;
 
-        if (!quiet && !pool.some(item => item.probability > 0)) {
+        if (pool.some(item => item.probability > 0)) {
+            addLog('📈 站点调整了奖池爆率', 'warning');
+        } else {
             opaquePoolWarned = false;
             warnIfPoolOpaque();
-        } else if (!quiet) {
-            const shift = (before !== null && after !== null && Math.abs(after - before) >= 0.05)
-                ? `，理论盈亏率 ${before > 0 ? '+' : ''}${before.toFixed(1)}% → ${after > 0 ? '+' : ''}${after.toFixed(1)}%`
-                : '';
-            addLog(`📈 站点调整了奖池爆率${shift}`, 'warning');
         }
         return true;
     }
@@ -1956,35 +1938,18 @@
             profitElement.style.color = tone(profit);
         }
 
-        const baseline = theoreticalProfitRate();
-        setText('theory-rate', baseline === null
-            ? '-'
-            : `${baseline > 0 ? '+' : ''}${baseline.toFixed(1)}%`);
-
         const rateElement = $('profit-rate');
         if (!rateElement) return;
 
         if (stats.cost <= 0) {
             rateElement.textContent = '-';
             rateElement.style.color = '#a08066';
-            rateElement.title = '';
             return;
         }
 
         const rate = (profit / stats.cost) * 100;
         rateElement.textContent = `${rate > 0 ? '+' : ''}${rate.toFixed(1)}%`;
         rateElement.style.color = tone(rate);
-
-        rateElement.title = baseline === null
-            ? ''
-            : `理论盈亏率 ${baseline > 0 ? '+' : ''}${baseline.toFixed(1)}%（按官方爆率）`;
-    }
-
-    /* 按官方爆率算出来的期望盈亏率，读不到奖池时返回 null */
-    function theoreticalProfitRate() {
-        const expected = poolExpectation().beans;
-        if (!expected || singleCost <= 0) return null;
-        return ((expected - singleCost) / singleCost) * 100;
     }
 
     /* 分奖项明细：一级按类别聚合，二级展开具体档位 */
