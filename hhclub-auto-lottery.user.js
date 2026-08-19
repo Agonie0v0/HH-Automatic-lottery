@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.15.0
+// @version      1.16.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 一抽到底 · 实时余额 · 站内信清理
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -255,6 +255,9 @@
             const merged = ensureBucket(stats, target);
             merged.count += Number(bucket?.count) || 0;
             merged.value += Number(bucket?.value) || 0;
+
+            const swapped = Number(bucket?.swappedBeans) || 0;
+            if (swapped) merged.swappedBeans = (merged.swappedBeans || 0) + swapped;
             Object.entries(bucket?.tiers || {}).forEach(([label, count]) => {
                 merged.tiers[label] = (merged.tiers[label] || 0) + (Number(count) || 0);
             });
@@ -606,6 +609,8 @@
 
             const bucket = ensureBucket(stats, 'vip');
             bucket.value -= prize.value;
+            // 和 value（天数）不是一个单位，单独存，类别行上也单独列一行
+            bucket.swappedBeans = (bucket.swappedBeans || 0) + beans;
             bucket.tiers[prize.label] = (bucket.tiers[prize.label] || 0) - 1;
             if (bucket.tiers[prize.label] <= 0) delete bucket.tiers[prize.label];
             bucket.tiers[swappedLabel] = (bucket.tiers[swappedLabel] || 0) + 1;
@@ -2105,9 +2110,16 @@
                 })
                 .join('');
 
-            const sumLine = bucket.value > 0
-                ? `<div class="hh-row-sum">累计 ${fmt(bucket.value)}${meta.unit ? ' ' + meta.unit : ''}</div>`
-                : '';
+            // 累计可能有两行：本类别自己的单位一行，被折算成憨豆的另起一行。
+            // VIP 被换成憨豆时天数和憨豆不是一个单位，混在一行里没法看。
+            const sums = [];
+            if (bucket.value > 0) {
+                sums.push(`累计 ${fmt(bucket.value)}${meta.unit ? ' ' + meta.unit : ''}`);
+            }
+            if (bucket.swappedBeans > 0) {
+                sums.push(`另折算 ${fmt(bucket.swappedBeans)} 憨豆`);
+            }
+            const sumLine = sums.map(text => `<div class="hh-row-sum">${text}</div>`).join('');
 
             // 官方爆率读不到时（页面结构变了 / 非抽奖页）整块降级，只显示实测
             const typeOfficial = official.byType[type];
@@ -2648,6 +2660,9 @@
             const target = ensureBucket(result, type);
             target.count += bucket.count;
             target.value += bucket.value;
+
+            const swapped = Number(bucket.swappedBeans) || 0;
+            if (swapped) target.swappedBeans = (target.swappedBeans || 0) + swapped;
             Object.entries(bucket.tiers).forEach(([label, count]) => {
                 target.tiers[label] = (target.tiers[label] || 0) + count;
             });

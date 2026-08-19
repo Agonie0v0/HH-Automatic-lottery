@@ -1962,6 +1962,16 @@ console.log('\n[38] 已是 VIP 时站点改发憨豆，要按憨豆记账');
         JSON.stringify(stats.prizes.vip?.tiers));
     check('VIP 类别累计天数为 0',
         stats.prizes.vip?.value === 0, `实际 ${stats.prizes.vip?.value}`);
+    check('折算的憨豆单独记在 swappedBeans 上',
+        stats.prizes.vip?.swappedBeans === 1000000, `实际 ${stats.prizes.vip?.swappedBeans}`);
+
+    const vipSums = Array.from(d.querySelectorAll('#detail-list .hh-row'))
+        .find(row => row.dataset.type === 'vip');
+    const sumTexts = Array.from(vipSums?.querySelectorAll('.hh-row-sum') || []).map(el => el.textContent);
+    check('天数为 0 时不显示「累计 0 天」',
+        !sumTexts.some(text => text.includes('天')), sumTexts.join(' | '));
+    check('类别行单独列出「另折算 1,000,000 憨豆」',
+        sumTexts.join('|') === '另折算 1,000,000 憨豆', sumTexts.join(' | '));
     check('抽数还是 1，没被重复计',
         stats.draws === 1 && stats.cost === 2000, `${stats.draws} 抽 / ${stats.cost} 消耗`);
     check('原始文案照实保留 VIP',
@@ -1987,6 +1997,14 @@ console.log('\n[39] 不是 VIP 的用户中 VIP，照常记 VIP 天数');
     check('档位还是「7 天」，不是折算档',
         Object.keys(stats.prizes.vip?.tiers || {}).join('|') === '7 天',
         Object.keys(stats.prizes.vip?.tiers || {}).join(' | '));
+    check('没有折算，就不该有 swappedBeans',
+        !stats.prizes.vip?.swappedBeans, `实际 ${stats.prizes.vip?.swappedBeans}`);
+
+    const vipRow = Array.from(d.querySelectorAll('#detail-list .hh-row'))
+        .find(row => row.dataset.type === 'vip');
+    const sums = Array.from(vipRow?.querySelectorAll('.hh-row-sum') || []).map(el => el.textContent);
+    check('类别行只有「累计 7 天」一行',
+        sums.join('|') === '累计 7 天', sums.join(' | '));
     check('不会误报改发憨豆',
         !Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('已经是 VIP')),
         '误报了');
