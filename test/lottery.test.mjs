@@ -1840,12 +1840,26 @@ console.log('\n[36] 循环里抛异常要停下来并说一声，不能装作还
     await run(dom);
     const d = w.document;
 
-    // 制造一个渲染期异常：fmt() 走的就是 toLocaleString
-    w.Number.prototype.toLocaleString = function () { throw new Error('渲染炸了'); };
+    // 制造一个渲染期异常：fmt() 走的就是 toLocaleString。
+    // 只炸一次就自己恢复 —— 一直炸的话连 startLottery 和停机流程都进不去，
+    // 测不出「循环中途抛异常」这个场景。
+    const realToLocaleString = w.Number.prototype.toLocaleString;
+    let armed = false;
+    w.Number.prototype.toLocaleString = function (...args) {
+        if (armed) {
+            armed = false;
+            throw new Error('渲染炸了');
+        }
+        return realToLocaleString.apply(this, args);
+    };
 
     d.getElementById('lottery-interval').value = '3';
     d.getElementById('max-lottery-count').value = '5';
     d.getElementById('start-lottery').click();
+
+    // 等第一抽正常落地，再埋雷，确保炸在循环中途
+    await until(() => d.getElementById('draw-count').textContent === '1', 30000);
+    armed = true;
 
     await untilStopped(d, 30000);
 
