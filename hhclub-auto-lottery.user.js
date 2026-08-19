@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.9.0
+// @version      1.10.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 官方爆率对比 · 一抽到底 · 实时余额
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -50,7 +50,19 @@
         // 读不到奖池时的兜底判定：VIP，或单笔十万以上的憨豆
         jackpotBeansFloor: 100000,
         // 每抽多少次回服务端校准一次余额，纠正本地估算的累计漂移
-        balanceSyncEveryDraws: 25
+        balanceSyncEveryDraws: 25,
+
+        // ---- 站内信清理 ----
+        mailboxPage: '/messages.php',
+        // 只有主题里带这几个字的才会被删。收件箱里还混着「种子被删除」
+        // 「憨豆 改变」这类真要看的信，宁可漏删也不能误删。
+        lotteryMailKeyword: '幸运大转盘',
+        // 站点收件箱一页 100 封，不满一页就是翻到底了
+        mailboxPageSize: 100,
+        // 翻页上限，防站点改版后无限翻下去
+        mailboxMaxPages: 60,
+        // 一次 POST 提交多少个 id
+        mailDeleteChunk: 100
     };
 
     /* 奖项分类元数据：决定明细列表的图标 / 名称 / 单位 */
@@ -91,6 +103,9 @@
     // 距上次服务端校准过了多少抽，用来决定什么时候再校准一次
     let drawsSinceCalibration = 0;
     let calibrating = false;
+    // 站内信清理是异步的，加把锁免得自动清和手动清撞一起
+    let cleaningMail = false;
+    let mailCleaned = 0;
 
     let settings = {
         interval: 7,
@@ -100,6 +115,7 @@
         detailOpen: 'none',
         drainMode: false,
         reserveBeans: 0,
+        autoCleanMail: false,
         panelLeft: null,
         panelTop: null
     };
@@ -1583,6 +1599,18 @@
                     勾选后忽略最大次数，一直抽到余额跌破保留线为止
                 </div>
 
+                <div class="hh-drain">
+                    <label class="hh-drain-toggle">
+                        <input type="checkbox" id="auto-clean-mail">
+                        <span>📪 自动删抽奖站内信</span>
+                    </label>
+                    <button id="purge-mail" class="hh-small-btn"
+                            style="flex:0 0 auto;width:auto;padding:4px 10px;">🗑 立即清空</button>
+                </div>
+                <div id="mail-hint" class="hh-drain-hint">
+                    每 ${CONFIG.balanceSyncEveryDraws} 抽顺手清一次，只删主题带「${CONFIG.lotteryMailKeyword}」的，别的信不碰
+                </div>
+
                 <div style="display:flex;align-items:center;justify-content:space-between;margin-top:7px;">
                     <span style="font-size:10px;color:#a08066;font-weight:500;">
                         当前间隔 <b id="current-interval" style="color:#5a4030;">7</b> 秒
@@ -2256,6 +2284,7 @@
 
             if (drawsSinceCalibration >= CONFIG.balanceSyncEveryDraws) {
                 await calibrateBalance({ quiet: true });
+                await autoCleanMail();
             }
             return;
         }
@@ -2657,6 +2686,180 @@
     }
 
     /* =========================================================
+       站内信清理
+
+       站点每抽一次就发一封「幸运大转盘 中奖通知」，挂机一晚收件箱
+       就被埋了（线上实测 1,385 封信里 1,362 封是这个）。
+       删除走的就是收件箱那个表单：POST action=moveordel + messages[] + delete。
+
+       只删主题里带「幸运大转盘」的，别的一封不碰 —— 同一个收件箱里
+       还混着「种子被删除」「憨豆 改变」这类真要看的通知。
+    ========================================================= */
+
+    /* 从一页收件箱里抠出「消息 id + 主题」。站点的列表行长这样：
+       <div class="grid …"><input name="messages[]" value="ID">…<a href="…viewmessage&id=ID">主题</a></div> */
+    function parseMailboxPage(doc) {
+        return Array.from(doc.querySelectorAll('input[name="messages[]"]'))
+            .map(box => {
+                const row = box.closest('div.grid') || box.parentElement?.parentElement;
+                const link = row?.querySelector('a[href*="viewmessage"]');
+                return { id: box.value, subject: (link?.textContent || '').trim() };
+            })
+            .filter(item => item.id);
+    }
+
+    const isLotteryMail = item => item.subject.includes(CONFIG.lotteryMailKeyword);
+
+    async function fetchMailboxPage(page) {
+        const url = `${CONFIG.mailboxPage}?action=viewmailbox&box=1&page=${page}`;
+        const response = await fetch(url, { credentials: 'include' });
+        if (!response.ok) throw new Error(`收件箱第 ${page + 1} 页读取失败（${response.status}）`);
+
+        return parseMailboxPage(new DOMParser().parseFromString(await response.text(), 'text/html'));
+    }
+
+    /* 翻完整个收件箱。最后一页不满一页就是到底了。 */
+    async function scanMailbox() {
+        const all = [];
+        for (let page = 0; page < CONFIG.mailboxMaxPages; page++) {
+            const items = await fetchMailboxPage(page);
+            all.push(...items);
+            if (items.length < CONFIG.mailboxPageSize) break;
+        }
+        return all;
+    }
+
+    async function deleteMail(ids) {
+        let done = 0;
+
+        for (let at = 0; at < ids.length; at += CONFIG.mailDeleteChunk) {
+            const chunk = ids.slice(at, at + CONFIG.mailDeleteChunk);
+            const body = new URLSearchParams();
+
+            body.append('action', 'moveordel');
+            chunk.forEach(id => body.append('messages[]', id));
+            body.append('delete', '删除');
+
+            const response = await fetch(CONFIG.mailboxPage, {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body
+            });
+            if (!response.ok) throw new Error(`删除失败（${response.status}）`);
+
+            done += chunk.length;
+        }
+
+        return done;
+    }
+
+    /* 挂机期间顺手清。新信都排在最前面，所以只看第一页就够，一次请求。 */
+    async function autoCleanMail() {
+        if (!settings.autoCleanMail || cleaningMail) return;
+
+        cleaningMail = true;
+        try {
+            const ids = (await fetchMailboxPage(0)).filter(isLotteryMail).map(item => item.id);
+            if (!ids.length) return;
+
+            await deleteMail(ids);
+            mailCleaned += ids.length;
+            addLog(`📪 清掉 ${fmt(ids.length)} 封抽奖通知 · 本次累计 ${fmt(mailCleaned)} 封`, 'info');
+        } catch (error) {
+            // 清信失败不该影响抽奖，记一行就算了
+            addLog(`⚠️ 站内信清理失败：${error.message}`, 'warning');
+        } finally {
+            cleaningMail = false;
+        }
+    }
+
+    /* 一键清空：先把整个收件箱扫一遍，把「要删多少 / 留多少」摆给用户看了再动手 */
+    async function purgeLotteryMail() {
+        if (cleaningMail) return;
+
+        const button = $('purge-mail');
+        const restore = () => {
+            cleaningMail = false;
+            if (button) {
+                button.disabled = false;
+                button.textContent = '🗑 立即清空';
+            }
+        };
+
+        cleaningMail = true;
+        if (button) {
+            button.disabled = true;
+            button.textContent = '扫描中…';
+        }
+
+        try {
+            addLog('🔍 正在扫描收件箱…', 'info');
+            const all = await scanMailbox();
+            const targets = all.filter(isLotteryMail);
+            const keep = all.length - targets.length;
+
+            if (!targets.length) {
+                addLog(`✅ 收件箱里没有抽奖通知（共 ${fmt(all.length)} 封）`, 'success');
+                return;
+            }
+
+            if (await askMailPurge(targets.length, keep) !== 'delete') {
+                addLog('已取消，一封都没删', 'info');
+                return;
+            }
+
+            if (button) button.textContent = '删除中…';
+            const removed = await deleteMail(targets.map(item => item.id));
+            addLog(`🗑 已删除 ${fmt(removed)} 封抽奖通知，其余 ${fmt(keep)} 封原样保留`, 'success');
+        } catch (error) {
+            addLog(`⚠️ ${error.message}`, 'error');
+        } finally {
+            restore();
+        }
+    }
+
+    function askMailPurge(targetCount, keepCount) {
+        return new Promise(resolve => {
+            const overlay = document.createElement('div');
+            overlay.className = 'hh-modal-overlay';
+            overlay.innerHTML = `
+                <div class="hh-modal">
+                    <div class="hh-modal-title">🗑 清空抽奖站内信</div>
+                    <div class="hh-modal-text">
+                        找到 <b>${fmt(targetCount)}</b> 封主题带「${CONFIG.lotteryMailKeyword}」的通知，<br>
+                        另有 <b>${fmt(keepCount)}</b> 封其他站内信<b>不会</b>被动。<br>
+                        删除不可撤销。
+                    </div>
+                    <button class="hh-modal-btn hh-modal-primary" data-mode="delete">
+                        删除这 ${fmt(targetCount)} 封
+                        <span>其余 ${fmt(keepCount)} 封原样保留</span>
+                    </button>
+                    <button class="hh-modal-btn hh-modal-ghost" data-mode="cancel">取消</button>
+                </div>
+            `;
+
+            const done = mode => {
+                overlay.remove();
+                document.removeEventListener('keydown', onKey);
+                resolve(mode);
+            };
+            const onKey = event => {
+                if (event.key === 'Escape') done('cancel');
+            };
+
+            overlay.addEventListener('click', event => {
+                const button = event.target.closest('[data-mode]');
+                if (button) return done(button.dataset.mode);
+                if (event.target === overlay) done('cancel');
+            });
+            document.addEventListener('keydown', onKey);
+
+            document.body.appendChild(overlay);
+        });
+    }
+
+    /* =========================================================
        拖动（兼容触屏）
     ========================================================= */
 
@@ -2806,6 +3009,14 @@
             applyDrainUI();
         });
 
+        on('purge-mail', 'click', purgeLotteryMail);
+
+        on('auto-clean-mail', 'change', event => {
+            settings.autoCleanMail = event.target.checked;
+            saveSettings();
+            applyMailUI();
+        });
+
         on('reserve-beans', 'change', event => {
             const value = Math.max(0, parseInt(event.target.value, 10) || 0);
             event.target.value = value;
@@ -2867,7 +3078,11 @@
         const reserveInput = $('reserve-beans');
         if (reserveInput) reserveInput.value = Math.max(0, settings.reserveBeans);
 
+        const mailToggle = $('auto-clean-mail');
+        if (mailToggle) mailToggle.checked = !!settings.autoCleanMail;
+
         applyDrainUI();
+        applyMailUI();
 
         setText('toggle-animation', `🎉 中奖动画：${settings.animation ? '开' : '关'}`);
         setText('toggle-all-tiers', settings.detailOpen === 'all' ? '🔼 收起全部档位' : '🔽 展开全部档位');
@@ -2888,6 +3103,10 @@
         if (setMaxButton) setMaxButton.disabled = !!settings.drainMode;
 
         $('drain-hint')?.classList.toggle('is-on', !!settings.drainMode);
+    }
+
+    function applyMailUI() {
+        $('mail-hint')?.classList.toggle('is-on', !!settings.autoCleanMail);
     }
 
     function init() {
