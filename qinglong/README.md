@@ -1,6 +1,6 @@
-# HHCLUB 幸运大转盘 · 青龙版
+# HHCLUB 幸运大转盘 · 命令行版
 
-不用开浏览器、不用挂机。**所有配置都在脚本最上面那一块，改完保存就能跑，不用配环境变量。** 跟油猴版共用一套抽奖逻辑（限流退避、VIP 折算、站内信清理都在），只是把面板换成了日志和通知。
+**不只能在青龙里跑** —— 任何装了 Node 18+ 的机器（Debian / Ubuntu / NAS / 群晖…）`node hh_lottery.js` 直接就能用。不用开浏览器、不用挂机。**所有配置都在脚本最上面那一块，改完保存就能跑，不用配环境变量。** 跟油猴版共用一套抽奖逻辑（限流退避、VIP 折算、站内信清理都在），只是把面板换成了日志和通知。
 
 统计会存成一份 JSON，**格式和油猴版的「💾 备份 JSON」完全一致** —— 挂 NAS 上跑，隔段时间把文件拿下来，在浏览器面板里点「📥 导入备份」就能合进电脑上的历史统计。
 
@@ -10,15 +10,67 @@
 
 ## 装
 
-青龙 → 脚本管理 → 新建 `hh_lottery.js`，把 [`hh_lottery.js`](hh_lottery.js) 全文贴进去。
+### 青龙
 
-或者直接拉：
+脚本管理 → 新建 `hh_lottery.js`，把 [`hh_lottery.js`](hh_lottery.js) 全文贴进去。或者直接拉：
 
 ```bash
 ql raw https://raw.githubusercontent.com/SAGIRIxr/HH-Automatic-lottery/main/qinglong/hh_lottery.js
 ```
 
-脚本头部已经带了 `cron: 5 9 * * *`（每天早上 9:05），青龙一般会自动识别；没识别就手动建个定时任务指过去。
+脚本头部带了 `cron: 5 9 * * *`（每天早上 9:05），青龙一般会自动识别；没识别就手动建个定时任务指过去。
+
+### Debian / Ubuntu / NAS 直接跑
+
+只要 Node 18 以上，下下来改完配置就能跑，没有任何依赖：
+
+```bash
+curl -fLO https://raw.githubusercontent.com/SAGIRIxr/HH-Automatic-lottery/main/qinglong/hh_lottery.js
+```
+
+```bash
+node hh_lottery.js
+```
+
+Debian 12 自带的 `nodejs` 包是 18.19，够用；`node -v` 看一下就知道。
+
+定时用 crontab（`crontab -e`）：
+
+```
+5 9 * * * cd /opt/hh && /usr/bin/node hh_lottery.js >> /var/log/hh-lottery.log 2>&1
+```
+
+或者 systemd timer，`/etc/systemd/system/hh-lottery.service`：
+
+```ini
+[Unit]
+Description=HHCLUB 幸运大转盘
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/hh
+ExecStart=/usr/bin/node /opt/hh/hh_lottery.js
+```
+
+`/etc/systemd/system/hh-lottery.timer`：
+
+```ini
+[Unit]
+Description=每天跑一次 HHCLUB 抽奖
+
+[Timer]
+OnCalendar=*-*-* 09:05:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+sudo systemctl enable --now hh-lottery.timer
+```
+
+跑到一半按 Ctrl-C（或者 `systemctl stop`）不会丢成绩 —— 收到信号会先把已经抽到的存进统计文件再退出。
 
 ---
 
@@ -37,6 +89,7 @@ const CONFIG = {
     maxMinutes: 60,     // ⑤ 单次运行时间上限（分钟）
     cleanMail: false,   // ⑥ 抽完顺手清抽奖站内信
     statsFile: 'hh_lottery_stats.json',   // ⑦ 统计存哪儿，留空 '' 就是不记
+    timezone: 'Asia/Shanghai',            // ⑧ 日志时间按哪个时区显示
     host: 'hhanclub.net',
     userAgent: '...'
 };
@@ -51,6 +104,7 @@ const CONFIG = {
 | `maxMinutes` | `60` | 单次运行时间上限（分钟），防止一抽到底把任务挂死 |
 | `cleanMail` | `false` | 抽完顺手清掉「幸运大转盘 中奖通知」站内信 |
 | `statsFile` | `hh_lottery_stats.json` | 统计存到哪个文件，相对路径按脚本所在目录算。留空 `''` 就是不记 |
+| `timezone` | `Asia/Shanghai` | 日志时间按哪个时区显示。容器里系统时区多半是 UTC，不设的话日志时间跟你对不上 |
 | `host` | `hhanclub.net` | 站点域名，一般不用改 |
 | `userAgent` | Chrome | 一般不用改 |
 
@@ -91,30 +145,35 @@ c_secure_uid=NzMyMQ%3D%3D; c_secure_pass=...; c_secure_ssl=...; c_secure_tracker
 ## 跑完能看到什么
 
 ```
-🎡 HHCLUB 幸运大转盘 · 共 1 个账号
-   每个账号抽 20 次 · 间隔 8 秒
-
-▶ 账号 1 开始 · 余额 1,574,093 憨豆 · 单抽 2,000
-🎲 账号 1 第 1 抽：魔力 2000 · 余额 1,574,093
-🎲 账号 1 第 2 抽：补签卡 1 · 余额 1,572,093
+[08/19 09:05:01] 🎡 HHCLUB 幸运大转盘
+[08/19 09:05:01]    抽 20 次 · 间隔 8 秒
+[08/19 09:05:02] ▶ 开始 · 余额 1,574,093 憨豆 · 单抽 2,000
+[08/19 09:05:02] 🎲 第 1 抽：魔力 2000 · 余额 1,574,093
+[08/19 09:05:10] 🎲 第 2 抽：补签卡 1 · 余额 1,572,093
 ...
-📪 账号 1 清掉 20 封抽奖通知
+[08/19 09:07:48] 📪 清掉 20 封抽奖通知
+[08/19 09:07:48] 💾 统计已存到 /opt/hh/hh_lottery_stats.json
 
 ────────────────────────────────────────
-账号 1：20 抽
+本次：20 抽
   消耗 40,000 · 获得 37,100 憨豆
   盈亏 -2,900（-7.3%）
-  余额 1,571,193
   其他：补签卡 2个 · 上传量 2GB
     2,000 憨豆 × 6
     100 憨豆 × 5
     1,000 憨豆 × 4
     5,000 憨豆 × 3
-    补签卡 2 × 1
+    补签卡 1 个 × 2
     上传量 2 GB × 1
+
+历史总计：860 抽
+  消耗 1,720,000 · 获得 1,698,400 憨豆
+  盈亏 -21,600（-1.3%）
+
+余额 1,571,193
 ```
 
-青龙装了通知模块的话，这份汇总会一并推过去。
+每行日志都带时间戳（按 `timezone` 显示），汇总块不带 —— 套上反而没法看。青龙装了通知模块的话，这份汇总会一并推过去；直接跑的话重定向到文件即可。
 
 ---
 
@@ -171,7 +230,7 @@ c_secure_uid=NzMyMQ%3D%3D; c_secure_pass=...; c_secure_ssl=...; c_secure_tracker
 npm run test:ql
 ```
 
-会在本地起一个假站点，把脚本当子进程真跑一遍，覆盖按次数抽 / 一抽到底 / VIP 折算两种走向及其跨次留存 / 站内信清理（含每页 10 封的分页）/ 统计导出格式 / 跨次累计 / 统计文件损坏 / Cookie 没填 / Cookie 失效，共 67 条断言。
+会在本地起一个假站点，把脚本当子进程真跑一遍，覆盖按次数抽 / 一抽到底 / VIP 折算两种走向及其跨次留存 / 站内信清理（含每页 10 封的分页）/ 统计导出格式 / 跨次累计 / 统计文件损坏 / Cookie 没填 / Cookie 失效 / 日志时间戳与时区 / 在仓库里直接运行，共 76 条断言。
 
 测试是**照你的用法来的**：复制一份源码、把配置区整块换掉、再当子进程真跑，所以配置区的写法本身也在被测。
 
