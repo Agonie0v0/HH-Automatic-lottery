@@ -83,8 +83,11 @@ const RUNTIME = {
     backoffAfter: 3,
     backoffFactor: 1.5,
     maxBackoffMs: 30000,
-    // 中 VIP 后余额比估算多出这么多，就认定站点改发了憨豆
-    vipSwapMinBeans: 100000,
+    // 读不到站点公布的折算金额时用这个兜底
+    vipSwapFallbackBeans: 1000000,
+    // 查不到等级时才用余额差兜底判断。容差收得比较紧 ——
+    // 松了的话别人赠送一笔魔力就可能被误判成折算
+    vipSwapTolerance: 20000,
     // 站内信一次提交多少个 id
     mailChunk: 100,
     // 站内信翻页上限（每页显示多少封是用户自己在站点设置里定的）
@@ -256,6 +259,31 @@ function parsePrizeText(text) {
     return fallback;
 }
 
+/* 折算金额是站点明文印在抽奖页上的：
+     「当中奖 [VIP] 时，如果用户已经是 VIP 或以上等级，奖励憨豆： 1000000」
+   必须读它，不能拿余额差当金额 —— 憨豆还会因为做种持续增长，
+   两次读数之间涨的那几十点会被当成中奖收入记进去
+   （线上真出现过「1,000,060 憨豆」这种不存在的档位）。 */
+function parseVipSwapBeansFrom(html) {
+    const text = String(html || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ');
+    const match = text.match(/当中奖\s*\[?\s*VIP\s*\]?[^当]{0,80}?奖励憨豆[：:]\s*([\d,]+)/i);
+    if (!match) return 0;
+
+    const value = Number(match[1].replace(/,/g, ''));
+    return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+/* 「VIP 或以上等级」说的是 NexusPHP 的 class。站点可以把等级名字改得
+   面目全非（本站叫「俺不中类」），但等级图标用的还是标准文件名，
+   所以按图标判。只要判出 class ≥ VIP，折算与否就是确定的事实，
+   不用再去猜余额 —— 别人赠送魔力、做种收益统统影响不到。 */
+const CLASS_RANK = {
+    user: 1, power: 2, elite: 3, crazy: 4, insane: 5, veteran: 6,
+    extreme: 7, ultimate: 8, nexusmaster: 9, vip: 10, retiree: 11,
+    uploader: 12, moderator: 13, coadministrator: 14,
+    administrator: 15, sysop: 16, staffleader: 17
+};
+
 /* =========================================================
    统计
 
@@ -423,6 +451,12 @@ class Lottery {
         this.current = emptyStats();
         this.total = loadTotal();
 
+        // 站点公布的折算金额，开跑时从抽奖页读
+        this.vipSwapBeans = 0;
+        // true = 是 VIP 或以上，false = 不是，null = 没查出来
+        this.vipOrAbove = null;
+        this.vipClassChecked = false;
+
         this.errorStreak = 0;
         this.rateLimitStreak = 0;
         this.intervalMs = CONFIG.interval * 1000;
@@ -452,6 +486,10 @@ class Lottery {
         if (/takelogin\.php|name="password"/i.test(html)) {
             throw new Error('Cookie 已失效，站点把我踢回登录页了');
         }
+
+        // 折算金额和单抽消耗一样是站点随时能改的，顺手刷新
+        const swapBeans = parseVipSwapBeansFrom(html);
+        if (swapBeans > 0) this.vipSwapBeans = swapBeans;
 
         const balance = numberAfterClass(html, 'bean-number');
         const cost = numberAfterClass(html, 'use-bean');
@@ -492,6 +530,39 @@ class Lottery {
        不用去猜用户是不是 VIP —— 余额说了算。而且要是哪天 prize_text
        本身就返回「魔力 1000000」，那笔憨豆已经记进去了、估算和实际对得上，
        这里不会重复计。 */
+    readVipSwapBeans() {
+        return this.vipSwapBeans || RUNTIME.vipSwapFallbackBeans;
+    }
+
+    async fetchSelfUserId() {
+        const match = (await this.get('/usercp.php')).match(/userdetails\.php\?id=(\d+)/);
+        return match ? match[1] : null;
+    }
+
+    /* 查一次就记住。读不到返回 null —— 「没查出来」和「不是 VIP」
+       得分开，前者要退回余额差兜底，后者直接就能定。 */
+    async checkVipOrAbove() {
+        if (this.vipClassChecked) return this.vipOrAbove;
+        this.vipClassChecked = true;
+
+        try {
+            const id = await this.fetchSelfUserId();
+            if (!id) return null;
+
+            const html = await this.get(`/userdetails.php?id=${id}`);
+            const match = html.match(/等级[：:][\s\S]{0,300}?pic\/(\w+)\.(?:gif|png|svg|webp)/i);
+            if (!match) return null;
+
+            const rank = CLASS_RANK[match[1].toLowerCase()];
+            if (!rank) return null;
+
+            this.vipOrAbove = rank >= CLASS_RANK.vip;
+            return this.vipOrAbove;
+        } catch (error) {
+            return null;
+        }
+    }
+
     async reconcileVip(prize) {
         const estimated = this.balance;
 
@@ -499,18 +570,43 @@ class Lottery {
         try {
             actual = (await this.snapshot()).balance;
         } catch (error) {
+            // 这里悄悄放过去最要命：VIP 五千抽才碰一次，漏一次就是一百万
+            report('⚠️ 中了 VIP 但余额没核成 —— 你若本来就是 VIP，这一注的憨豆没记上');
             return;
         }
 
         const drift = actual - estimated;
         this.balance = actual;
-        if (drift < RUNTIME.vipSwapMinBeans) return;
 
-        const beans = Math.round(drift);
+        const beans = this.readVipSwapBeans();
+
+        // 先按等级判 —— 这是确定的事实，不受赠送魔力 / 做种收益干扰
+        const eligible = await this.checkVipOrAbove();
+
+        if (eligible === false) return;                 // 不是 VIP，真拿到了天数
+        if (eligible === null) {
+            // 等级读不到才退回余额差，而且要求落在公布金额附近的窄带里。
+            // 放宽的话，抽奖期间有人赠送一笔魔力就会被误判成折算。
+            if (Math.abs(drift - beans) > RUNTIME.vipSwapTolerance) {
+                if (drift > RUNTIME.vipSwapTolerance) {
+                    report(`⚠️ 中了 VIP 且余额变动 ${drift > 0 ? '+' : ''}${fmt(Math.round(drift))}，`
+                        + '但读不到你的等级，无法确认是否折算 —— 这一注按 VIP 记');
+                }
+                return;
+            }
+        }
+
+        // 金额一律按站点公布的来。drift 里混着做种收益、赠送、别的标签页的
+        // 开销，当金额用会记出「1,000,060 憨豆」这种奖池里根本没有的档位。
         markVipSwapped(this.current, prize, beans);
         markVipSwapped(this.total, prize, beans);
 
         report(`👑 你已经是 VIP，站点改发了 ${fmt(beans)} 憨豆 · 仍计为一次 VIP 中奖`);
+
+        const extra = Math.round(drift - beans);
+        if (Math.abs(extra) >= 1) {
+            report(`ℹ️ 同期余额另有 ${extra > 0 ? '+' : ''}${fmt(extra)}（做种收益 / 赠送等），未计入中奖`);
+        }
     }
 
     nextDelay() {

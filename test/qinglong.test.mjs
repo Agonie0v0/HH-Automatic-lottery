@@ -30,10 +30,21 @@ function check(name, cond, extra = '') {
 
 /* ---------------------------------------------------------------- */
 
-const luckyPage = (balance, cost = 2000) => `<!doctype html><html><body>
+const luckyPage = (balance, cost = 2000, swapBeans = 0) => `<!doctype html><html><body>
     <div class="header-bean flex"><span class="bean-number text-[14px]">${balance}.0</span></div>
+    ${swapBeans ? `<div class="rule">当中奖 [VIP] 时，如果用户已经是 VIP 或以上等级，奖励憨豆： ${swapBeans}</div>` : ''}
     <div class="use-bean text-center">每次消耗憨豆： ${cost}</div>
     <script>let prizes = [{"type":1001,"typeText":"\\u9b54\\u529b","amountText":"100 ","priority":99}];</script>
+</body></html>`;
+
+/* 等级是按图标文件名判的 —— 站点能把等级名字改得面目全非，图标名不变 */
+const userDetailsPage = klass => `<html><body>
+    <table><tr><td class="rowhead">等级：</td>
+    <td class="rowfollow"><img class="rank" src="pic/${klass}.gif" alt="${klass}"></td></tr></table>
+</body></html>`;
+
+const userCpPage = uid => `<html><body>
+    <a href="userdetails.php?id=${uid}">我的资料</a>
 </body></html>`;
 
 const loginPage = () => `<!doctype html><html><body>
@@ -64,7 +75,8 @@ const mailboxPage = (items, pageCount) => {
  *   pageSize  收件箱每页显示多少封
  */
 function startSite({ prizes = ['魔力 100 '], balance = 100000, cost = 2000, onDraw = null,
-                     mail = [], pageSize = 100, loggedOut = false } = {}) {
+                     mail = [], pageSize = 100, loggedOut = false,
+                     swapBeans = 0, userClass = null } = {}) {
     const state = {
         balance, cost, draws: 0, deleted: [], mailPageHits: [],
         mail: [...mail], drawn: []
@@ -84,7 +96,19 @@ function startSite({ prizes = ['魔力 100 '], balance = 100000, cost = 2000, on
         if (loggedOut) return send(200, loginPage());
 
         if (url.pathname === '/lucky.php') {
-            return send(200, luckyPage(state.balance, state.cost));
+            return send(200, luckyPage(state.balance, state.cost, swapBeans));
+        }
+
+        // userClass 为 null 时这两个页面不存在，脚本就查不到等级
+        if (url.pathname === '/usercp.php') {
+            if (!userClass) return send(404, 'not found');
+            return send(200, userCpPage('7321'));
+        }
+
+        if (url.pathname === '/userdetails.php') {
+            if (!userClass) return send(404, 'not found');
+            state.classPageHits = (state.classPageHits || 0) + 1;
+            return send(200, userDetailsPage(userClass));
         }
 
         if (url.pathname === '/plugin/lucky-draw') {
@@ -601,6 +625,106 @@ console.log('\n[20] 余额带小数时也要有千分位');
     check('余额写成 1,254,347.2 而不是一长串',
         /余额 1,254,347\.2\b/.test(out), out.slice(-400));
     check('没有 toFixed 补出来的多余 0', !/1254347|\.20\b/.test(out), out.slice(-400));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[21] 折算金额按站点公布值，做种涨的那几十点不算中奖');
+{
+    // 做种憨豆一直在涨，从本地结算到服务端读数这一两秒又涨了 60。
+    // 拿余额差当金额的话会记出「1,000,060 憨豆」这种奖池里没有的档位。
+    const site = await startSite({
+        prizes: ['VIP 7 Day(s)'],
+        balance: 500000,
+        swapBeans: 1000000,
+        userClass: 'vip',
+        onDraw: state => { state.balance += 1000000 + 60; }
+    });
+    const statsFile = path.join(TMP, 'stats-published.json');
+
+    const { out } = await runScript({ host: site.state.origin, draws: 1, statsFile });
+    const t = JSON.parse(fs.readFileSync(statsFile, 'utf8')).total;
+
+    check('档位是整数的 1,000,000，不是 1,000,060',
+        Object.keys(t.prizes.vip.tiers).join() === '已转换为憨豆 1,000,000',
+        Object.keys(t.prizes.vip.tiers).join(' | '));
+    check('憨豆按公布值记 1,000,000', t.gains.beans === 1000000, `实际 ${t.gains.beans}`);
+    check('多出来的 60 单独说明是做种收益',
+        /同期余额另有 \+60（做种收益 \/ 赠送等），未计入中奖/.test(out), out.slice(-700));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[22] 按等级判：普通用户中真 VIP，同时收到大额赠送也不误判');
+{
+    // 之前靠「余额多出一大笔」判折算，这种情况会凭空多记一百万
+    const site = await startSite({
+        prizes: ['VIP 7 Day(s)'],
+        balance: 500000,
+        swapBeans: 1000000,
+        userClass: 'user',
+        onDraw: state => { state.balance += 1000000; }   // 别人赠送的魔力
+    });
+    const statsFile = path.join(TMP, 'stats-gift.json');
+
+    const { out } = await runScript({ host: site.state.origin, draws: 1, statsFile });
+    const t = JSON.parse(fs.readFileSync(statsFile, 'utf8')).total;
+
+    check('不认定为折算', !/站点改发/.test(out), out.slice(-700));
+    check('老老实实记 VIP 7 天',
+        t.gains.vip === 7 && Object.keys(t.prizes.vip.tiers).join() === '7 天',
+        JSON.stringify(t.prizes.vip));
+    check('没有凭空多出一百万憨豆', t.gains.beans === 0, `实际 ${t.gains.beans}`);
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[23] 等级说是 VIP 就是 VIP，不用等余额对上');
+{
+    // 余额一点没变（读数滞后 / 别的标签页同时在花），
+    // 按等级判照样能定，不再依赖余额差
+    const site = await startSite({
+        prizes: ['VIP 7 Day(s)'],
+        balance: 500000,
+        swapBeans: 1000000,
+        userClass: 'uploader'      // 比 VIP 还高的等级，也该算
+    });
+    const statsFile = path.join(TMP, 'stats-class.json');
+
+    const { out } = await runScript({ host: site.state.origin, draws: 1, statsFile });
+    const t = JSON.parse(fs.readFileSync(statsFile, 'utf8')).total;
+
+    check('余额没变也认定为折算', /站点改发了 1,000,000 憨豆/.test(out), out.slice(-700));
+    check('VIP 以上的等级同样算', t.prizes.vip.swappedBeans === 1000000,
+        JSON.stringify(t.prizes.vip));
+    check('查等级只查一次，不是每抽都查',
+        (site.state.classPageHits || 0) === 1, `实际 ${site.state.classPageHits} 次`);
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[24] 等级读不到、余额差又对不上：按 VIP 记并说明白');
+{
+    const site = await startSite({
+        prizes: ['VIP 7 Day(s)'],
+        balance: 500000,
+        swapBeans: 1000000,
+        userClass: null,                                  // 查不到等级
+        onDraw: state => { state.balance += 500000; }     // 一笔赠送，不是折算
+    });
+    const statsFile = path.join(TMP, 'stats-unknown.json');
+
+    const { out } = await runScript({ host: site.state.origin, draws: 1, statsFile });
+    const t = JSON.parse(fs.readFileSync(statsFile, 'utf8')).total;
+
+    check('不瞎猜，按 VIP 记', t.gains.vip === 7 && t.gains.beans === 0,
+        `vip=${t.gains.vip} beans=${t.gains.beans}`);
+    check('明说读不到等级、无法确认',
+        /读不到你的等级，无法确认是否折算/.test(out), out.slice(-700));
 
     await site.close();
 }
