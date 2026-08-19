@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.14.0
+// @version      1.15.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 一抽到底 · 实时余额 · 站内信清理
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -589,26 +589,26 @@
         stats.raw[rawKey] = (stats.raw[rawKey] || 0) + 1;
     }
 
-    /* 把已经记成 from 的那一注改记成 to。抽数和消耗不动，只挪奖品归属。 */
-    function reclassifyLastDraw(from, to) {
-        const fix = stats => {
-            if (from.type !== 'unknown') {
-                stats.gains[from.type] = (stats.gains[from.type] || 0) - from.value;
-            }
-            const old = ensureBucket(stats, from.type);
-            old.count -= 1;
-            old.value -= from.value;
-            old.tiers[from.label] = (old.tiers[from.label] || 0) - 1;
-            if (old.tiers[from.label] <= 0) delete old.tiers[from.label];
-            if (old.count <= 0) delete stats.prizes[from.type];
+    /* 把刚记下的那一注 VIP 改标成「已转换为憨豆」。
 
-            if (to.type !== 'unknown') {
-                stats.gains[to.type] = (stats.gains[to.type] || 0) + to.value;
-            }
-            const next = ensureBucket(stats, to.type);
-            next.count += 1;
-            next.value += to.value;
-            next.tiers[to.label] = (next.tiers[to.label] || 0) + 1;
+       这一注仍然算在 VIP 类别里 —— 转盘确实停在 VIP 那一格，
+       中奖次数和爆率统计不该少这一笔。变的只有档位和收益归属：
+         · VIP 档位从「7 天」换成「已转换为憨豆 1,000,000」
+         · VIP 天数扣回去（没真拿到）
+         · 憨豆收入加上（盈亏要算对）
+       抽数和消耗都不动。 */
+    function markVipSwapped(prize, beans) {
+        const swappedLabel = `已转换为憨豆 ${fmt(beans)}`;
+
+        const fix = stats => {
+            stats.gains.vip = (stats.gains.vip || 0) - prize.value;
+            stats.gains.beans = (stats.gains.beans || 0) + beans;
+
+            const bucket = ensureBucket(stats, 'vip');
+            bucket.value -= prize.value;
+            bucket.tiers[prize.label] = (bucket.tiers[prize.label] || 0) - 1;
+            if (bucket.tiers[prize.label] <= 0) delete bucket.tiers[prize.label];
+            bucket.tiers[swappedLabel] = (bucket.tiers[swappedLabel] || 0) + 1;
         };
 
         fix(currentStats);
@@ -632,9 +632,9 @@
         const drift = beanBalance - estimated;
         if (drift < CONFIG.vipSwapMinBeans) return;
 
-        const swapped = parsePrizeText(`魔力 ${Math.round(drift)}`);
-        reclassifyLastDraw(prize, swapped);
-        addLog(`👑 你已经是 VIP，站点改发了 ${fmt(swapped.value)} 憨豆，已按憨豆记账`, 'success');
+        const beans = Math.round(drift);
+        markVipSwapped(prize, beans);
+        addLog(`👑 你已经是 VIP，站点改发了 ${fmt(beans)} 憨豆 · 仍计为一次 VIP 中奖`, 'success');
     }
 
     function recordDraw(prizeText) {

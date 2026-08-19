@@ -1948,20 +1948,27 @@ console.log('\n[38] 已是 VIP 时站点改发憨豆，要按憨豆记账');
     // 服务端余额 = 起始 - 2000 消耗 + 1,000,000 补偿
     const { d, stats } = await drawOneVip(start => start - 2000 + 1000000);
 
-    check('这一注不再算成 VIP 天数', !stats.gains.vip, `实际 ${stats.gains.vip}`);
+    check('没拿到 VIP 天数', !stats.gains.vip, `实际 ${stats.gains.vip}`);
     check('憨豆记了 1,000,000', stats.gains.beans === 1000000, `实际 ${stats.gains.beans}`);
-    check('明细里进的是憨豆那一类',
-        stats.prizes.beans?.count === 1 && !stats.prizes.vip,
-        JSON.stringify(stats.prizes));
-    check('档位名是「1,000,000 憨豆」',
-        Object.keys(stats.prizes.beans?.tiers || {})[0] === '1,000,000 憨豆',
-        Object.keys(stats.prizes.beans?.tiers || {}).join(' | '));
+    check('仍然算作一次 VIP 中奖，爆率统计不丢这一笔',
+        stats.prizes.vip?.count === 1, JSON.stringify(stats.prizes.vip));
+    check('没有凭空多出一次憨豆中奖',
+        !stats.prizes.beans, JSON.stringify(stats.prizes.beans));
+    check('VIP 档位标成「已转换为憨豆 1,000,000」',
+        Object.keys(stats.prizes.vip?.tiers || {}).join('|') === '已转换为憨豆 1,000,000',
+        Object.keys(stats.prizes.vip?.tiers || {}).join(' | '));
+    check('原来的「7 天」档位已经撤掉',
+        !stats.prizes.vip?.tiers['7 天'],
+        JSON.stringify(stats.prizes.vip?.tiers));
+    check('VIP 类别累计天数为 0',
+        stats.prizes.vip?.value === 0, `实际 ${stats.prizes.vip?.value}`);
     check('抽数还是 1，没被重复计',
         stats.draws === 1 && stats.cost === 2000, `${stats.draws} 抽 / ${stats.cost} 消耗`);
     check('原始文案照实保留 VIP',
         stats.raw['VIP 7 Day(s)'] === 1, JSON.stringify(stats.raw));
-    check('日志说清楚了改发憨豆',
-        Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('已经是 VIP')),
+    check('日志说清楚了改发憨豆、且仍计为一次 VIP',
+        Array.from(d.querySelectorAll('#lottery-log div'))
+            .some(el => el.textContent.includes('已经是 VIP') && el.textContent.includes('仍计为一次 VIP 中奖')),
         '未找到说明日志');
     check('大奖特效照样触发', !!d.querySelector('.hh-jackpot-overlay'), '没触发');
 }
@@ -1977,6 +1984,9 @@ console.log('\n[39] 不是 VIP 的用户中 VIP，照常记 VIP 天数');
     check('明细里进的是 VIP 那一类',
         stats.prizes.vip?.count === 1 && !stats.prizes.beans,
         JSON.stringify(stats.prizes));
+    check('档位还是「7 天」，不是折算档',
+        Object.keys(stats.prizes.vip?.tiers || {}).join('|') === '7 天',
+        Object.keys(stats.prizes.vip?.tiers || {}).join(' | '));
     check('不会误报改发憨豆',
         !Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('已经是 VIP')),
         '误报了');
