@@ -1362,27 +1362,39 @@ function mailPage(items) {
 const lotteryMail = (from, count) =>
     Array.from({ length: count }, (_, i) => ({ id: String(from + i), subject: '幸运大转盘 中奖通知' }));
 
+/* 一个会真的少信的收件箱：删除后重新分页，模拟站点的行为 */
+function makeMailbox(items) {
+    let inbox = [...items];
+    return {
+        page: n => inbox.slice(n * 100, (n + 1) * 100),
+        remove: ids => { inbox = inbox.filter(item => !ids.includes(item.id)); },
+        add: item => { inbox = [item, ...inbox]; },
+        get all() { return inbox; }
+    };
+}
+
 /* ---------------------------------------------------------------- */
-console.log('\n[29] 一键清空只删抽奖通知，别的信一封不碰');
+console.log('\n[29] 只删抽奖通知：别的信一封不碰，中途新到的也扫干净');
 {
-    // 三页收件箱：第三页不满 100 封，脚本据此判断翻到底了
     const KEEP = [
         { id: '9001', subject: '种子被删除' },
         { id: '9002', subject: '种子被删除' },
         { id: '9003', subject: '憨豆 改变' }
     ];
-    const PAGES = [
-        lotteryMail(1000, 100),
-        [...lotteryMail(2000, 98), KEEP[0], KEEP[1]],
-        [...lotteryMail(3000, 15), KEEP[2]]
-    ];
+    // 三页：100 + 100 + 16，最后一页不满 100，脚本据此判断翻到底
+    const box = makeMailbox([
+        ...lotteryMail(1000, 100),
+        ...lotteryMail(2000, 98), KEEP[0], KEEP[1],
+        ...lotteryMail(3000, 15), KEEP[2]
+    ]);
     const TOTAL_LOTTERY = 100 + 98 + 15;
 
     const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
     const w = dom.window;
 
     const deleted = [];
-    let posts = 0, pageHits = [];
+    const pageHits = [];
+    let posts = 0;
     w.fetch = async (url, init = {}) => {
         const target = String(url);
         if (init.method === 'POST') {
@@ -1390,13 +1402,20 @@ console.log('\n[29] 一键清空只删抽奖通知，别的信一封不碰');
             const body = init.body;
             check(`第 ${posts} 次提交带上了 action=moveordel`, body.get('action') === 'moveordel', body.get('action'));
             check(`第 ${posts} 次提交按的是删除键`, body.get('delete') === '删除', body.get('delete'));
-            deleted.push(...body.getAll('messages[]'));
+
+            const ids = body.getAll('messages[]');
+            deleted.push(...ids);
+            box.remove(ids);
+
+            // 第一批删完的当口又中了一次奖，新通知这时才进收件箱 ——
+            // 它不在扫描时的 id 清单里，只能靠扫尾那一步收掉
+            if (posts === 1) box.add({ id: '4242', subject: '幸运大转盘 中奖通知' });
             return { ok: true, status: 200, text: async () => '' };
         }
         if (target.includes('messages.php')) {
             const page = Number(new URL(target, 'https://hhanclub.net').searchParams.get('page'));
             pageHits.push(page);
-            return { ok: true, status: 200, text: async () => mailPage(PAGES[page] || []) };
+            return { ok: true, status: 200, text: async () => mailPage(box.page(page)) };
         }
         return { ok: true, status: 200, text: async () => '<html><body></body></html>' };
     };
@@ -1405,23 +1424,29 @@ console.log('\n[29] 一键清空只删抽奖通知，别的信一封不碰');
     const d = w.document;
 
     d.getElementById('purge-mail').click();
+    await until(() => !!d.querySelector('.hh-modal-overlay [data-mode="lottery"]'), 10000);
 
-    // 扫描完会弹确认框，按下「删除」
-    await until(() => !!d.querySelector('.hh-modal-overlay [data-mode="delete"]'), 10000);
-    const modalText = d.querySelector('.hh-modal-text')?.textContent || '';
-    check(`确认框写明要删 ${TOTAL_LOTTERY} 封`, modalText.includes(String(TOTAL_LOTTERY)), modalText.replace(/\s+/g, ' ').trim());
-    check('确认框写明保留 3 封', /3\s*<\/b>\s*封其他站内信|3.*封其他站内信/.test(
-        d.querySelector('.hh-modal-text')?.innerHTML || ''), d.querySelector('.hh-modal-text')?.innerHTML);
+    const modalText = (d.querySelector('.hh-modal-text')?.textContent || '').replace(/\s+/g, ' ').trim();
+    check(`确认框写明收件箱共 ${TOTAL_LOTTERY + 3} 封`, modalText.includes(String(TOTAL_LOTTERY + 3)), modalText);
+    check(`确认框写明抽奖通知 ${TOTAL_LOTTERY} 封`, modalText.includes(String(TOTAL_LOTTERY)), modalText);
+    check('确认框给了「全部删除」这个选项',
+        !!d.querySelector('.hh-modal-overlay [data-mode="all"]'), '没有全部删除按钮');
 
-    d.querySelector('.hh-modal-overlay [data-mode="delete"]').click();
-    await until(() => deleted.length >= TOTAL_LOTTERY, 10000);
+    d.querySelector('.hh-modal-overlay [data-mode="lottery"]').click();
+    await until(() => deleted.includes('4242'), 10000);
+    await sleep(300);
 
-    check('翻完了三页就停，没有继续翻', pageHits.join(',') === '0,1,2', pageHits.join(','));
-    check(`删掉的正好是 ${TOTAL_LOTTERY} 封`, deleted.length === TOTAL_LOTTERY, `实际 ${deleted.length}`);
+    check('先翻完三页，删完再补扫一次第一页',
+        pageHits.join(',') === '0,1,2,0', pageHits.join(','));
+    check(`删掉 ${TOTAL_LOTTERY} 封 + 中途新到的 1 封`,
+        deleted.length === TOTAL_LOTTERY + 1, `实际 ${deleted.length}`);
+    check('中途新到的那封也删了', deleted.includes('4242'), deleted.join(',').slice(-40));
     check('一封非抽奖通知都没被删',
         KEEP.every(item => !deleted.includes(item.id)),
         KEEP.filter(item => deleted.includes(item.id)).map(item => item.subject).join(' | '));
-    check('按 100 一批提交，共 3 批', posts === 3, `实际 ${posts}`);
+    check('收件箱里只剩那 3 封该留的',
+        box.all.length === 3 && box.all.every(item => !item.subject.includes('幸运大转盘')),
+        box.all.map(item => item.subject).join(' | '));
     check('日志写明了删了多少、留了多少',
         Array.from(d.querySelectorAll('#lottery-log div'))
             .some(el => el.textContent.includes('已删除') && el.textContent.includes('原样保留')),
@@ -1533,6 +1558,58 @@ console.log('\n[31] 自动删站内信：关着不动，开着按校准节奏清
     check('日志记了一行',
         Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('封抽奖通知')),
         '未找到清理日志');
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[32] 全部删除：连别的站内信一起清，但不补扫');
+{
+    const box = makeMailbox([
+        ...lotteryMail(1000, 8),
+        { id: '9001', subject: '种子被删除' },
+        { id: '9002', subject: '憨豆 改变' }
+    ]);
+
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+    const w = dom.window;
+
+    const deleted = [];
+    const pageHits = [];
+    w.fetch = async (url, init = {}) => {
+        const target = String(url);
+        if (init.method === 'POST') {
+            const ids = init.body.getAll('messages[]');
+            deleted.push(...ids);
+            box.remove(ids);
+            // 删的当口又到了一封正经站内信，全部删除模式不该把它带走
+            box.add({ id: '7777', subject: '种子被删除' });
+            return { ok: true, status: 200, text: async () => '' };
+        }
+        if (target.includes('messages.php')) {
+            pageHits.push(Number(new URL(target, 'https://hhanclub.net').searchParams.get('page')));
+            return { ok: true, status: 200, text: async () => mailPage(box.page(pageHits.at(-1))) };
+        }
+        return { ok: true, status: 200, text: async () => '<html><body></body></html>' };
+    };
+
+    await run(dom);
+    const d = w.document;
+
+    d.getElementById('purge-mail').click();
+    await until(() => !!d.querySelector('.hh-modal-overlay [data-mode="all"]'), 10000);
+    d.querySelector('.hh-modal-overlay [data-mode="all"]').click();
+    await until(() => deleted.length >= 10, 10000);
+    await sleep(300);
+
+    check('10 封全删了', deleted.length === 10, `实际 ${deleted.length}`);
+    check('非抽奖通知这次也删了',
+        deleted.includes('9001') && deleted.includes('9002'), deleted.join(','));
+    check('全部删除不补扫第一页', pageHits.join(',') === '0', pageHits.join(','));
+    check('删除期间新到的正经站内信没被带走',
+        !deleted.includes('7777') && box.all.some(item => item.id === '7777'),
+        box.all.map(item => item.id).join(','));
+    check('日志说的是清空收件箱',
+        Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('已清空收件箱')),
+        '未找到结果日志');
 }
 
 /* ---------------------------------------------------------------- */

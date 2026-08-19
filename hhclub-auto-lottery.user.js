@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.10.0
+// @version      1.11.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 官方爆率对比 · 一抽到底 · 实时余额
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -2775,7 +2775,7 @@
     }
 
     /* 一键清空：先把整个收件箱扫一遍，把「要删多少 / 留多少」摆给用户看了再动手 */
-    async function purgeLotteryMail() {
+    async function purgeMailbox() {
         if (cleaningMail) return;
 
         const button = $('purge-mail');
@@ -2799,18 +2799,40 @@
             const targets = all.filter(isLotteryMail);
             const keep = all.length - targets.length;
 
-            if (!targets.length) {
-                addLog(`✅ 收件箱里没有抽奖通知（共 ${fmt(all.length)} 封）`, 'success');
+            if (!all.length) {
+                addLog('✅ 收件箱是空的', 'success');
                 return;
             }
 
-            if (await askMailPurge(targets.length, keep) !== 'delete') {
+            const mode = await askMailPurge(targets.length, keep);
+            if (mode !== 'lottery' && mode !== 'all') {
                 addLog('已取消，一封都没删', 'info');
                 return;
             }
 
+            const doomed = mode === 'all' ? all : targets;
+            if (!doomed.length) {
+                addLog(`✅ 收件箱里没有抽奖通知（共 ${fmt(all.length)} 封）`, 'success');
+                return;
+            }
+
             if (button) button.textContent = '删除中…';
-            const removed = await deleteMail(targets.map(item => item.id));
+            let removed = await deleteMail(doomed.map(item => item.id));
+
+            if (mode === 'all') {
+                addLog(`🗑 已清空收件箱 · 共 ${fmt(removed)} 封`, 'success');
+                return;
+            }
+
+            // 扫描到删完这几秒里可能又进了新的中奖通知 —— 它们不在刚才那份
+            // id 清单里，会被剩下。补扫一次第一页收尾。
+            // 只在「只删抽奖通知」时做：全部删除模式下再扫一遍，
+            // 有可能把这期间刚到的正经站内信一起带走。
+            const stragglers = (await fetchMailboxPage(0)).filter(isLotteryMail);
+            if (stragglers.length) {
+                removed += await deleteMail(stragglers.map(item => item.id));
+            }
+
             addLog(`🗑 已删除 ${fmt(removed)} 封抽奖通知，其余 ${fmt(keep)} 封原样保留`, 'success');
         } catch (error) {
             addLog(`⚠️ ${error.message}`, 'error');
@@ -2825,15 +2847,20 @@
             overlay.className = 'hh-modal-overlay';
             overlay.innerHTML = `
                 <div class="hh-modal">
-                    <div class="hh-modal-title">🗑 清空抽奖站内信</div>
+                    <div class="hh-modal-title">🗑 清理收件箱</div>
                     <div class="hh-modal-text">
-                        找到 <b>${fmt(targetCount)}</b> 封主题带「${CONFIG.lotteryMailKeyword}」的通知，<br>
-                        另有 <b>${fmt(keepCount)}</b> 封其他站内信<b>不会</b>被动。<br>
+                        收件箱共 <b>${fmt(targetCount + keepCount)}</b> 封：<br>
+                        「${CONFIG.lotteryMailKeyword}」通知 <b>${fmt(targetCount)}</b> 封，
+                        其他站内信 <b>${fmt(keepCount)}</b> 封。<br>
                         删除不可撤销。
                     </div>
-                    <button class="hh-modal-btn hh-modal-primary" data-mode="delete">
-                        删除这 ${fmt(targetCount)} 封
+                    <button class="hh-modal-btn hh-modal-primary" data-mode="lottery">
+                        只删抽奖通知 · ${fmt(targetCount)} 封
                         <span>其余 ${fmt(keepCount)} 封原样保留</span>
+                    </button>
+                    <button class="hh-modal-btn" data-mode="all">
+                        全部删除 · ${fmt(targetCount + keepCount)} 封
+                        <span>连「种子被删除」这类通知一起清掉</span>
                     </button>
                     <button class="hh-modal-btn hh-modal-ghost" data-mode="cancel">取消</button>
                 </div>
@@ -3009,7 +3036,7 @@
             applyDrainUI();
         });
 
-        on('purge-mail', 'click', purgeLotteryMail);
+        on('purge-mail', 'click', purgeMailbox);
 
         on('auto-clean-mail', 'change', event => {
             settings.autoCleanMail = event.target.checked;
