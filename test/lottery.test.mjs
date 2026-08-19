@@ -22,7 +22,8 @@ function check(name, cond, extra = '') {
     else { failed++; console.log(`  ✗ ${name} ${extra}`); }
 }
 
-function makeDom({ legacy = null, pool = null, useBean = '每次消耗 2,000 憨豆', balance = '1,234,567' } = {}) {
+function makeDom({ legacy = null, pool = null, useBean = '每次消耗 2,000 憨豆', balance = '1,234,567',
+                   vipSwapBeans = 1000000 } = {}) {
     // pool 传入时按抽奖页真实的内联脚本形状渲染一段 <script>，
     // 让脚本走和线上完全一样的奖池读取路径。
     const poolScript = pool
@@ -36,6 +37,7 @@ function makeDom({ legacy = null, pool = null, useBean = '每次消耗 2,000 憨
     const dom = new JSDOM(`<!doctype html><html><body>
         <div class="use-bean">${useBean}</div>
         <div class="bean-number">${balance}</div>
+        <div class="hint">当中奖 [VIP] 时，如果用户已经是 VIP 或以上等级，奖励憨豆： ${vipSwapBeans}</div>
         ${poolScript}
     </body></html>`, {
         url: 'https://hhanclub.net/lucky.php',
@@ -2089,6 +2091,93 @@ console.log('\n[41] VIP 折算核不到余额时要明说，不能装没事');
     const stats = JSON.parse(w.localStorage.getItem('hhanclub_lottery_stats_v4'));
     check('核不到就按原样记 VIP，不瞎猜', stats.gains.vip === 7, `实际 ${stats.gains.vip}`);
     check('憨豆不会凭空多出来', stats.gains.beans === 0, `实际 ${stats.gains.beans}`);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[42] 折算金额按站点公布的算，不拿余额差当金额');
+{
+    // 憨豆会因为做种一直涨。校准读到的余额 = 起始 - 消耗 + 100 万补偿 + 60 做种，
+    // 早先直接把 drift 当金额，记出了「1,000,060 憨豆」这种奖池里没有的档位。
+    const START = 500000;
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000', balance: String(START) });
+    const w = dom.window;
+
+    w.fetch = async url => {
+        if (String(url).includes('lucky.php')) {
+            return {
+                ok: true, status: 200,
+                text: async () => `<html><body>
+                    <div class="bean-number">${START - 2000 + 1000000 + 60}.0</div>
+                    <div class="use-bean">每次消耗憨豆： 2000</div>
+                    <div>当中奖 [VIP] 时，如果用户已经是 VIP 或以上等级，奖励憨豆： 1000000</div>
+                </body></html>`
+            };
+        }
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ret: 0, data: { prize_text: 'VIP 7 Day(s)' } })
+        };
+    };
+
+    await run(dom);
+    const d = w.document;
+    d.getElementById('lottery-interval').value = '3';
+    d.getElementById('max-lottery-count').value = '1';
+    d.getElementById('start-lottery').click();
+    await untilStopped(d, 30000);
+    await sleep(300);
+
+    const stats = JSON.parse(w.localStorage.getItem('hhanclub_lottery_stats_v4'));
+    check('记的是站点公布的 1,000,000，不是 1,000,060',
+        stats.gains.beans === 1000000, `实际 ${stats.gains.beans}`);
+    check('档位名也是整数 1,000,000',
+        Object.keys(stats.prizes.vip?.tiers || {}).join('|') === '已转换为憨豆 1,000,000',
+        Object.keys(stats.prizes.vip?.tiers || {}).join(' | '));
+    check('多出来的 60 单独说明，不计入中奖',
+        Array.from(d.querySelectorAll('#lottery-log div'))
+            .some(el => el.textContent.includes('+60') && el.textContent.includes('未计入中奖')),
+        Array.from(d.querySelectorAll('#lottery-log div')).map(el => el.textContent).slice(-3).join(' | '));
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[43] 站点改了折算金额，脚本跟着改');
+{
+    const START = 500000;
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000', balance: String(START),
+                          vipSwapBeans: 500000 });
+    const w = dom.window;
+
+    w.fetch = async url => {
+        if (String(url).includes('lucky.php')) {
+            return {
+                ok: true, status: 200,
+                text: async () => `<html><body>
+                    <div class="bean-number">${START - 2000 + 500000}.0</div>
+                    <div class="use-bean">每次消耗憨豆： 2000</div>
+                    <div>当中奖 [VIP] 时，如果用户已经是 VIP 或以上等级，奖励憨豆： 500000</div>
+                </body></html>`
+            };
+        }
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ret: 0, data: { prize_text: 'VIP 7 Day(s)' } })
+        };
+    };
+
+    await run(dom);
+    const d = w.document;
+    d.getElementById('lottery-interval').value = '3';
+    d.getElementById('max-lottery-count').value = '1';
+    d.getElementById('start-lottery').click();
+    await untilStopped(d, 30000);
+    await sleep(300);
+
+    const stats = JSON.parse(w.localStorage.getItem('hhanclub_lottery_stats_v4'));
+    check('按页面上写的 500,000 记',
+        stats.gains.beans === 500000, `实际 ${stats.gains.beans}`);
+    check('档位名跟着变',
+        Object.keys(stats.prizes.vip?.tiers || {}).join('|') === '已转换为憨豆 500,000',
+        Object.keys(stats.prizes.vip?.tiers || {}).join(' | '));
 }
 
 /* ---------------------------------------------------------------- */

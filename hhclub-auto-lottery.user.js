@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.16.1
+// @version      1.17.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 一抽到底 · 实时余额 · 站内信清理
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -49,10 +49,11 @@
         jackpotMaxRate: 0.002,
         // 读不到奖池时的兜底判定：VIP，或单笔十万以上的憨豆
         jackpotBeansFloor: 100000,
-        // 中 VIP 但用户本来就是 VIP 时，站点改发憨豆。校准后余额比估算
-        // 多出这么多就认定发生了替换 —— 取值远高于任何单笔憨豆奖（780,000
-        // 那档除外，但那一注的 prize_text 就是魔力，走不到这里）
-        vipSwapMinBeans: 100000,
+        // 读不到站点公布的折算金额时用这个兜底
+        vipSwapFallbackBeans: 1000000,
+        // 余额多出「折算金额 × 这个比例」就认定发生了替换。
+        // 不要求精确相等：做种魔力在涨，别的标签页也可能在花。
+        vipSwapDetectRatio: 0.5,
         // 每抽多少次回服务端校准一次余额，纠正本地估算的累计漂移
         balanceSyncEveryDraws: 25,
         // 校准撞车时最多等多久让开（手动点 🔄 正好和自动校准撞上）
@@ -507,6 +508,27 @@
         return list.map(() => 0);
     }
 
+    /* 折算金额是站点明文印在抽奖页上的：
+         「当中奖 [VIP] 时，如果用户已经是 VIP 或以上等级，奖励憨豆： 1000000」
+       必须读它，不能拿余额差当金额 —— 憨豆还会因为做种持续增长，
+       两次读数之间涨的那几十点会被当成中奖收入记进去
+       （线上真出现过「1,000,060 憨豆」这种不存在的档位）。 */
+    function parseVipSwapBeansFrom(doc) {
+        const text = doc.body ? doc.body.textContent || '' : '';
+        const match = text.match(/当中奖\s*\[?\s*VIP\s*\]?[^当]{0,80}?奖励憨豆[：:]\s*([\d,]+)/i);
+        if (!match) return 0;
+
+        const value = Number(match[1].replace(/,/g, ''));
+        return Number.isFinite(value) && value > 0 ? value : 0;
+    }
+
+    let vipSwapBeans = 0;
+
+    function readVipSwapBeans() {
+        if (!vipSwapBeans) vipSwapBeans = parseVipSwapBeansFrom(document);
+        return vipSwapBeans || CONFIG.vipSwapFallbackBeans;
+    }
+
     function readPrizePool() {
         if (prizePool) return prizePool;
         prizePool = parsePrizePoolFrom(document) || [];
@@ -643,11 +665,19 @@
         }
 
         const drift = beanBalance - estimated;
-        if (drift < CONFIG.vipSwapMinBeans) return;
+        const beans = readVipSwapBeans();
+        if (drift < beans * CONFIG.vipSwapDetectRatio) return;
 
-        const beans = Math.round(drift);
+        // 只拿 drift 当「发生了替换」的信号，金额一律按站点公布的来。
+        // drift 里混着做种收益和别的标签页的开销，当金额用会记出
+        // 「1,000,060 憨豆」这种奖池里根本没有的档位。
         markVipSwapped(prize, beans);
+
+        const extra = Math.round(drift - beans);
         addLog(`👑 你已经是 VIP，站点改发了 ${fmt(beans)} 憨豆 · 仍计为一次 VIP 中奖`, 'success');
+        if (Math.abs(extra) >= 1) {
+            addLog(`ℹ️ 同期余额另有 ${extra > 0 ? '+' : ''}${fmt(extra)}（做种收益等），未计入中奖`, 'info');
+        }
     }
 
     function recordDraw(prizeText) {
@@ -1836,6 +1866,10 @@
             if (!response.ok) return null;
 
             const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
+            // 折算金额和奖池一样是站点随时能改的，顺手刷新
+            const swapBeans = parseVipSwapBeansFrom(doc);
+            if (swapBeans > 0) vipSwapBeans = swapBeans;
+
             return {
                 balance: firstNumber(doc.querySelector('.bean-number')?.textContent ?? ''),
                 // .use-bean 和 .bean-number 一样，不刷新页面就永远不变。
