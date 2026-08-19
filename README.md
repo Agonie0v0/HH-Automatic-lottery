@@ -23,6 +23,15 @@ https://raw.githubusercontent.com/SAGIRIxr/HH-Automatic-lottery/main/hhclub-auto
 
 > 上面两个 GreasyFork 链接装的是上游版本，不是本版本，别装错了。
 
+## 两个版本
+
+| | 用途 |
+|---|---|
+| **油猴脚本** [`hhclub-auto-lottery.user.js`](hhclub-auto-lottery.user.js) | 开着抽奖页，悬浮面板实时看战绩 |
+| **青龙版** [`qinglong/hh_lottery.js`](qinglong/hh_lottery.js) | 填个 Cookie 挂服务器上跑，见 [qinglong/README.md](qinglong/README.md) |
+
+两边共用同一套抽奖逻辑（限流退避、VIP 折算、站内信清理），青龙版把面板换成了日志和通知。
+
 ## 功能
 
 - **奖项明细** —— 按类别聚合中奖次数、占比、累计数值，可展开到具体档位
@@ -78,6 +87,8 @@ npm test        # 行为测试，约 6 分钟（用的是真实计时器）
 ```
 
 测试在 jsdom 里加载真实脚本、stub 掉接口，覆盖分奖项聚合、v3 迁移与 magic 合并、串行循环、退避恢复、连续失败停止、计数器隔离、余额结算与服务端校准、一抽到底、奖池降级、站内信清理、备份导入和大奖判定，共 184 条断言。其中奖池与中奖文案夹具直接取自线上真实数据。
+
+青龙版另有一套 mock 站点测试（`npm run test:ql`）：本地起假站点，把脚本当子进程真跑一遍，覆盖按次数抽 / 一抽到底 / VIP 折算两种走向 / 站内信分页清理 / Cookie 失效 / 多账号，共 32 条断言。
 
 ## GreasyFork 同步
 

@@ -1,12 +1,14 @@
 {
   "name": "hhclub-auto-lottery",
-  "version": "1.2.0",
-  "description": "HHCLUB 自动抽奖 · 情绪价值拉满版 —— 分奖项统计 / 官方爆率对比 / 官方记录同步的油猴脚本",
+  "version": "1.14.0",
+  "description": "HHCLUB 自动抽奖 · 情绪价值拉满版 —— 分奖项统计 / 一抽到底 / 实时余额 / 站内信清理，油猴脚本 + 青龙版",
   "private": true,
   "type": "module",
   "scripts": {
     "test": "node test/lottery.test.mjs",
-    "check": "node --check hhclub-auto-lottery.user.js"
+    "test:ql": "node test/qinglong.test.mjs",
+    "test:all": "node test/lottery.test.mjs && node test/qinglong.test.mjs",
+    "check": "node --check hhclub-auto-lottery.user.js && node --check qinglong/hh_lottery.js"
   },
   "license": "MIT",
   "devDependencies": {
