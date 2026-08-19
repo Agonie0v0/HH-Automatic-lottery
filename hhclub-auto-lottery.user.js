@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.8.1
+// @version      1.8.2
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 官方爆率对比 · 一抽到底 · 实时余额
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -440,15 +440,38 @@
 
         // 奖池文案拼法和接口返回的 prize_text 一致（typeText + ' ' + amountText），
         // 所以档位 label 天然对得上，可以直接按 label 匹配。
-        return list.map(item => {
+        const rates = poolProbabilities(list);
+
+        return list.map((item, index) => {
             const prize = parsePrizeText(`${item.typeText || ''} ${item.amountText || ''}`);
             return {
                 type: prize.type,
                 label: prize.label,
                 value: prize.value,
-                probability: Number(item.probability_real) || 0
+                probability: rates[index]
             };
         });
+    }
+
+    /* 站点公布爆率的方式变过：早先每项都带一个算好的 probability_real，
+       后来这个字段被撤掉，只剩原始权重 probability。两种都认 ——
+       有 probability_real 就直接用，没有就拿权重归一化。归一化对
+       「本来就是概率」的输入是恒等变换，所以一套代码覆盖两种情况，
+       而且用权重算精度更高（probability_real 只有四位小数）。
+       两个字段都没有时返回全 0，上层据此整块降级。 */
+    function poolProbabilities(list) {
+        const real = list.map(item => Number(item.probability_real));
+        if (real.every(Number.isFinite) && real.some(value => value > 0)) return real;
+
+        const weights = list.map(item => {
+            const value = Number(item.probability);
+            return Number.isFinite(value) && value > 0 ? value : 0;
+        });
+
+        const total = weights.reduce((sum, value) => sum + value, 0);
+        if (total > 0) return weights.map(value => value / total);
+
+        return list.map(() => 0);
     }
 
     function readPrizePool() {
@@ -466,8 +489,13 @@
     function officialRates() {
         const byType = {};
         const byTier = {};
+        const pool = readPrizePool();
 
-        readPrizePool().forEach(item => {
+        // 一项都读不到爆率时返回空表：宁可整块不显示，
+        // 也不要摆一排「官方 0.00%」让人以为是站点真的把爆率调成了 0
+        if (!pool.some(item => item.probability > 0)) return { byType, byTier };
+
+        pool.forEach(item => {
             byType[item.type] = (byType[item.type] || 0) + item.probability;
             const key = `${item.type}|${item.label}`;
             byTier[key] = (byTier[key] || 0) + item.probability;
@@ -481,7 +509,9 @@
         const pool = readPrizePool();
         const hit = pool.find(item => item.type === prize.type && item.label === prize.label);
 
-        if (hit) return hit.probability > 0 && hit.probability <= CONFIG.jackpotMaxRate;
+        // 爆率读得到才按爆率判。站点撤掉爆率字段时全表都是 0，
+        // 那就当没读到走硬规则，否则大奖特效会跟着一起失效。
+        if (hit && hit.probability > 0) return hit.probability <= CONFIG.jackpotMaxRate;
 
         return prize.type === 'vip'
             || (prize.type === 'beans' && prize.value >= CONFIG.jackpotBeansFloor);

@@ -1253,5 +1253,99 @@ console.log('\n[26] 单次消耗没变时不打扰');
 }
 
 /* ---------------------------------------------------------------- */
+console.log('\n[27] 站点撤掉 probability_real 时改用原始权重');
+{
+    // 线上 2026-08-19 的奖池：只剩 probability（原始权重），没有算好的概率
+    const WEIGHT_POOL = [
+        { typeText: '彩虹 ID', amountText: '7 Day(s)', probability: 400 },
+        { typeText: '魔力', amountText: '780000 ', probability: 14 },
+        { typeText: '魔力', amountText: '5000 ', probability: 2039 },
+        { typeText: 'VIP', amountText: '7 Day(s)', probability: 3 },
+        { typeText: '魔力', amountText: '100 ', probability: 3961 },
+        { typeText: '补签卡', amountText: '1 ', probability: 800 },
+        { typeText: '魔力', amountText: '2000 ', probability: 3000 },
+        { typeText: '上传量', amountText: '2 GB', probability: 800 },
+        { typeText: '魔力', amountText: '1000 ', probability: 3500 },
+        { typeText: '上传量', amountText: '5 GB', probability: 200 },
+        { typeText: '邀请', amountText: '1 ', probability: 50 }
+    ];
+
+    const dom = makeDom({ pool: WEIGHT_POOL, useBean: '每次消耗憨豆： 2000', balance: '100000' });
+    const w = dom.window;
+    w.fetch = async url => {
+        if (String(url).includes('lucky.php')) {
+            return { ok: true, status: 200, text: async () => '<html><body></body></html>' };
+        }
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ret: 0, data: { prize_text: '魔力 100 ' } })
+        };
+    };
+
+    await run(dom);
+    const d = w.document;
+
+    // 总权重 14767，憨豆档位加权总值 31,011,100 → 每抽期望 2100.03
+    check('按权重归一化算出理论盈亏率 +5.0%',
+        d.getElementById('theory-rate').textContent === '+5.0%',
+        d.getElementById('theory-rate').textContent);
+
+    d.getElementById('lottery-interval').value = '3';
+    d.getElementById('max-lottery-count').value = '1';
+    d.getElementById('start-lottery').click();
+    await untilStopped(d);
+
+    const official = Array.from(d.querySelectorAll('#detail-list .hh-row-official'));
+    check('官方爆率照常显示，不是 0.00%',
+        official.length === 1 && official[0].textContent === '官方 84.7%',
+        official.map(el => el.textContent).join(' | '));
+
+    const tierRates = Array.from(d.querySelectorAll('#detail-list .hh-tier-rate'));
+    check('档位爆率也配得上（100 憨豆 26.82%）',
+        tierRates.some(el => el.textContent.includes('官方 26.82%')),
+        tierRates.map(el => el.textContent).join(' | '));
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[28] 两个爆率字段都没有时整块降级，不摆 0.00%');
+{
+    const BLIND_POOL = REAL_POOL.map(({ typeText, amountText }) => ({ typeText, amountText }));
+
+    const dom = makeDom({ pool: BLIND_POOL, useBean: '每次消耗憨豆： 2000', balance: '100000' });
+    const w = dom.window;
+    w.fetch = async url => {
+        if (String(url).includes('lucky.php')) {
+            return { ok: true, status: 200, text: async () => '<html><body></body></html>' };
+        }
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ret: 0, data: { prize_text: '魔力 100 ' } })
+        };
+    };
+
+    await run(dom);
+    const d = w.document;
+
+    check('理论盈亏率显示为 -，不是 -100%',
+        d.getElementById('theory-rate').textContent === '-',
+        d.getElementById('theory-rate').textContent);
+
+    d.getElementById('lottery-interval').value = '3';
+    d.getElementById('max-lottery-count').value = '1';
+    d.getElementById('start-lottery').click();
+    await untilStopped(d);
+
+    check('类别行不显示官方爆率',
+        d.querySelectorAll('#detail-list .hh-row-official').length === 0,
+        Array.from(d.querySelectorAll('#detail-list .hh-row-official')).map(el => el.textContent).join(' | '));
+    check('档位行也不显示官方爆率',
+        d.querySelectorAll('#detail-list .hh-tier-rate').length === 0,
+        Array.from(d.querySelectorAll('#detail-list .hh-tier-rate')).map(el => el.textContent).join(' | '));
+    check('实测数据照常统计',
+        d.getElementById('draw-count').textContent === '1',
+        d.getElementById('draw-count').textContent);
+}
+
+/* ---------------------------------------------------------------- */
 console.log(`\n=========== ${passed} passed, ${failed} failed ===========\n`);
 process.exit(failed ? 1 : 0);
