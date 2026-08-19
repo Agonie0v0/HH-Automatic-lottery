@@ -1369,9 +1369,11 @@ const lotteryMail = (from, count) =>
    pageSize 可调 —— 站点上每页显示多少封是用户自己设的，默认 100，见过 10 的。 */
 function makeMailbox(items, pageSize = 100) {
     let inbox = [...items];
+    let size = pageSize;
     return {
-        get pageCount() { return Math.max(1, Math.ceil(inbox.length / pageSize)); },
-        page(n) { return inbox.slice(n * pageSize, (n + 1) * pageSize); },
+        setPageSize(n) { size = n; },
+        get pageCount() { return Math.max(1, Math.ceil(inbox.length / size)); },
+        page(n) { return inbox.slice(n * size, (n + 1) * size); },
         remove(ids) { inbox = inbox.filter(item => !ids.includes(item.id)); },
         add(item) { inbox = [item, ...inbox]; },
         get all() { return inbox; }
@@ -1640,6 +1642,173 @@ console.log('\n[33] 自动删站内信：关着不动，开着一路清到第一
     check('日志记了一行',
         Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('封抽奖通知')),
         '未找到清理日志');
+}
+
+/* 网站设定页夹具：照 usercp 的样子给一堆各类字段，用来验证「只改 pmnum」 */
+function usercpPage(pmnum) {
+    return `<html><body>
+        <form action="usercp.php" method="post">
+            <input type="hidden" name="action" value="tracker">
+            <input type="hidden" name="type" value="save">
+            <input type="checkbox" name="cat401" value="yes" checked>
+            <input type="checkbox" name="cat402" value="yes">
+            <input type="checkbox" name="cat403" value="yes" checked>
+            <input type="checkbox" name="showcomnum" value="yes" checked>
+            <input type="radio" name="timetype" value="added">
+            <input type="radio" name="timetype" value="last" checked>
+            <select name="stylesheet">
+                <option value="1">默认</option><option value="7" selected>HHan</option>
+            </select>
+            <select name="fontsize">
+                <option value="small">小</option><option value="medium" selected>中</option>
+            </select>
+            <input type="text" name="pmnum" value="${pmnum}">
+            <input type="text" name="sbnum" value="70">
+            <input type="text" name="torrentsperpage" value="0">
+            <button type="submit">保存</button>
+        </form>
+    </body></html>`;
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[34] 每页条数太小时提议改站点设置，且只改这一项');
+{
+    const KEEP = { id: '9001', subject: '种子被删除' };
+    const box = makeMailbox([...lotteryMail(1000, 44), KEEP], 10);   // 45 封 / 每页 10 = 5 页
+
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+    const w = dom.window;
+
+    let pmnum = 10;
+    let savedBody = null;
+    const pageHits = [];
+    const deleted = [];
+
+    w.fetch = async (url, init = {}) => {
+        const target = String(url);
+
+        if (target.includes('usercp.php') && init.method === 'POST') {
+            savedBody = init.body;
+            pmnum = Number(init.body.get('pmnum')) || pmnum;
+            box.setPageSize(pmnum);
+            return { ok: true, status: 200, text: async () => '' };
+        }
+        if (target.includes('usercp.php')) {
+            return { ok: true, status: 200, text: async () => usercpPage(pmnum) };
+        }
+        if (init.method === 'POST') {
+            const ids = init.body.getAll('messages[]');
+            deleted.push(...ids);
+            box.remove(ids);
+            return { ok: true, status: 200, text: async () => '' };
+        }
+        if (target.includes('messages.php')) {
+            const page = Number(new URL(target, 'https://hhanclub.net').searchParams.get('page'));
+            pageHits.push(page);
+            return { ok: true, status: 200, text: async () => mailPage(box.page(page), box.pageCount) };
+        }
+        return { ok: true, status: 200, text: async () => '<html><body></body></html>' };
+    };
+
+    await run(dom);
+    const d = w.document;
+
+    d.getElementById('purge-mail').click();
+    await until(() => !!d.querySelector('.hh-modal-overlay [data-mode="bump"]'), 10000);
+
+    const askText = (d.querySelector('.hh-modal-text')?.textContent || '').replace(/\s+/g, ' ').trim();
+    check('提示里写明了当前每页 10 封、要翻 5 页',
+        askText.includes('10') && askText.includes('5'), askText);
+
+    d.querySelector('.hh-modal-overlay [data-mode="bump"]').click();
+    await until(() => !!savedBody, 10000);
+
+    check('提交的是 action=tracker / type=save',
+        savedBody.get('action') === 'tracker' && savedBody.get('type') === 'save',
+        `${savedBody.get('action')} / ${savedBody.get('type')}`);
+    check('pmnum 改成了 100', savedBody.get('pmnum') === '100', savedBody.get('pmnum'));
+    check('pmnum 只提交一次，不是追加',
+        savedBody.getAll('pmnum').length === 1, `实际 ${savedBody.getAll('pmnum').length} 个`);
+    check('勾着的复选框原样回填',
+        savedBody.getAll('cat401').join() === 'yes'
+        && savedBody.getAll('cat403').join() === 'yes'
+        && savedBody.getAll('showcomnum').join() === 'yes',
+        [...savedBody.keys()].join(','));
+    check('没勾的复选框不会被凭空勾上',
+        !savedBody.has('cat402'), 'cat402 被提交了');
+    check('单选按当前选中的那个提交',
+        savedBody.get('timetype') === 'last', savedBody.get('timetype'));
+    check('下拉框按当前选中项提交',
+        savedBody.get('stylesheet') === '7' && savedBody.get('fontsize') === 'medium',
+        `${savedBody.get('stylesheet')} / ${savedBody.get('fontsize')}`);
+    check('其余文本框原样回填',
+        savedBody.get('sbnum') === '70' && savedBody.get('torrentsperpage') === '0',
+        `${savedBody.get('sbnum')} / ${savedBody.get('torrentsperpage')}`);
+    check('提交按钮不会被当成字段',
+        ![...savedBody.keys()].some(k => k === ''), [...savedBody.keys()].join(','));
+
+    check('日志报了改动结果',
+        Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('每页站内信条数已改成')),
+        '未找到结果日志');
+
+    // 改完之后按新的每页 100 封扫，44 封抽奖通知照样一封不漏
+    await until(() => !!d.querySelector('.hh-modal-overlay [data-mode="lottery"]'), 10000);
+    d.querySelector('.hh-modal-overlay [data-mode="lottery"]').click();
+    await until(() => deleted.length >= 44, 10000);
+    await sleep(400);
+
+    check('改完后按新页大小扫，44 封全删了', deleted.length === 44, `实际 ${deleted.length}`);
+    check('该留的那封还在', !deleted.includes(KEEP.id) && box.all.length === 1,
+        box.all.map(item => item.subject).join(' | '));
+
+    // 问过一次就不再问
+    box.add({ id: '8001', subject: '幸运大转盘 中奖通知' });
+    d.getElementById('purge-mail').click();
+    await until(() => !!d.querySelector('.hh-modal-overlay [data-mode="lottery"]'), 10000);
+    check('答过一次就不再打扰',
+        !d.querySelector('.hh-modal-overlay [data-mode="bump"]'), '又弹了一次');
+    d.querySelector('.hh-modal-overlay [data-mode="cancel"]').click();
+    await sleep(200);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[35] 页数不多时不提这茬');
+{
+    const box = makeMailbox(lotteryMail(1000, 15), 10);   // 15 封 / 每页 10 = 2 页
+
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+    const w = dom.window;
+
+    let usercpHits = 0;
+    w.fetch = async (url, init = {}) => {
+        const target = String(url);
+        if (target.includes('usercp.php')) {
+            usercpHits++;
+            return { ok: true, status: 200, text: async () => usercpPage(10) };
+        }
+        if (init.method === 'POST') {
+            box.remove(init.body.getAll('messages[]'));
+            return { ok: true, status: 200, text: async () => '' };
+        }
+        if (target.includes('messages.php')) {
+            const page = Number(new URL(target, 'https://hhanclub.net').searchParams.get('page'));
+            return { ok: true, status: 200, text: async () => mailPage(box.page(page), box.pageCount) };
+        }
+        return { ok: true, status: 200, text: async () => '<html><body></body></html>' };
+    };
+
+    await run(dom);
+    const d = w.document;
+
+    d.getElementById('purge-mail').click();
+    await until(() => !!d.querySelector('.hh-modal-overlay [data-mode="lottery"]'), 10000);
+
+    check('只有两页时不弹改设置的提示',
+        !d.querySelector('.hh-modal-overlay [data-mode="bump"]'), '弹了');
+    check('也没去碰网站设定页', usercpHits === 0, `实际请求了 ${usercpHits} 次`);
+
+    d.querySelector('.hh-modal-overlay [data-mode="cancel"]').click();
+    await sleep(200);
 }
 
 /* ---------------------------------------------------------------- */

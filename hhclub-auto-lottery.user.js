@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.11.1
+// @version      1.12.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 官方爆率对比 · 一抽到底 · 实时余额
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -62,6 +62,12 @@
         mailboxMaxPages: 600,
         // 反复清第一页的轮数上限，同样是因为一页可能只有 10 封
         mailSweepMaxRounds: 20,
+        // 网站设定页，每页站内信条数（pmnum）在这里
+        userCpPage: '/usercp.php',
+        // 建议调到的每页条数
+        mailPageSizeTarget: 100,
+        // 收件箱超过这么多页才值得提议改设置，只有一两页的没必要打扰
+        mailPageSizeAskAfterPages: 3,
         // 一次 POST 提交多少个 id
         mailDeleteChunk: 100
     };
@@ -117,6 +123,7 @@
         drainMode: false,
         reserveBeans: 0,
         autoCleanMail: false,
+        mailPageSizePrompted: false,
         panelLeft: null,
         panelTop: null
     };
@@ -2765,6 +2772,145 @@
         return all;
     }
 
+    /* 把一张表单按当前值序列化。改站点设置必须整张表回填 ——
+       usercp 一次收下全部 83 个字段，只提交想改的那个，其余全会被清成默认值。 */
+    function serializeForm(form) {
+        const data = new URLSearchParams();
+
+        Array.from(form.elements).forEach(element => {
+            const name = element.name;
+            if (!name || element.disabled) return;
+
+            const type = String(element.type || '').toLowerCase();
+            if (['submit', 'button', 'reset', 'image', 'file'].includes(type)) return;
+
+            if (type === 'checkbox' || type === 'radio') {
+                if (element.checked) data.append(name, element.value);
+                return;
+            }
+
+            if (element.tagName === 'SELECT' && element.multiple) {
+                Array.from(element.selectedOptions).forEach(option => data.append(name, option.value));
+                return;
+            }
+
+            data.append(name, element.value);
+        });
+
+        return data;
+    }
+
+    /* 把「每页站内信条数」改成 target，返回改完后站点上的实际值。
+       只动 pmnum 一项，其余设定原样回填。 */
+    async function setMailPageSize(target) {
+        const settingsUrl = `${CONFIG.userCpPage}?action=tracker`;
+
+        const page = await fetch(settingsUrl, { credentials: 'include' });
+        if (!page.ok) throw new Error(`打不开网站设定页（${page.status}）`);
+
+        const doc = new DOMParser().parseFromString(await page.text(), 'text/html');
+        const form = Array.from(doc.querySelectorAll('form'))
+            .find(item => item.querySelector('[name="pmnum"]'));
+        if (!form) throw new Error('网站设定页里没找到「每页站内信条数」，站点大概改版了');
+
+        const body = serializeForm(form);
+        // 防呆：字段数明显不对就别提交，免得把一整页设定冲成默认值
+        if (Array.from(body.keys()).length < 10) {
+            throw new Error('网站设定表单读出来不完整，已放弃修改');
+        }
+
+        body.set('pmnum', String(target));
+
+        const saved = await fetch(CONFIG.userCpPage, {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body
+        });
+        if (!saved.ok) throw new Error(`保存网站设定失败（${saved.status}）`);
+
+        // 站点未必会报错，回头核一遍到底生效没有
+        const after = await fetch(settingsUrl, { credentials: 'include' });
+        if (!after.ok) return 0;
+
+        const value = new DOMParser().parseFromString(await after.text(), 'text/html')
+            .querySelector('[name="pmnum"]')?.value;
+        return Number(value) || 0;
+    }
+
+    /* 收件箱每页显示多少封是站点设置里的 pmnum。设成 10 的话，
+       一千多封信要翻一百多页才扫得完。页数多的时候问一句要不要调到 100，
+       答过一次就记下来，不再打扰。 */
+    async function offerBiggerMailPage() {
+        if (settings.mailPageSizePrompted) return;
+
+        const { items, pageCount } = await fetchMailboxPage(0);
+        if (pageCount <= CONFIG.mailPageSizeAskAfterPages) return;
+        if (!items.length || items.length >= CONFIG.mailPageSizeTarget) return;
+
+        // 不管答什么都只问这一次
+        settings.mailPageSizePrompted = true;
+        saveSettings();
+
+        if (await askMailPageSize(items.length, pageCount) !== 'bump') {
+            addLog('好，保持现在的每页条数', 'info');
+            return;
+        }
+
+        try {
+            const now = await setMailPageSize(CONFIG.mailPageSizeTarget);
+            if (now >= CONFIG.mailPageSizeTarget) {
+                addLog(`⚡ 每页站内信条数已改成 ${now}（原 ${items.length}）`, 'success');
+            } else {
+                addLog(`⚠️ 设定提交了，但每页条数是 ${now || '未知'}，站点可能有上限`, 'warning');
+            }
+        } catch (error) {
+            addLog(`⚠️ ${error.message}`, 'warning');
+        }
+    }
+
+    function askMailPageSize(pageSize, pageCount) {
+        return new Promise(resolve => {
+            const overlay = document.createElement('div');
+            overlay.className = 'hh-modal-overlay';
+            overlay.innerHTML = `
+                <div class="hh-modal">
+                    <div class="hh-modal-title">⚡ 扫得有点慢</div>
+                    <div class="hh-modal-text">
+                        你的收件箱每页只显示 <b>${fmt(pageSize)}</b> 封，
+                        扫完要翻 <b>${fmt(pageCount)}</b> 页。<br>
+                        改成每页 ${CONFIG.mailPageSizeTarget} 封能少翻九成。<br>
+                        <span style="opacity:.75">改的是站点「控制面板 → 网站设定」里的
+                        「每页站内信条数」，其余设定按当前值原样回填。</span>
+                    </div>
+                    <button class="hh-modal-btn hh-modal-primary" data-mode="bump">
+                        改成每页 ${CONFIG.mailPageSizeTarget} 封
+                        <span>只动这一项</span>
+                    </button>
+                    <button class="hh-modal-btn hh-modal-ghost" data-mode="keep">不用，就这样扫</button>
+                </div>
+            `;
+
+            const done = mode => {
+                overlay.remove();
+                document.removeEventListener('keydown', onKey);
+                resolve(mode);
+            };
+            const onKey = event => {
+                if (event.key === 'Escape') done('keep');
+            };
+
+            overlay.addEventListener('click', event => {
+                const button = event.target.closest('[data-mode]');
+                if (button) return done(button.dataset.mode);
+                if (event.target === overlay) done('keep');
+            });
+            document.addEventListener('keydown', onKey);
+
+            document.body.appendChild(overlay);
+        });
+    }
+
     /* 反复清第一页，直到第一页不再有抽奖通知。
        一页可能只有 10 封，清一次远不够，所以要循环。 */
     async function sweepLotteryMail() {
@@ -2846,6 +2992,9 @@
         }
 
         try {
+            // 页数太多的话先问一句要不要把每页条数调大，能省一大截请求
+            await offerBiggerMailPage();
+
             addLog('🔍 正在扫描收件箱…', 'info');
             const all = await scanMailbox();
             const targets = all.filter(isLotteryMail);
