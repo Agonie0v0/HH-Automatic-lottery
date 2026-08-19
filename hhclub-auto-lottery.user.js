@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.11.0
+// @version      1.11.1
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 官方爆率对比 · 一抽到底 · 实时余额
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -57,10 +57,11 @@
         // 只有主题里带这几个字的才会被删。收件箱里还混着「种子被删除」
         // 「憨豆 改变」这类真要看的信，宁可漏删也不能误删。
         lotteryMailKeyword: '幸运大转盘',
-        // 站点收件箱一页 100 封，不满一页就是翻到底了
-        mailboxPageSize: 100,
-        // 翻页上限，防站点改版后无限翻下去
-        mailboxMaxPages: 60,
+        // 翻页上限。每页显示多少封是用户自己在站点设置里定的（见过 10 封的），
+        // 所以页数可能很多，这里只是防站点改版后无限翻下去的兜底
+        mailboxMaxPages: 600,
+        // 反复清第一页的轮数上限，同样是因为一页可能只有 10 封
+        mailSweepMaxRounds: 20,
         // 一次 POST 提交多少个 id
         mailDeleteChunk: 100
     };
@@ -2710,23 +2711,73 @@
 
     const isLotteryMail = item => item.subject.includes(CONFIG.lotteryMailKeyword);
 
+    /* 站点的翻页下拉框每页一个 <option>，直接就是总页数。
+       比「数这页有几封」可靠得多 —— 每页显示多少封是用户自己设的。 */
+    function readPageCount(doc) {
+        const select = doc.querySelector('select[onchange*="switchPage"]');
+        return select ? select.options.length : 0;
+    }
+
     async function fetchMailboxPage(page) {
         const url = `${CONFIG.mailboxPage}?action=viewmailbox&box=1&page=${page}`;
         const response = await fetch(url, { credentials: 'include' });
         if (!response.ok) throw new Error(`收件箱第 ${page + 1} 页读取失败（${response.status}）`);
 
-        return parseMailboxPage(new DOMParser().parseFromString(await response.text(), 'text/html'));
+        const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
+        return { items: parseMailboxPage(doc), pageCount: readPageCount(doc) };
     }
 
-    /* 翻完整个收件箱。最后一页不满一页就是到底了。 */
+    /* 翻完整个收件箱。
+
+       页数按翻页下拉框来。**不能靠「这页不满 100 封就是最后一页」判断** ——
+       每页显示多少封是用户自己在站点设置里定的，见过设成 10 封的，
+       那样翻一页就以为到底了，第 11 封往后全删不掉。
+       下拉框读不到时才退回长度判断，并且以第一页的实际条数为准。 */
     async function scanMailbox() {
         const all = [];
-        for (let page = 0; page < CONFIG.mailboxMaxPages; page++) {
-            const items = await fetchMailboxPage(page);
-            all.push(...items);
-            if (items.length < CONFIG.mailboxPageSize) break;
+        const seen = new Set();
+        let totalPages = CONFIG.mailboxMaxPages;
+        let pageSize = 0;
+        let hasPageCount = false;
+
+        for (let page = 0; page < Math.min(totalPages, CONFIG.mailboxMaxPages); page++) {
+            const { items, pageCount } = await fetchMailboxPage(page);
+
+            if (page === 0) {
+                hasPageCount = pageCount > 0;
+                if (hasPageCount) totalPages = pageCount;
+                pageSize = items.length;
+            }
+
+            if (!items.length) break;
+            // 站点要是不认 page 参数、每页都返回同一批，及时收手
+            if (items.every(item => seen.has(item.id))) break;
+
+            items.forEach(item => {
+                if (seen.has(item.id)) return;
+                seen.add(item.id);
+                all.push(item);
+            });
+
+            if (!hasPageCount && items.length < pageSize) break;
         }
+
         return all;
+    }
+
+    /* 反复清第一页，直到第一页不再有抽奖通知。
+       一页可能只有 10 封，清一次远不够，所以要循环。 */
+    async function sweepLotteryMail() {
+        let removed = 0;
+
+        for (let round = 0; round < CONFIG.mailSweepMaxRounds; round++) {
+            const { items } = await fetchMailboxPage(0);
+            const ids = items.filter(isLotteryMail).map(item => item.id);
+            if (!ids.length) break;
+            removed += await deleteMail(ids);
+        }
+
+        return removed;
     }
 
     async function deleteMail(ids) {
@@ -2754,18 +2805,19 @@
         return done;
     }
 
-    /* 挂机期间顺手清。新信都排在最前面，所以只看第一页就够，一次请求。 */
+    /* 挂机期间顺手清。新信都排在最前面，所以只看第一页 ——
+       但一页可能只有 10 封，而两次校准之间会攒 25 封，
+       所以要清到第一页没有抽奖通知为止，否则永远追不上。 */
     async function autoCleanMail() {
         if (!settings.autoCleanMail || cleaningMail) return;
 
         cleaningMail = true;
         try {
-            const ids = (await fetchMailboxPage(0)).filter(isLotteryMail).map(item => item.id);
-            if (!ids.length) return;
+            const removed = await sweepLotteryMail();
+            if (!removed) return;
 
-            await deleteMail(ids);
-            mailCleaned += ids.length;
-            addLog(`📪 清掉 ${fmt(ids.length)} 封抽奖通知 · 本次累计 ${fmt(mailCleaned)} 封`, 'info');
+            mailCleaned += removed;
+            addLog(`📪 清掉 ${fmt(removed)} 封抽奖通知 · 本次累计 ${fmt(mailCleaned)} 封`, 'info');
         } catch (error) {
             // 清信失败不该影响抽奖，记一行就算了
             addLog(`⚠️ 站内信清理失败：${error.message}`, 'warning');
@@ -2825,13 +2877,10 @@
             }
 
             // 扫描到删完这几秒里可能又进了新的中奖通知 —— 它们不在刚才那份
-            // id 清单里，会被剩下。补扫一次第一页收尾。
+            // id 清单里，会被剩下。补扫收尾。
             // 只在「只删抽奖通知」时做：全部删除模式下再扫一遍，
             // 有可能把这期间刚到的正经站内信一起带走。
-            const stragglers = (await fetchMailboxPage(0)).filter(isLotteryMail);
-            if (stragglers.length) {
-                removed += await deleteMail(stragglers.map(item => item.id));
-            }
+            removed += await sweepLotteryMail();
 
             addLog(`🗑 已删除 ${fmt(removed)} 封抽奖通知，其余 ${fmt(keep)} 封原样保留`, 'success');
         } catch (error) {
