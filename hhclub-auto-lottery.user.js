@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.8.2
+// @version      1.8.3
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 官方爆率对比 · 一抽到底 · 实时余额
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -483,6 +483,20 @@
     /* 奖池指纹，用来判断站点有没有偷偷调过爆率 */
     function poolFingerprint(pool) {
         return (pool || []).map(item => `${item.type}|${item.label}|${item.probability}`).sort().join(';');
+    }
+
+    /* 奖池还在但一项爆率都读不到 —— 站点 2026-08-19 把 probability 和
+       probability_real 双双撤掉了，页面上只剩排序用的 priority。
+       官方对比这块只能停用，说一声，免得以为是脚本坏了。 */
+    let opaquePoolWarned = false;
+    function warnIfPoolOpaque() {
+        if (opaquePoolWarned) return;
+        const pool = readPrizePool();
+        if (!pool.length || pool.some(item => item.probability > 0)) return;
+
+        opaquePoolWarned = true;
+        addLog('ℹ️ 站点已不再公布奖品爆率，官方对比与理论盈亏率停用', 'warning');
+        addLog('📊 实测统计不受影响，样本够大时占比就是爆率', 'info');
     }
 
     /* 官方爆率查表：按类别汇总一份，按具体档位汇总一份 */
@@ -1778,7 +1792,10 @@
         prizePool = pool;
         const after = theoreticalProfitRate();
 
-        if (!quiet) {
+        if (!quiet && !pool.some(item => item.probability > 0)) {
+            opaquePoolWarned = false;
+            warnIfPoolOpaque();
+        } else if (!quiet) {
             const shift = (before !== null && after !== null && Math.abs(after - before) >= 0.05)
                 ? `，理论盈亏率 ${before > 0 ? '+' : ''}${before.toFixed(1)}% → ${after > 0 ? '+' : ''}${after.toFixed(1)}%`
                 : '';
@@ -2932,6 +2949,8 @@
         if (totalStats.migratedFrom === 'v3') {
             addLog('📦 已迁移旧版历史统计数据', 'success');
         }
+
+        warnIfPoolOpaque();
 
 
         setInterval(() => {
