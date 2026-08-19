@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.17.0
+// @version      1.18.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 一抽到底 · 实时余额 · 站内信清理
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -51,9 +51,11 @@
         jackpotBeansFloor: 100000,
         // 读不到站点公布的折算金额时用这个兜底
         vipSwapFallbackBeans: 1000000,
-        // 余额多出「折算金额 × 这个比例」就认定发生了替换。
-        // 不要求精确相等：做种魔力在涨，别的标签页也可能在花。
-        vipSwapDetectRatio: 0.5,
+        // 查不到等级时才用余额差兜底判断。容差收得比较紧 ——
+        // 松了的话别人赠送一笔魔力就可能被误判成折算。
+        vipSwapTolerance: 20000,
+        // 个人页，用来读等级
+        userCpPageForId: '/usercp.php',
         // 每抽多少次回服务端校准一次余额，纠正本地估算的累计漂移
         balanceSyncEveryDraws: 25,
         // 校准撞车时最多等多久让开（手动点 🔄 正好和自动校准撞上）
@@ -508,6 +510,55 @@
         return list.map(() => 0);
     }
 
+    /* 「VIP 或以上等级」说的是 NexusPHP 的 class。站点可以把等级名字改得
+       面目全非（本站叫「俺不中类」），但等级图标用的还是标准文件名，
+       所以按图标判。只要判出 class ≥ VIP，折算与否就是确定的事实，
+       不用再去猜余额 —— 别人赠送魔力、做种收益、别的标签页在花钱，
+       统统影响不到。 */
+    const CLASS_RANK = {
+        user: 1, power: 2, elite: 3, crazy: 4, insane: 5, veteran: 6,
+        extreme: 7, ultimate: 8, nexusmaster: 9, vip: 10, retiree: 11,
+        uploader: 12, moderator: 13, coadministrator: 14,
+        administrator: 15, sysop: 16, staffleader: 17
+    };
+
+    // true = 是 VIP 或以上，false = 不是，null = 没查出来
+    let vipOrAbove = null;
+    let vipClassChecked = false;
+
+    async function fetchSelfUserId() {
+        const response = await fetch(CONFIG.userCpPageForId, { credentials: 'include' });
+        if (!response.ok) return null;
+
+        const match = (await response.text()).match(/userdetails\.php\?id=(\d+)/);
+        return match ? match[1] : null;
+    }
+
+    async function checkVipOrAbove() {
+        if (vipClassChecked) return vipOrAbove;
+        vipClassChecked = true;
+
+        try {
+            const id = await fetchSelfUserId();
+            if (!id) return null;
+
+            const response = await fetch(`/userdetails.php?id=${id}`, { credentials: 'include' });
+            if (!response.ok) return null;
+
+            const match = (await response.text())
+                .match(/等级[：:][\s\S]{0,300}?pic\/(\w+)\.(?:gif|png|svg|webp)/i);
+            if (!match) return null;
+
+            const rank = CLASS_RANK[match[1].toLowerCase()];
+            if (!rank) return null;
+
+            vipOrAbove = rank >= CLASS_RANK.vip;
+            return vipOrAbove;
+        } catch (error) {
+            return null;
+        }
+    }
+
     /* 折算金额是站点明文印在抽奖页上的：
          「当中奖 [VIP] 时，如果用户已经是 VIP 或以上等级，奖励憨豆： 1000000」
        必须读它，不能拿余额差当金额 —— 憨豆还会因为做种持续增长，
@@ -666,17 +717,31 @@
 
         const drift = beanBalance - estimated;
         const beans = readVipSwapBeans();
-        if (drift < beans * CONFIG.vipSwapDetectRatio) return;
 
-        // 只拿 drift 当「发生了替换」的信号，金额一律按站点公布的来。
-        // drift 里混着做种收益和别的标签页的开销，当金额用会记出
-        // 「1,000,060 憨豆」这种奖池里根本没有的档位。
+        // 先按等级判 —— 这是确定的事实，不受赠送魔力 / 做种收益干扰
+        const eligible = await checkVipOrAbove();
+
+        if (eligible === false) return;                 // 不是 VIP，真拿到了天数
+        if (eligible === null) {
+            // 等级读不到才退回余额差，而且要求落在公布金额附近的窄带里。
+            // 放宽的话，抽奖期间有人赠送一笔魔力就会被误判成折算。
+            if (Math.abs(drift - beans) > CONFIG.vipSwapTolerance) {
+                if (drift > CONFIG.vipSwapTolerance) {
+                    addLog(`⚠️ 中了 VIP 且余额变动 ${drift > 0 ? '+' : ''}${fmt(Math.round(drift))}，`
+                        + '但读不到你的等级，无法确认是否折算 —— 这一注按 VIP 记', 'warning');
+                }
+                return;
+            }
+        }
+
+        // 金额一律按站点公布的来。drift 里混着做种收益、赠送、别的标签页的
+        // 开销，当金额用会记出「1,000,060 憨豆」这种奖池里根本没有的档位。
         markVipSwapped(prize, beans);
 
         const extra = Math.round(drift - beans);
         addLog(`👑 你已经是 VIP，站点改发了 ${fmt(beans)} 憨豆 · 仍计为一次 VIP 中奖`, 'success');
         if (Math.abs(extra) >= 1) {
-            addLog(`ℹ️ 同期余额另有 ${extra > 0 ? '+' : ''}${fmt(extra)}（做种收益等），未计入中奖`, 'info');
+            addLog(`ℹ️ 同期余额另有 ${extra > 0 ? '+' : ''}${fmt(extra)}（做种收益 / 赠送等），未计入中奖`, 'info');
         }
     }
 

@@ -2180,6 +2180,123 @@ console.log('\n[43] 站点改了折算金额，脚本跟着改');
         Object.keys(stats.prizes.vip?.tiers || {}).join(' | '));
 }
 
+/* 抽一注 VIP。classIcon 决定站点认不认「VIP 或以上」，
+   serverBalance 决定校准时读到多少余额。 */
+async function drawVipWith({ classIcon, serverBalance, swapRule = 1000000 }) {
+    const START = 500000;
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000', balance: String(START) });
+    const w = dom.window;
+
+    let userdetailsHits = 0;
+    w.fetch = async url => {
+        const target = String(url);
+        if (target.includes('usercp.php')) {
+            return {
+                ok: true, status: 200,
+                text: async () => '<html><body><a href="userdetails.php?id=17321">我</a></body></html>'
+            };
+        }
+        if (target.includes('userdetails.php')) {
+            userdetailsHits++;
+            if (!classIcon) return { ok: false, status: 500, text: async () => '' };
+            return {
+                ok: true, status: 200,
+                text: async () => `<html><body><span>等级：</span>
+                    <span><img alt="x" src="pic/${classIcon}.gif" /><span>俺不中类</span></span>
+                </body></html>`
+            };
+        }
+        if (target.includes('lucky.php')) {
+            return {
+                ok: true, status: 200,
+                text: async () => `<html><body>
+                    <div class="bean-number">${serverBalance(START)}.0</div>
+                    <div class="use-bean">每次消耗憨豆： 2000</div>
+                    <div>当中奖 [VIP] 时，如果用户已经是 VIP 或以上等级，奖励憨豆： ${swapRule}</div>
+                </body></html>`
+            };
+        }
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ret: 0, data: { prize_text: 'VIP 7 Day(s)' } })
+        };
+    };
+
+    await run(dom);
+    const d = w.document;
+    d.getElementById('lottery-interval').value = '3';
+    d.getElementById('max-lottery-count').value = '1';
+    d.getElementById('start-lottery').click();
+    await untilStopped(d, 30000);
+    await sleep(400);
+
+    return {
+        d, w, userdetailsHits,
+        stats: JSON.parse(w.localStorage.getItem('hhanclub_lottery_stats_v4')),
+        logs: Array.from(d.querySelectorAll('#lottery-log div')).map(el => el.textContent)
+    };
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[44] 抽奖期间有人赠送魔力，不能误判成 VIP 折算');
+{
+    // 普通用户（Power User）中了真 VIP，同时收到 80 万赠送。
+    // 只看余额差的话会当成折算，凭空记出一百万。
+    const { stats, logs } = await drawVipWith({
+        classIcon: 'power',
+        serverBalance: start => start - 2000 + 800000
+    });
+
+    check('等级不够，判定为真拿到 VIP 天数', stats.gains.vip === 7, `实际 ${stats.gains.vip}`);
+    check('憨豆一分没多记', stats.gains.beans === 0, `实际 ${stats.gains.beans}`);
+    check('档位还是「7 天」',
+        Object.keys(stats.prizes.vip?.tiers || {}).join('|') === '7 天',
+        Object.keys(stats.prizes.vip?.tiers || {}).join(' | '));
+    check('不会谎称已折算',
+        !logs.some(line => line.includes('已经是 VIP')), logs.slice(-3).join(' | '));
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[45] 是发布员（class 高于 VIP），余额没动也照样判折算');
+{
+    // 极端情况：校准恰好读到和估算一样的余额（比如同期花掉了等额憨豆）。
+    // 按等级判就不受影响。
+    const { stats, userdetailsHits } = await drawVipWith({
+        classIcon: 'uploader',
+        serverBalance: start => start - 2000
+    });
+
+    check('按等级判定为折算', stats.gains.beans === 1000000, `实际 ${stats.gains.beans}`);
+    check('没拿到 VIP 天数', !stats.gains.vip, `实际 ${stats.gains.vip}`);
+    check('仍算一次 VIP 中奖', stats.prizes.vip?.count === 1, JSON.stringify(stats.prizes.vip));
+    check('等级只查一次', userdetailsHits === 1, `实际 ${userdetailsHits}`);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[46] 等级读不到时退回余额差，且窄带才认');
+{
+    // 读不到等级 + 余额只多了 80 万（离公布的 100 万差 20 万，超出容差）
+    const loose = await drawVipWith({
+        classIcon: null,
+        serverBalance: start => start - 2000 + 800000
+    });
+    check('偏差太大就不认，按 VIP 记', loose.stats.gains.vip === 7, `实际 ${loose.stats.gains.vip}`);
+    check('憨豆不乱加', loose.stats.gains.beans === 0, `实际 ${loose.stats.gains.beans}`);
+    check('提示读不到等级、无法确认',
+        loose.logs.some(line => line.includes('读不到你的等级')), loose.logs.slice(-3).join(' | '));
+
+    // 读不到等级 + 余额多了 1,000,060（做种那 60 点，在容差内）
+    const tight = await drawVipWith({
+        classIcon: null,
+        serverBalance: start => start - 2000 + 1000060
+    });
+    check('落在窄带内就认，且按公布金额记',
+        tight.stats.gains.beans === 1000000, `实际 ${tight.stats.gains.beans}`);
+    check('多出的 60 单独说明',
+        tight.logs.some(line => line.includes('+60') && line.includes('未计入中奖')),
+        tight.logs.slice(-3).join(' | '));
+}
+
 /* ---------------------------------------------------------------- */
 console.log(`\n=========== ${passed} passed, ${failed} failed ===========\n`);
 process.exit(failed ? 1 : 0);
