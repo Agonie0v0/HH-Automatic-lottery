@@ -146,8 +146,8 @@ function runScript(config) {
         interval: 3,
         maxMinutes: 60,
         cleanMail: false,
-        accountGap: 0,
         host: 'hhanclub.net',
+        timezone: 'Asia/Shanghai',
         userAgent: 'test-agent',
         ...config
     };
@@ -487,6 +487,74 @@ console.log('\n[15] 折算的憨豆跨次运行不能丢');
         /折算：VIP 折算 1,000,000 憨豆/.test(out), out.slice(-700));
 
     await site2.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[16] 日志带时间戳，汇总块不带');
+{
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
+
+    const { out } = await runScript({ host: site.state.origin, draws: 2 });
+
+    const [before, after] = out.split('─'.repeat(40));
+    const logLines = before.split('\n').filter(line => line.trim());
+
+    check('日志每一行都带 [MM/DD HH:MM:SS]',
+        logLines.every(line => /^\[\d\d\/\d\d \d\d:\d\d:\d\d\] /.test(line)),
+        logLines.find(line => !/^\[\d\d\/\d\d \d\d:\d\d:\d\d\] /.test(line)));
+    check('抽奖那几行也带上了', logLines.some(line => /\] 🎲 第 1 抽/.test(line)),
+        logLines.join(' | ').slice(0, 200));
+    check('汇总块不套时间戳，免得没法看',
+        (after || '').split('\n').filter(l => l.trim()).every(line => !/^\[\d\d\/\d\d/.test(line)),
+        (after || '').slice(0, 200));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[17] 时区按配置走 —— 容器里多半是 UTC，不设就对不上');
+{
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
+
+    const hourOf = out => {
+        const match = out.match(/^\[\d\d\/\d\d (\d\d):\d\d:\d\d\]/m);
+        return match ? Number(match[1]) : null;
+    };
+
+    const utc = await runScript({ host: site.state.origin, draws: 1, timezone: 'UTC' });
+    const shanghai = await runScript({ host: site.state.origin, draws: 1, timezone: 'Asia/Shanghai' });
+
+    const a = hourOf(utc.out);
+    const b = hourOf(shanghai.out);
+
+    check('两种时区都打出了时间', a !== null && b !== null, `${a} / ${b}`);
+    check('上海比 UTC 快 8 小时', ((b - a) + 24) % 24 === 8, `UTC ${a} 时 / 上海 ${b} 时`);
+
+    const bad = await runScript({ host: site.state.origin, draws: 1, timezone: '瞎写的时区' });
+    check('时区写错不会崩，退回 ISO 格式',
+        /^\[\d\d-\d\d \d\d:\d\d:\d\d\] /m.test(bad.out), bad.out.slice(0, 200));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[18] 在仓库里直接 node qinglong/hh_lottery.js 也能跑');
+{
+    // 仓库根目录的 package.json 是 type:module，会把这个目录下的 .js
+    // 当 ESM 解析，直接跑就崩在 require 上 —— qinglong/package.json 钉回
+    // commonjs 才行。这条就是防它被误删。
+    const { code, out } = await new Promise(resolve => {
+        const child = spawn(process.execPath, [SCRIPT], { cwd: ROOT });
+        let text = '';
+        child.stdout.on('data', d => { text += d; });
+        child.stderr.on('data', d => { text += d; });
+        child.on('close', c => resolve({ code: c, out: text }));
+    });
+
+    check('不会因为 type:module 崩掉',
+        !/require is not defined|ERR_REQUIRE_ESM/.test(out), out.slice(0, 300));
+    check('走到了「还没填 Cookie」这一步', /还没填 Cookie/.test(out), out.slice(0, 300));
+    check('退出码是 1', code === 1, `exit ${code}`);
 }
 
 /* ---------------------------------------------------------------- */

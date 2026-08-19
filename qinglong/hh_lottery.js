@@ -10,6 +10,9 @@
  * 统计会存成一份 JSON，格式和油猴版的「💾 备份 JSON」完全一致 ——
  * 从 NAS 上把这个文件拿下来，在浏览器面板里点「📥 导入备份」就能合进去。
  *
+ * 不只能在青龙里跑 —— 任何装了 Node 18+ 的机器（Debian / NAS / 群晖…）
+ * 直接 `node hh_lottery.js` 就行，配 crontab 或 systemd timer 定时。
+ *
  * 依赖：Node 18+（用的是内置 fetch，不需要 npm install 任何东西）
  * 仓库：https://github.com/SAGIRIxr/HH-Automatic-lottery
  * 协议：MIT
@@ -54,10 +57,14 @@ const CONFIG = {
           留空字符串 '' 就是不记 */
     statsFile: 'hh_lottery_stats.json',
 
-    /* ⑧ 站点域名，一般不用改 */
+    /* ⑧ 日志时间按哪个时区显示。
+          青龙容器默认常是 UTC，不设这个的话日志时间对不上 */
+    timezone: 'Asia/Shanghai',
+
+    /* ⑨ 站点域名，一般不用改 */
     host: 'hhanclub.net',
 
-    /* ⑨ User-Agent，一般不用改 */
+    /* ⑩ User-Agent，一般不用改 */
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
         + '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
 };
@@ -101,6 +108,7 @@ function normalizeConfig() {
     CONFIG.cleanMail = CONFIG.cleanMail === true;
     CONFIG.host = String(CONFIG.host || 'hhanclub.net').trim().replace(/\/+$/, '');
     CONFIG.statsFile = String(CONFIG.statsFile || '').trim();
+    CONFIG.timezone = String(CONFIG.timezone || '').trim();
 }
 
 /* 还没填 Cookie 的占位文字要认出来，不然会拿着「在这里粘贴」去请求 */
@@ -115,12 +123,37 @@ function readCookie() {
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-function log(...args) {
-    console.log(...args);
+/* 日志时间。跑在容器里的话系统时区多半是 UTC，跟人对不上，
+   所以按 CONFIG.timezone 显示；时区名写错就退回 ISO。 */
+function stamp() {
+    const now = new Date();
+    try {
+        return now.toLocaleString('zh-CN', {
+            timeZone: CONFIG.timezone || undefined,
+            hour12: false,
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit'
+        });
+    } catch (error) {
+        return now.toISOString().slice(5, 19).replace('T', ' ');
+    }
+}
+
+function log(line = '') {
+    console.log(line === '' ? '' : `[${stamp()}] ${line}`);
+}
+
+/* 汇总那种多行块不套时间戳，套上反而没法看 */
+function raw(block) {
+    console.log(block);
 }
 
 const messages = [];
 function report(line) {
+    // 通知里存不带时间戳的版本，推送出去更紧凑
     messages.push(line);
     log(line);
 }
@@ -749,6 +782,28 @@ async function notify(title, content) {
     }
 }
 
+/* 直接在终端跑的时候 Ctrl-C 很常见，抽到一半的成绩不能就这么没了。
+   青龙停任务发的也是 SIGTERM，同样接住。 */
+function guardExit(lottery) {
+    let bailing = false;
+
+    const bail = signal => () => {
+        if (bailing) process.exit(130);
+        bailing = true;
+
+        log(`\n⚠️ 收到 ${signal}，先把已抽到的存下来再退出`);
+        if (lottery.current.draws > 0) {
+            const file = saveStats(lottery.current, lottery.total);
+            if (file) log(`💾 统计已存到 ${file}`);
+        }
+        raw(`\n${'─'.repeat(40)}\n${lottery.summary()}`);
+        process.exit(130);
+    };
+
+    process.on('SIGINT', bail('Ctrl-C'));
+    process.on('SIGTERM', bail('SIGTERM'));
+}
+
 async function main() {
     if (typeof fetch !== 'function') {
         log('❌ 需要 Node 18 或更高版本（脚本用的是内置 fetch）');
@@ -770,6 +825,7 @@ async function main() {
         : `   一抽到底 · 保留 ${fmt(CONFIG.reserve)} 憨豆 · 间隔 ${CONFIG.interval} 秒`);
 
     const lottery = new Lottery(cookie);
+    guardExit(lottery);
 
     try {
         await lottery.run();
@@ -785,7 +841,7 @@ async function main() {
     }
 
     const summary = lottery.summary();
-    log(`\n${'─'.repeat(40)}\n${summary}`);
+    raw(`\n${'─'.repeat(40)}\n${summary}`);
 
     await notify('HHCLUB 幸运大转盘', [...messages, '', summary].join('\n').trim());
 }

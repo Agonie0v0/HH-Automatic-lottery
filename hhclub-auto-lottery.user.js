@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.16.0
+// @version      1.16.1
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 一抽到底 · 实时余额 · 站内信清理
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -55,6 +55,8 @@
         vipSwapMinBeans: 100000,
         // 每抽多少次回服务端校准一次余额，纠正本地估算的累计漂移
         balanceSyncEveryDraws: 25,
+        // 校准撞车时最多等多久让开（手动点 🔄 正好和自动校准撞上）
+        calibrationWaitMs: 15000,
 
         // ---- 站内信清理 ----
         mailboxPage: '/messages.php',
@@ -632,7 +634,13 @@
        这里不会重复计。 */
     async function reconcileVipPrize(prize) {
         const estimated = beanBalance;
-        if (!await calibrateBalance({ quiet: true })) return;
+
+        await waitForCalibrationSlot();
+        if (!await calibrateBalance({ quiet: true })) {
+            // 这里悄悄放过去最要命：VIP 五千抽才碰一次，漏一次就是一百万
+            addLog('⚠️ 中了 VIP 但余额没核成 —— 你若本来就是 VIP，这一注的憨豆没记上', 'warning');
+            return;
+        }
 
         const drift = beanBalance - estimated;
         if (drift < CONFIG.vipSwapMinBeans) return;
@@ -1879,6 +1887,19 @@
         return true;
     }
 
+    /* calibrateBalance 撞上另一次正在跑的校准会直接返回 false。
+       多数地方无所谓，但有两处是指着这次结果做决定的：
+         · VIP 折算 —— 放弃就等于一百万憨豆不记账
+         · 一抽到底的停止判断 —— 放弃就会拿旧余额判定，提前收工
+       这两处先等它让开再上。 */
+    async function waitForCalibrationSlot(timeoutMs = CONFIG.calibrationWaitMs) {
+        const deadline = Date.now() + timeoutMs;
+        while (calibrating && Date.now() < deadline) {
+            await new Promise(resolve => setTimeout(resolve, 200));
+        }
+        return !calibrating;
+    }
+
     async function calibrateBalance({ quiet = false } = {}) {
         if (calibrating) return false;
         calibrating = true;
@@ -2419,8 +2440,10 @@
         const reserve = Math.max(0, settings.reserveBeans);
         if (beanBalance - singleCost >= reserve) return false;
 
-        // 估算说该停了，但可能是漂移造成的 —— 拿权威值再确认一遍
+        // 估算说该停了，但可能是漂移造成的 —— 拿权威值再确认一遍。
+        // 校准被别的调用占着时先等一下，直接放弃的话会拿旧余额判定、提前收工。
         if (drawsSinceCalibration > 0) {
+            await waitForCalibrationSlot();
             await calibrateBalance({ quiet: true });
             if (beanBalance - singleCost >= reserve) return false;
         }

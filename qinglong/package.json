@@ -1,0 +1,4 @@
+{
+  "//": "仓库根目录的 package.json 是 type:module，会让这个目录下的 .js 被当成 ESM 解析，直接 node qinglong/hh_lottery.js 就崩在 require 上。这里把本目录钉回 commonjs。单独下载脚本到别处运行时没有 package.json，Node 本来就按 commonjs 处理，不受影响。",
+  "type": "commonjs"
+}

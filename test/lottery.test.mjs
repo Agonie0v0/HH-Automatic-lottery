@@ -2011,5 +2011,86 @@ console.log('\n[39] 不是 VIP 的用户中 VIP，照常记 VIP 天数');
 }
 
 /* ---------------------------------------------------------------- */
+console.log('\n[40] 手动刷新余额正好撞上 VIP 折算，也不能把这一注漏掉');
+{
+    // 抽到 VIP 的同时手动点 🔄：早先的实现里 calibrateBalance 见到
+    // calibrating 就直接 return false，折算被悄悄跳过，一百万憨豆不记账。
+    const START = 500000;
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000', balance: String(START) });
+    const w = dom.window;
+
+    let luckyHits = 0;
+    w.fetch = async url => {
+        if (String(url).includes('lucky.php')) {
+            luckyHits++;
+            // 第一次（手动刷新那次）故意拖慢，制造校准撞车
+            if (luckyHits === 1) await sleep(1500);
+            return {
+                ok: true, status: 200,
+                text: async () => `<html><body>
+                    <div class="bean-number">${START - 2000 + 1000000}.0</div>
+                    <div class="use-bean">每次消耗憨豆： 2000</div>
+                </body></html>`
+            };
+        }
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ret: 0, data: { prize_text: 'VIP 7 Day(s)' } })
+        };
+    };
+
+    await run(dom);
+    const d = w.document;
+
+    // 先手动点一次刷新，让它卡在慢请求里，紧接着开抽
+    d.getElementById('refresh-balance').click();
+    d.getElementById('lottery-interval').value = '3';
+    d.getElementById('max-lottery-count').value = '1';
+    d.getElementById('start-lottery').click();
+
+    await untilStopped(d, 30000);
+    await sleep(500);
+
+    const stats = JSON.parse(w.localStorage.getItem('hhanclub_lottery_stats_v4'));
+    check('撞车时等它让开，折算照样完成',
+        stats.gains.beans === 1000000, `实际 ${stats.gains.beans}`);
+    check('仍然算一次 VIP 中奖', stats.prizes.vip?.count === 1, JSON.stringify(stats.prizes.vip));
+    check('没有留下「没记上」的告警',
+        !Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('没记上')),
+        '出现了漏记告警');
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[41] VIP 折算核不到余额时要明说，不能装没事');
+{
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000', balance: '500000' });
+    const w = dom.window;
+
+    w.fetch = async url => {
+        // 校准一直失败
+        if (String(url).includes('lucky.php')) return { ok: false, status: 502, text: async () => '' };
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ret: 0, data: { prize_text: 'VIP 7 Day(s)' } })
+        };
+    };
+
+    await run(dom);
+    const d = w.document;
+    d.getElementById('lottery-interval').value = '3';
+    d.getElementById('max-lottery-count').value = '1';
+    d.getElementById('start-lottery').click();
+    await untilStopped(d, 30000);
+
+    check('日志明确提示这一注可能漏记',
+        Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('没记上')),
+        '没有任何提示');
+
+    const stats = JSON.parse(w.localStorage.getItem('hhanclub_lottery_stats_v4'));
+    check('核不到就按原样记 VIP，不瞎猜', stats.gains.vip === 7, `实际 ${stats.gains.vip}`);
+    check('憨豆不会凭空多出来', stats.gains.beans === 0, `实际 ${stats.gains.beans}`);
+}
+
+/* ---------------------------------------------------------------- */
 console.log(`\n=========== ${passed} passed, ${failed} failed ===========\n`);
 process.exit(failed ? 1 : 0);
