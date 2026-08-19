@@ -1334,9 +1334,13 @@ console.log('\n[28] 两个爆率字段都没有时整块降级，不摆 0.00%');
     check('类别行不显示官方爆率',
         d.querySelectorAll('#detail-list .hh-row-official').length === 0,
         Array.from(d.querySelectorAll('#detail-list .hh-row-official')).map(el => el.textContent).join(' | '));
-    check('档位行也不显示官方爆率',
-        d.querySelectorAll('#detail-list .hh-tier-rate').length === 0,
-        Array.from(d.querySelectorAll('#detail-list .hh-tier-rate')).map(el => el.textContent).join(' | '));
+    const blindTiers = Array.from(d.querySelectorAll('#detail-list .hh-tier-rate'));
+    check('档位行不显示官方爆率',
+        blindTiers.every(el => !el.textContent.includes('官方')),
+        blindTiers.map(el => el.textContent).join(' | '));
+    check('但档位的实测占比照样显示',
+        blindTiers.length === 1 && /^实测 \d+\.\d\d%$/.test(blindTiers[0].textContent.trim()),
+        blindTiers.map(el => el.textContent).join(' | '));
     check('实测数据照常统计',
         d.getElementById('draw-count').textContent === '1',
         d.getElementById('draw-count').textContent);

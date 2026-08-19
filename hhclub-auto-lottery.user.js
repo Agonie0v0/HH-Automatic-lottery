@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.12.1
+// @version      1.12.2
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 官方爆率对比 · 一抽到底 · 实时余额
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -2031,10 +2031,13 @@
             const tiers = Object.entries(bucket.tiers)
                 .sort((a, b) => b[1] - a[1])
                 .map(([label, count]) => {
+                    // 实测占比一直都要显示。站点撤掉爆率后是没得「对比」，
+                    // 不是没得「算」—— 之前把整行都跟着官方爆率一起藏了。
                     const tierOfficial = official.byTier[`${type}|${label}`];
-                    const rateLine = tierOfficial === undefined
-                        ? ''
-                        : `<span class="hh-tier-rate">实测 ${((count / totalCount) * 100).toFixed(2)}% · 官方 ${(tierOfficial * 100).toFixed(2)}%</span>`;
+                    const measured = `实测 ${((count / totalCount) * 100).toFixed(2)}%`;
+                    const rateLine = `<span class="hh-tier-rate">${measured}${
+                        tierOfficial === undefined ? '' : ` · 官方 ${(tierOfficial * 100).toFixed(2)}%`
+                    }</span>`;
                     return `
                     <div class="hh-tier">
                         <span class="hh-tier-name">${escapeHtml(label)}</span>
