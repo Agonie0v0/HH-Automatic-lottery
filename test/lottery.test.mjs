@@ -1823,5 +1823,73 @@ console.log('\n[35] 页数不多时不提这茬');
 }
 
 /* ---------------------------------------------------------------- */
+console.log('\n[36] 循环里抛异常要停下来并说一声，不能装作还在跑');
+{
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+    const w = dom.window;
+    w.fetch = async url => {
+        if (String(url).includes('lucky.php')) {
+            return { ok: true, status: 200, text: async () => '<html><body></body></html>' };
+        }
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ret: 0, data: { prize_text: '魔力 100 ' } })
+        };
+    };
+
+    await run(dom);
+    const d = w.document;
+
+    // 制造一个渲染期异常：fmt() 走的就是 toLocaleString
+    w.Number.prototype.toLocaleString = function () { throw new Error('渲染炸了'); };
+
+    d.getElementById('lottery-interval').value = '3';
+    d.getElementById('max-lottery-count').value = '5';
+    d.getElementById('start-lottery').click();
+
+    await untilStopped(d, 30000);
+
+    check('状态停在「已停止」，不是卡在运行中',
+        d.getElementById('lottery-status').textContent === '已停止',
+        d.getElementById('lottery-status').textContent);
+    check('日志里报了异常原因',
+        Array.from(d.querySelectorAll('#lottery-log div')).some(el => el.textContent.includes('抽奖循环异常')),
+        '未找到异常日志');
+    check('停止按钮已置灰', d.getElementById('stop-lottery').disabled === true);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[37] 「奖项种类」和明细里的「N 种」口径一致');
+{
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+    const w = dom.window;
+
+    // 导入来的数据可能带着中过 0 次的空桶（旧版本 / 手改过的备份）
+    w.localStorage.setItem('hhanclub_lottery_stats_v4', JSON.stringify({
+        version: 4, draws: 10, cost: 20000,
+        gains: { beans: 3000, magic: 0, invite: 0, rainbow: 0, vip: 0, makeup: 0, upload: 0, rename: 0 },
+        prizes: {
+            beans: { count: 10, value: 3000, tiers: { '100 憨豆': 10 } },
+            vip: { count: 0, value: 0, tiers: {} },
+            rename: { count: 0, value: 0, tiers: {} }
+        },
+        raw: {}
+    }));
+
+    await run(dom);
+    const d = w.document;
+
+    d.getElementById('view-mode').value = 'total';
+    d.getElementById('view-mode').dispatchEvent(new w.Event('change'));
+    await sleep(150);
+
+    const summary = d.getElementById('detail-summary').textContent;
+    check('明细里只算真中过的：1 种', summary.includes('1 种'), summary);
+    check('顶部「奖项种类」也是 1，不把空桶算进去',
+        d.getElementById('prize-type-count').textContent === '1',
+        d.getElementById('prize-type-count').textContent);
+}
+
+/* ---------------------------------------------------------------- */
 console.log(`\n=========== ${passed} passed, ${failed} failed ===========\n`);
 process.exit(failed ? 1 : 0);

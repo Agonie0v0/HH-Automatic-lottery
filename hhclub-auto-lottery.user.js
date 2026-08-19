@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.12.2
-// @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 官方爆率对比 · 一抽到底 · 实时余额
+// @version      1.13.0
+// @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 一抽到底 · 实时余额 · 站内信清理
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
 // @grant        none
@@ -434,9 +434,9 @@
     /* =========================================================
        奖池与官方爆率
 
-       抽奖页的内联脚本里带着完整奖池，且站点自己算好了 probability_real
-       （小数形式，11 项相加 ≈ 1）。读出来就能把实测爆率和官方公布值并排比，
-       不用自己拿样本去猜理论值。读不到时全部功能降级，不影响抽奖。
+       抽奖页的内联脚本里带着完整奖池。爆率字段站点给过两种写法，
+       也可能一个都不给（2026-08-19 起就是这样），具体见 poolProbabilities。
+       读不到爆率时官方对比整块降级，实测统计和抽奖本身都不受影响。
     ========================================================= */
 
     let prizePool = null;
@@ -1866,6 +1866,10 @@
                     : `🔄 余额已校准：${fmt(value)}`, 'info');
             }
             return true;
+        } catch (error) {
+            // 校准是挂机路径上的一环，失败只能记一笔继续用估算，不能把循环带崩
+            addLog(`⚠️ 余额校准出错：${error?.message || error}`, 'warning');
+            return false;
         } finally {
             calibrating = false;
             updateBalanceDisplay();
@@ -1946,7 +1950,10 @@
         const stats = activeStats();
 
         setText('draw-count', fmt(stats.draws));
-        setText('prize-type-count', Object.keys(stats.prizes).length);
+        // 和明细列表口径对齐：只数真中过的，否则导入的数据里
+        // 可能带着 count 为 0 的空桶，两处数字对不上
+        setText('prize-type-count',
+            Object.values(stats.prizes).filter(bucket => bucket.count > 0).length);
         setText('cost-beans', fmt(stats.cost));
         setText('total-beans-won', fmt(stats.gains.beans));
         setText('total-invites', fmt(stats.gains.invite));
@@ -1960,9 +1967,7 @@
     }
 
     /* 憨豆盈亏。奖池里 type 1001 就是憨豆，所以这个数字是实打实的：
-       期望值按当前奖池实时算，别写死 —— 站点会调爆率，正负都出现过：
-       2026-08-18 早上是 +16.8%，当天 21:49 把 780,000 憨豆的权重从 15 砍到 3，
-       立刻变成 -24.6%。副标题把实测盈亏率和这个实时理论值放一起比。 */
+       中的憨豆减去消耗，再除以消耗就是实测盈亏率。 */
     function renderProfit(stats) {
         const tone = value => (value > 0 ? '#4d8a3a' : value < 0 ? '#d94a44' : '#a08066');
 
@@ -2410,6 +2415,7 @@
         dynamicInterval = interval * 1000;
         errorStreak = 0;
         rateLimitStreak = 0;
+        mailCleaned = 0;
         roundStartDraws = currentStats.draws;
         running = true;
 
@@ -2433,7 +2439,12 @@
             ? `🔥 一抽到底 · 保留 ${fmt(reserve)} 憨豆 · 间隔 ${interval} 秒`
             : `🚀 开始抽奖 · ${maxCount} 次 · 间隔 ${interval} 秒`, 'success');
 
-        lotteryLoop(maxCount);
+        // 循环里任何一处抛异常都不能静默吞掉 —— 不接这个 catch 的话
+        // running 会一直卡在 true，面板显示「抽奖进行中」但其实早停了
+        lotteryLoop(maxCount).catch(error => {
+            addLog(`❌ 抽奖循环异常：${error?.message || error}`, 'error');
+            stopLottery('🛑 内部异常，已停止');
+        });
     }
 
     function stopLottery(message = '🛑 抽奖已停止') {
