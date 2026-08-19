@@ -207,7 +207,7 @@ console.log('\n[2] 一抽到底：抽到保留线就停');
 }
 
 /* ---------------------------------------------------------------- */
-console.log('\n[3] 已是 VIP 时站点改发憨豆，要按憨豆记账');
+console.log('\n[3] 已是 VIP 时站点改发憨豆：憨豆照记，但仍算一次 VIP 中奖');
 {
     const site = await startSite({
         prizes: ['VIP 7 Day(s)'],
@@ -218,10 +218,13 @@ console.log('\n[3] 已是 VIP 时站点改发憨豆，要按憨豆记账');
 
     const { out } = await runScript({ host: site.state.origin, draws: 1 });
 
-    check('识别出了换发', /已经是 VIP，站点改发了 1,000,000 憨豆/.test(out), out.slice(-500));
+    check('识别出了换发',
+        /已经是 VIP，站点改发了 1,000,000 憨豆 · 仍计为一次 VIP 中奖/.test(out), out.slice(-500));
     check('憨豆记了 1,000,000', /获得 1,000,000 憨豆/.test(out), out.slice(-500));
-    check('档位记成憨豆而不是 VIP 天数',
-        /1,000,000 憨豆 × 1/.test(out) && !/7 天 × 1/.test(out), out.slice(-500));
+    check('档位换成「已转换为憨豆」，不再是 7 天',
+        /已转换为憨豆 1,000,000 × 1/.test(out) && !/7 天 × 1/.test(out), out.slice(-500));
+    check('汇总里单列了折算的憨豆',
+        /折算：VIP 折算 1,000,000 憨豆/.test(out), out.slice(-500));
     check('抽数还是 1', site.state.draws === 1, `实际 ${site.state.draws}`);
 
     await site.close();
@@ -403,12 +406,16 @@ console.log('\n[12] VIP 折算要落进导出的统计里');
     const t = JSON.parse(fs.readFileSync(statsFile, 'utf8')).total;
 
     check('憨豆记了 1,000,000', t.gains.beans === 1000000, `实际 ${t.gains.beans}`);
-    check('VIP 天数被撤掉了', !t.gains.vip, `实际 ${t.gains.vip}`);
-    check('prizes 里只剩憨豆那一类',
-        t.prizes.beans?.count === 1 && !t.prizes.vip, JSON.stringify(t.prizes));
-    check('档位名是「1,000,000 憨豆」',
-        Object.keys(t.prizes.beans.tiers)[0] === '1,000,000 憨豆',
-        Object.keys(t.prizes.beans.tiers).join(' | '));
+    check('VIP 天数被扣回去了（没真拿到）', !t.gains.vip, `实际 ${t.gains.vip}`);
+    check('仍然算一次 VIP 中奖，爆率统计不少这一笔',
+        t.prizes.vip?.count === 1, JSON.stringify(t.prizes.vip));
+    check('没有凭空多出一个憨豆类别的中奖', !t.prizes.beans, JSON.stringify(t.prizes.beans));
+    check('VIP 档位换成「已转换为憨豆 1,000,000」',
+        Object.keys(t.prizes.vip.tiers).join() === '已转换为憨豆 1,000,000',
+        Object.keys(t.prizes.vip.tiers).join(' | '));
+    check('折算的憨豆单独记在 swappedBeans 上（天数和憨豆不是一个单位）',
+        t.prizes.vip.swappedBeans === 1000000 && t.prizes.vip.value === 0,
+        `swappedBeans=${t.prizes.vip.swappedBeans} value=${t.prizes.vip.value}`);
     check('原始文案照实保留 VIP', t.raw['VIP 7 Day(s)'] === 1, JSON.stringify(t.raw));
     check('抽数和消耗没被重复计', t.draws === 1 && t.cost === 2000, `${t.draws} 抽 / ${t.cost}`);
 
@@ -446,6 +453,40 @@ console.log('\n[14] statsFile 留空就不落文件');
     check('汇总照常打印', /本次：1 抽/.test(out), out.slice(-400));
 
     await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[15] 折算的憨豆跨次运行不能丢');
+{
+    // 第一次中 VIP 被折算，第二次正常抽 —— 读回来时 swappedBeans 得还在
+    let drawn = 0;
+    const site = await startSite({
+        prizes: ['VIP 7 Day(s)'],
+        balance: 500000,
+        onDraw: state => { if (++drawn === 1) state.balance += 1000000; }
+    });
+    const statsFile = path.join(TMP, 'stats-swap-keep.json');
+
+    await runScript({ host: site.state.origin, draws: 1, statsFile });
+
+    site.state.prizes = null;   // 后面这次换成普通奖
+    await site.close();
+
+    const site2 = await startSite({ prizes: ['魔力 100 '], balance: 500000 });
+    const { out } = await runScript({ host: site2.state.origin, draws: 1, statsFile });
+
+    const t = JSON.parse(fs.readFileSync(statsFile, 'utf8')).total;
+
+    check('两次累计 2 抽', t.draws === 2, `实际 ${t.draws}`);
+    check('折算的 1,000,000 还在 swappedBeans 上',
+        t.prizes.vip?.swappedBeans === 1000000, JSON.stringify(t.prizes.vip));
+    check('憨豆总数 = 折算 1,000,000 + 这次 100',
+        t.gains.beans === 1000100, `实际 ${t.gains.beans}`);
+    check('VIP 中奖次数还是 1', t.prizes.vip?.count === 1, JSON.stringify(t.prizes.vip));
+    check('历史总计里也报了折算',
+        /折算：VIP 折算 1,000,000 憨豆/.test(out), out.slice(-700));
+
+    await site2.close();
 }
 
 /* ---------------------------------------------------------------- */
