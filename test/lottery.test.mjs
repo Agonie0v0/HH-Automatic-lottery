@@ -1486,6 +1486,11 @@ console.log('\n[30] 每页只显示 10 封时也要翻完整个收件箱');
     const d = w.document;
 
     d.getElementById('purge-mail').click();
+
+    // 5 页会先弹「要不要改成每页 100」，这里选不改 —— 就是要验证不改也能翻完
+    await until(() => !!d.querySelector('.hh-modal-overlay [data-mode="keep"]'), 10000);
+    d.querySelector('.hh-modal-overlay [data-mode="keep"]').click();
+
     await until(() => !!d.querySelector('.hh-modal-overlay [data-mode="lottery"]'), 10000);
 
     const modalText = (d.querySelector('.hh-modal-text')?.textContent || '').replace(/\s+/g, ' ').trim();
@@ -1493,6 +1498,8 @@ console.log('\n[30] 每页只显示 10 封时也要翻完整个收件箱');
 
     check('扫描翻了全部 5 页，不是只翻第一页',
         log.pageHits.slice(0, 5).join(',') === '0,1,2,3,4', log.pageHits.join(','));
+    check('探测页数用的第一页被复用，没重复拉',
+        log.pageHits.filter(page => page === 0).length === 1, log.pageHits.join(','));
 
     d.querySelector('.hh-modal-overlay [data-mode="lottery"]').click();
     await until(() => log.deleted.length >= 40, 10000);

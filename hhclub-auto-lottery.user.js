@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.12.0
+// @version      1.12.1
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 官方爆率对比 · 一抽到底 · 实时余额
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -2740,7 +2740,7 @@
        每页显示多少封是用户自己在站点设置里定的，见过设成 10 封的，
        那样翻一页就以为到底了，第 11 封往后全删不掉。
        下拉框读不到时才退回长度判断，并且以第一页的实际条数为准。 */
-    async function scanMailbox() {
+    async function scanMailbox(firstPage = null) {
         const all = [];
         const seen = new Set();
         let totalPages = CONFIG.mailboxMaxPages;
@@ -2748,7 +2748,10 @@
         let hasPageCount = false;
 
         for (let page = 0; page < Math.min(totalPages, CONFIG.mailboxMaxPages); page++) {
-            const { items, pageCount } = await fetchMailboxPage(page);
+            // 第一页多半刚才探测页数时已经拉过了，别再拉一遍
+            const { items, pageCount } = (page === 0 && firstPage)
+                ? firstPage
+                : await fetchMailboxPage(page);
 
             if (page === 0) {
                 hasPageCount = pageCount > 0;
@@ -2842,31 +2845,34 @@
        一千多封信要翻一百多页才扫得完。页数多的时候问一句要不要调到 100，
        答过一次就记下来，不再打扰。 */
     async function offerBiggerMailPage() {
-        if (settings.mailPageSizePrompted) return;
+        const first = await fetchMailboxPage(0);
 
-        const { items, pageCount } = await fetchMailboxPage(0);
-        if (pageCount <= CONFIG.mailPageSizeAskAfterPages) return;
-        if (!items.length || items.length >= CONFIG.mailPageSizeTarget) return;
+        if (settings.mailPageSizePrompted) return first;
+        if (first.pageCount <= CONFIG.mailPageSizeAskAfterPages) return first;
+        if (!first.items.length || first.items.length >= CONFIG.mailPageSizeTarget) return first;
 
         // 不管答什么都只问这一次
         settings.mailPageSizePrompted = true;
         saveSettings();
 
-        if (await askMailPageSize(items.length, pageCount) !== 'bump') {
+        if (await askMailPageSize(first.items.length, first.pageCount) !== 'bump') {
             addLog('好，保持现在的每页条数', 'info');
-            return;
+            return first;
         }
 
         try {
             const now = await setMailPageSize(CONFIG.mailPageSizeTarget);
             if (now >= CONFIG.mailPageSizeTarget) {
-                addLog(`⚡ 每页站内信条数已改成 ${now}（原 ${items.length}）`, 'success');
-            } else {
-                addLog(`⚠️ 设定提交了，但每页条数是 ${now || '未知'}，站点可能有上限`, 'warning');
+                addLog(`⚡ 每页站内信条数已改成 ${now}（原 ${first.items.length}）`, 'success');
+                // 页大小变了，刚才那一页的分页作废，让扫描重新拉
+                return null;
             }
+            addLog(`⚠️ 设定提交了，但每页条数是 ${now || '未知'}，站点可能有上限`, 'warning');
         } catch (error) {
             addLog(`⚠️ ${error.message}`, 'warning');
         }
+
+        return first;
     }
 
     function askMailPageSize(pageSize, pageCount) {
@@ -2992,11 +2998,12 @@
         }
 
         try {
-            // 页数太多的话先问一句要不要把每页条数调大，能省一大截请求
-            await offerBiggerMailPage();
+            // 页数太多的话先问一句要不要把每页条数调大，能省一大截请求。
+            // 顺手把第一页带回来给扫描复用，不额外多发请求。
+            const firstPage = await offerBiggerMailPage();
 
             addLog('🔍 正在扫描收件箱…', 'info');
-            const all = await scanMailbox();
+            const all = await scanMailbox(firstPage);
             const targets = all.filter(isLotteryMail);
             const keep = all.length - targets.length;
 
