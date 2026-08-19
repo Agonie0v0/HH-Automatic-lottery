@@ -160,7 +160,7 @@ function report(line) {
 
 function fmt(value) {
     const number = Number(value) || 0;
-    return Number.isInteger(number) ? number.toLocaleString('en-US') : number.toFixed(2);
+    return number.toLocaleString('en-US', { maximumFractionDigits: 2 });
 }
 
 /* 从文本里取第一个数字，兼容 "1,000" 这种千分位写法 */
@@ -199,15 +199,15 @@ function numberAfterClass(html, className) {
 ========================================================= */
 
 const PRIZE_META = {
-    beans: { name: '憨豆', unit: '' },
-    magic: { name: '憨豆（旧魔力）', unit: '' },
-    invite: { name: '邀请', unit: '' },
-    rainbow: { name: '彩虹ID', unit: '天' },
-    vip: { name: 'VIP', unit: '天' },
-    makeup: { name: '补签卡', unit: '个' },
-    upload: { name: '上传量', unit: 'GB' },
-    rename: { name: '改名卡', unit: '张' },
-    unknown: { name: '其他奖品', unit: '' }
+    beans: { name: '憨豆', icon: '💰', unit: '' },
+    magic: { name: '憨豆（旧魔力）', icon: '💰', unit: '' },
+    invite: { name: '邀请', icon: '📧', unit: '' },
+    rainbow: { name: '彩虹ID', icon: '🌈', unit: '天' },
+    vip: { name: 'VIP', icon: '⭐', unit: '天' },
+    makeup: { name: '补签卡', icon: '🎫', unit: '个' },
+    upload: { name: '上传量', icon: '⬆️', unit: 'GB' },
+    rename: { name: '改名卡', icon: '📛', unit: '张' },
+    unknown: { name: '其他奖品', icon: '🎁', unit: '' }
 };
 
 function parsePrizeText(text) {
@@ -711,6 +711,8 @@ class Lottery {
 
     /* ---------------- 汇总 ---------------- */
 
+    /* 档位得挂在类别下面。之前把所有档位拍平成一串，出来就是
+       「7 天 × 1」「1 个 × 2」—— 根本看不出是彩虹 ID 还是补签卡。 */
     summarize(stats, title) {
         if (!stats.draws) return `${title}：一抽未成`;
 
@@ -718,32 +720,37 @@ class Lottery {
         const profit = beans - stats.cost;
         const rate = stats.cost > 0 ? (profit / stats.cost) * 100 : 0;
 
-        const others = Object.entries(stats.gains)
-            .filter(([type, value]) => type !== 'beans' && type !== 'magic' && value > 0)
-            .map(([type, value]) => `${PRIZE_META[type]?.name || type} ${fmt(value)}${PRIZE_META[type]?.unit || ''}`)
-            .join(' · ');
+        const detail = Object.entries(stats.prizes)
+            .filter(([, bucket]) => bucket.count > 0)
+            .sort((a, b) => b[1].count - a[1].count)
+            .flatMap(([type, bucket]) => {
+                const meta = PRIZE_META[type] || PRIZE_META.unknown;
 
-        // 折算成憨豆的那部分和天数不是一个单位，单独说一句
-        const swapped = Object.entries(stats.prizes)
-            .filter(([, bucket]) => bucket.swappedBeans > 0)
-            .map(([type, bucket]) =>
-                `${PRIZE_META[type]?.name || type} 折算 ${fmt(bucket.swappedBeans)} 憨豆`)
-            .join(' · ');
+                // 累计可能有两截：本类别自己的单位一截，被折算成憨豆的另算
+                const sums = [];
+                if (bucket.value > 0) {
+                    sums.push(`${fmt(bucket.value)}${meta.unit ? ' ' + meta.unit : ''}`);
+                }
+                if (bucket.swappedBeans > 0) {
+                    sums.push(`另折算 ${fmt(bucket.swappedBeans)} 憨豆`);
+                }
 
-        const tiers = Object.values(stats.prizes)
-            .flatMap(bucket => Object.entries(bucket.tiers))
-            .sort((a, b) => b[1] - a[1])
-            .map(([label, count]) => `    ${label} × ${count}`)
-            .join('\n');
+                const head = `  ${meta.icon} ${meta.name} ${fmt(bucket.count)} 次`
+                    + (sums.length ? ` · ${sums.join(' · ')}` : '');
+
+                const tiers = Object.entries(bucket.tiers)
+                    .sort((a, b) => b[1] - a[1])
+                    .map(([label, count]) => `      ${label} × ${count}`);
+
+                return [head, ...tiers];
+            });
 
         return [
             `${title}：${fmt(stats.draws)} 抽`,
             `  消耗 ${fmt(stats.cost)} · 获得 ${fmt(beans)} 憨豆`,
             `  盈亏 ${profit >= 0 ? '+' : ''}${fmt(profit)}（${rate >= 0 ? '+' : ''}${rate.toFixed(1)}%）`,
-            others ? `  其他：${others}` : '',
-            swapped ? `  折算：${swapped}` : '',
-            tiers
-        ].filter(Boolean).join('\n');
+            ...detail
+        ].join('\n');
     }
 
     summary() {

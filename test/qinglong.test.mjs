@@ -223,8 +223,8 @@ console.log('\n[3] 已是 VIP 时站点改发憨豆：憨豆照记，但仍算�
     check('憨豆记了 1,000,000', /获得 1,000,000 憨豆/.test(out), out.slice(-500));
     check('档位换成「已转换为憨豆」，不再是 7 天',
         /已转换为憨豆 1,000,000 × 1/.test(out) && !/7 天 × 1/.test(out), out.slice(-500));
-    check('汇总里单列了折算的憨豆',
-        /折算：VIP 折算 1,000,000 憨豆/.test(out), out.slice(-500));
+    check('类别行上单列了折算的憨豆',
+        /⭐ VIP 1 次 · 另折算 1,000,000 憨豆/.test(out), out.slice(-500));
     check('抽数还是 1', site.state.draws === 1, `实际 ${site.state.draws}`);
 
     await site.close();
@@ -239,7 +239,7 @@ console.log('\n[4] 不是 VIP 的用户中 VIP，照常记 VIP 天数');
 
     check('不会误报换发', !/站点改发/.test(out), out.slice(-500));
     check('记的是 VIP 7 天', /7 天 × 1/.test(out), out.slice(-500));
-    check('其他奖里列出了 VIP', /VIP 7天/.test(out), out.slice(-500));
+    check('类别行报的是 VIP 1 次 · 7 天', /⭐ VIP 1 次 · 7 天/.test(out), out.slice(-500));
 
     await site.close();
 }
@@ -484,7 +484,7 @@ console.log('\n[15] 折算的憨豆跨次运行不能丢');
         t.gains.beans === 1000100, `实际 ${t.gains.beans}`);
     check('VIP 中奖次数还是 1', t.prizes.vip?.count === 1, JSON.stringify(t.prizes.vip));
     check('历史总计里也报了折算',
-        /折算：VIP 折算 1,000,000 憨豆/.test(out), out.slice(-700));
+        /⭐ VIP 1 次 · 另折算 1,000,000 憨豆/.test(out), out.slice(-700));
 
     await site2.close();
 }
@@ -555,6 +555,54 @@ console.log('\n[18] 在仓库里直接 node qinglong/hh_lottery.js 也能跑');
         !/require is not defined|ERR_REQUIRE_ESM/.test(out), out.slice(0, 300));
     check('走到了「还没填 Cookie」这一步', /还没填 Cookie/.test(out), out.slice(0, 300));
     check('退出码是 1', code === 1, `exit ${code}`);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[19] 档位要挂在类别下面，光看「7 天 × 1」认不出是什么奖');
+{
+    const site = await startSite({
+        prizes: ['魔力 100 ', '魔力 100 ', '彩虹 ID 7 Day(s)', '补签卡 1 ', '补签卡 1 ', '上传量 2 GB'],
+        balance: 100000
+    });
+
+    const { out } = await runScript({ host: site.state.origin, draws: 6 });
+    const block = out.split('─'.repeat(40))[1] || '';
+
+    check('憨豆一类：2 次 · 累计 200',
+        /💰 憨豆 2 次 · 200/.test(block), block);
+    check('补签卡一类：2 次 · 累计 2 个',
+        /🎫 补签卡 2 次 · 2 个/.test(block), block);
+    check('彩虹 ID 认得出来，不再是光秃秃的「7 天 × 1」',
+        /🌈 彩虹ID 1 次 · 7 天/.test(block), block);
+    check('上传量也带上类别', /⬆️ 上传量 1 次 · 2 GB/.test(block), block);
+
+    // 档位行缩进得比类别行深，视觉上才是从属关系
+    const lines = block.split('\n');
+    const rainbowAt = lines.findIndex(line => line.includes('🌈 彩虹ID'));
+    check('彩虹 ID 的档位紧跟在它自己下面',
+        /^ {6}7 天 × 1$/.test(lines[rainbowAt + 1] || ''), lines[rainbowAt + 1]);
+    check('中奖最多的类别排在最前',
+        (block.indexOf('💰 憨豆') < block.indexOf('🌈 彩虹ID'))
+        && (block.indexOf('🎫 补签卡') < block.indexOf('🌈 彩虹ID')),
+        block);
+    check('不再有拍平的孤儿档位行',
+        !/^ {4}\S+ × \d+$/m.test(block), block);
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[20] 余额带小数时也要有千分位');
+{
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 1256247.2 });
+
+    const { out } = await runScript({ host: site.state.origin, draws: 1 });
+
+    check('余额写成 1,254,347.2 而不是一长串',
+        /余额 1,254,347\.2\b/.test(out), out.slice(-400));
+    check('没有 toFixed 补出来的多余 0', !/1254347|\.20\b/.test(out), out.slice(-400));
+
+    await site.close();
 }
 
 /* ---------------------------------------------------------------- */
