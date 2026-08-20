@@ -1,0 +1,13 @@
+{
+    "//": "配置放这里，更新脚本时不会被覆盖。各项含义见 qinglong/README.md",
+    "cookie": "在这里粘贴你的 Cookie",
+    "draws": 10,
+    "reserve": 0,
+    "interval": 8,
+    "maxMinutes": 60,
+    "cleanMail": false,
+    "statsFile": "hh_lottery_stats.json",
+    "timezone": "Asia/Shanghai",
+    "host": "hhanclub.net",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+}

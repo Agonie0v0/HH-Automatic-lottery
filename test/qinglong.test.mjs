@@ -22,6 +22,17 @@ const SCRIPT = path.join(ROOT, 'qinglong', 'hh_lottery.js');
 const SOURCE = fs.readFileSync(SCRIPT, 'utf8').replace(/\r\n/g, '\n');
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'hh-ql-'));
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function until(fn, timeoutMs = 30000, stepMs = 200) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (fn()) return true;
+        await sleep(stepMs);
+    }
+    return false;
+}
+
 let passed = 0, failed = 0;
 function check(name, cond, extra = '') {
     if (cond) { passed++; console.log(`  ✓ ${name}`); }
@@ -188,7 +199,12 @@ function runScript(config, runtime = null) {
         patched = patched.replace(re, `$1${value}`);
     });
 
-    const file = path.join(TMP, `run-${copyIndex++}.js`);
+    // 每次运行给一个独立目录：脚本会往自己所在目录写 hh_lottery.config.json，
+    // 共用一个目录的话前一个用例生成的模板会盖掉后面用例注入的配置
+    const dir = path.join(TMP, `run-${copyIndex++}`);
+    fs.mkdirSync(dir, { recursive: true });
+
+    const file = path.join(dir, 'hh_lottery.js');
     fs.writeFileSync(file, patched);
 
     return new Promise(resolve => {
@@ -197,8 +213,37 @@ function runScript(config, runtime = null) {
         let out = '';
         child.stdout.on('data', d => { out += d; });
         child.stderr.on('data', d => { out += d; });
-        child.on('close', code => resolve({ code, out }));
+        child.on('close', code => resolve({ code, out, dir, file }));
     });
+}
+
+/* 起一个脚本进程但不等它结束 —— 用来测中途打断 */
+function spawnScript(config, { onOutput } = {}) {
+    const dir = path.join(TMP, `live-${copyIndex++}`);
+    fs.mkdirSync(dir, { recursive: true });
+
+    const head = 'const CONFIG = {';
+    const foot = '\n};\n\n/* ===== 配置区结束 ===== */';
+    const merged = {
+        cookie: 'c_secure_uid=test', statsFile: '', draws: 10, reserve: 0,
+        interval: 3, maxMinutes: 60, cleanMail: false,
+        host: 'hhanclub.net', timezone: 'Asia/Shanghai', userAgent: 'test-agent',
+        ...config
+    };
+    const patched = SOURCE.slice(0, SOURCE.indexOf(head))
+        + `const CONFIG = ${JSON.stringify(merged, null, 4)};`
+        + SOURCE.slice(SOURCE.indexOf(foot) + foot.length - foot.length);
+
+    const file = path.join(dir, 'hh_lottery.js');
+    fs.writeFileSync(file, patched);
+
+    const child = spawn(process.execPath, [file], { cwd: ROOT });
+    let out = '';
+    child.stdout.on('data', d => { out += d; onOutput?.(String(d)); });
+    child.stderr.on('data', d => { out += d; });
+
+    const done = new Promise(resolve => child.on('close', code => resolve({ code, out: out })));
+    return { child, dir, done, read: () => out };
 }
 
 /* ---------------------------------------------------------------- */
@@ -808,6 +853,187 @@ console.log('\n[26] 收尾那遍要翻全本：被压在第一页下面的也得
     check('10 封该留的一封没动',
         KEEP.every(k => left.some(m => m.id === k.id)), left.map(m => m.id).join(','));
     check('日志报了 6 封', /本次共清掉 6 封抽奖通知/.test(out), out.slice(-600));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[27] 外置配置：有 hh_lottery.config.json 就以它为准');
+{
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
+
+    // 先跑一次，脚本里的配置指向别处（会失败），外置配置把它掰回来
+    const dir = path.join(TMP, 'cfg-external');
+    fs.mkdirSync(dir, { recursive: true });
+
+    const head = 'const CONFIG = {';
+    const foot = '\n};\n\n/* ===== 配置区结束 ===== */';
+    const inScript = {
+        cookie: 'c_secure_uid=test', statsFile: '', draws: 99,
+        reserve: 0, interval: 3, maxMinutes: 60, cleanMail: false,
+        host: 'http://127.0.0.1:1', timezone: 'UTC', userAgent: 'in-script'
+    };
+    const patched = SOURCE.slice(0, SOURCE.indexOf(head))
+        + `const CONFIG = ${JSON.stringify(inScript, null, 4)};`
+        + SOURCE.slice(SOURCE.indexOf(foot));
+
+    fs.writeFileSync(path.join(dir, 'hh_lottery.js'), patched);
+    fs.writeFileSync(path.join(dir, 'hh_lottery.config.json'), JSON.stringify({
+        '//': '注释项要被忽略',
+        host: site.state.origin,
+        draws: 2,
+        timezone: 'Asia/Shanghai',
+        瞎写的项: 1
+    }, null, 4));
+
+    const { out } = await new Promise(resolve => {
+        const child = spawn(process.execPath, [path.join(dir, 'hh_lottery.js')], { cwd: ROOT });
+        let text = '';
+        child.stdout.on('data', d => { text += d; });
+        child.stderr.on('data', d => { text += d; });
+        child.on('close', code => resolve({ code, out: text }));
+    });
+
+    check('说明了配置来自哪个文件', /⚙️ 配置来自 .*hh_lottery\.config\.json/.test(out), out.slice(0, 400));
+    check('外置的 draws 覆盖了脚本里的 99', site.state.draws === 2, `实际 ${site.state.draws}`);
+    check('外置的 host 也生效了', /本次：2 抽/.test(out), out.slice(-400));
+    check('"//" 注释项不当配置', !/认不出的项.*\/\//.test(out), out.slice(0, 400));
+    check('认不出的项会点名忽略', /认不出的项，已忽略：瞎写的项/.test(out), out.slice(0, 400));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[28] 没填 Cookie 时替你生成配置模板');
+{
+    const { code, out, dir } = await runScript({ cookie: '在这里粘贴你的 Cookie' });
+    const file = path.join(dir, 'hh_lottery.config.json');
+
+    check('生成了配置文件', fs.existsSync(file), dir);
+    check('日志告诉你文件在哪', /📝 已生成配置文件/.test(out), out.slice(0, 400));
+    check('模板里各项都在',
+        (() => {
+            const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+            return ['cookie', 'draws', 'reserve', 'interval', 'maxMinutes',
+                'cleanMail', 'statsFile', 'timezone', 'host'].every(k => k in data);
+        })(),
+        fs.readFileSync(file, 'utf8').slice(0, 200));
+    check('还是以退出码 1 结束', code === 1, `exit ${code}`);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[29] 配置文件坏了要说清楚，并退回脚本里的配置');
+{
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
+
+    const dir = path.join(TMP, 'cfg-broken');
+    fs.mkdirSync(dir, { recursive: true });
+
+    const head = 'const CONFIG = {';
+    const foot = '\n};\n\n/* ===== 配置区结束 ===== */';
+    const inScript = {
+        cookie: 'c_secure_uid=test', statsFile: '', draws: 1,
+        reserve: 0, interval: 3, maxMinutes: 60, cleanMail: false,
+        host: site.state.origin, timezone: 'Asia/Shanghai', userAgent: 'test'
+    };
+    fs.writeFileSync(path.join(dir, 'hh_lottery.js'),
+        SOURCE.slice(0, SOURCE.indexOf(head))
+        + `const CONFIG = ${JSON.stringify(inScript, null, 4)};`
+        + SOURCE.slice(SOURCE.indexOf(foot)));
+    fs.writeFileSync(path.join(dir, 'hh_lottery.config.json'), '{ 这不是 JSON');
+
+    const { out } = await new Promise(resolve => {
+        const child = spawn(process.execPath, [path.join(dir, 'hh_lottery.js')], { cwd: ROOT });
+        let text = '';
+        child.stdout.on('data', d => { text += d; });
+        child.stderr.on('data', d => { text += d; });
+        child.on('close', code => resolve({ code, out: text }));
+    });
+
+    check('明说文件不是合法 JSON', /不是合法 JSON/.test(out), out.slice(0, 400));
+    check('退回脚本里的配置，照样跑得起来', /本次：1 抽/.test(out), out.slice(-400));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[30] 成绩先落盘，再去清信');
+{
+    // 清信接口卡死，模拟被 kill 在清信那一步。统计必须已经存好了
+    const site = await startSite({
+        prizes: ['魔力 100 '], balance: 100000,
+        mail: [{ id: '1', subject: '幸运大转盘 中奖通知' }]
+    });
+    const statsFile = path.join(TMP, 'stats-order.json');
+
+    const order = [];
+    const { out } = await runScript(
+        { host: site.state.origin, draws: 2, cleanMail: true, statsFile },
+        null
+    );
+
+    const saveAt = out.indexOf('💾 统计已存到');
+    const cleanAt = out.indexOf('📪 本次共清掉');
+
+    check('两件事都做了', saveAt > 0 && cleanAt > 0, `save@${saveAt} clean@${cleanAt}`);
+    check('落盘排在清信之前', saveAt < cleanAt, out.slice(-600));
+    check('统计文件里是 2 抽',
+        JSON.parse(fs.readFileSync(statsFile, 'utf8')).total.draws === 2,
+        fs.readFileSync(statsFile, 'utf8').slice(0, 120));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[31] 统计写盘是原子替换，不会留半截 JSON');
+{
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
+    const statsFile = path.join(TMP, 'stats-atomic.json');
+
+    await runScript({ host: site.state.origin, draws: 1, statsFile });
+
+    check('没留下 .tmp 残留', !fs.existsSync(`${statsFile}.tmp`), `${statsFile}.tmp`);
+    check('文件是完整的 JSON',
+        (() => {
+            try { return JSON.parse(fs.readFileSync(statsFile, 'utf8')).total.draws === 1; }
+            catch (error) { return false; }
+        })(),
+        fs.readFileSync(statsFile, 'utf8').slice(0, 120));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[32] 中途打断：成绩存下来，不触发清信');
+if (process.platform === 'win32') {
+    console.log('  · Windows 上 child.kill() 是强杀、收不到信号，这条跳过（Linux/NAS 上会跑）');
+} else {
+    const site = await startSite({
+        prizes: ['魔力 100 '], balance: 100000,
+        mail: [{ id: '1', subject: '幸运大转盘 中奖通知' }]
+    });
+    const statsFile = path.join(TMP, 'stats-interrupt.json');
+
+    let drawn = 0;
+    const live = spawnScript(
+        { host: site.state.origin, draws: 50, cleanMail: true, statsFile },
+        { onOutput: text => { if (/🎲 第 \d+ 抽/.test(text)) drawn++; } }
+    );
+
+    // 等它抽满两次再打断
+    await until(() => drawn >= 2, 30000);
+    live.child.kill('SIGINT');
+    const { out } = await live.done;
+
+    check('说明了是被信号打断的', /收到 Ctrl-C/.test(out), out.slice(-600));
+    check('已抽到的成绩存下来了',
+        fs.existsSync(statsFile) && JSON.parse(fs.readFileSync(statsFile, 'utf8')).total.draws >= 2,
+        fs.existsSync(statsFile) ? fs.readFileSync(statsFile, 'utf8').slice(0, 120) : '文件不存在');
+    check('没抽满 50 次就停了',
+        site.state.draws < 50, `实际 ${site.state.draws}`);
+    check('打断时不清信，那封通知还在',
+        site.state.mail.length === 1, site.state.mail.map(m => m.id).join(','));
+    check('汇总照样打出来了', /本次：\d+ 抽/.test(out), out.slice(-400));
 
     await site.close();
 }

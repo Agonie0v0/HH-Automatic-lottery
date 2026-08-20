@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.18.0
+// @version      1.19.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 一抽到底 · 实时余额 · 站内信清理
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -1006,6 +1006,17 @@
     font-weight: 800;
     color: #2d1f14;
 }
+#lottery-control-panel .hh-stat-note {
+    margin-top: 2px;
+    font-size: 9px;
+    line-height: 1.4;
+    font-weight: 600;
+    color: #a08066;
+    display: none;
+}
+#lottery-control-panel .hh-stat-note.is-on {
+    display: block;
+}
 
 /* ===== 盈亏 ===== */
 #lottery-control-panel .hh-profit {
@@ -1820,6 +1831,7 @@
                             <span>BEAN</span>
                         </div>
                         <div class="hh-stat-value" id="total-beans-won">0</div>
+                        <div class="hh-stat-note" id="beans-swap-note"></div>
                     </div>
                 </div>
 
@@ -1834,7 +1846,7 @@
                     </div>
                     <div class="hh-prize">
                         <div class="hh-prize-name">⭐ VIP</div>
-                        <div class="hh-prize-value" id="total-vip-days">0天</div>
+                        <div class="hh-prize-value" id="total-vip-count">0次</div>
                     </div>
                     <div class="hh-prize">
                         <div class="hh-prize-name">🎫 补签卡</div>
@@ -2119,6 +2131,13 @@
        渲染
     ========================================================= */
 
+    /* 所有类别里被折算成憨豆的总额。目前只有 VIP 会产生，
+       写成通用的，以后站点再加别的折算规则不用改这里。 */
+    function swappedBeansTotal(stats) {
+        return Object.values(stats.prizes)
+            .reduce((sum, bucket) => sum + (Number(bucket.swappedBeans) || 0), 0);
+    }
+
     function activeStats() {
         return settings.viewMode === 'total' ? totalStats : currentStats;
     }
@@ -2133,9 +2152,20 @@
             Object.values(stats.prizes).filter(bucket => bucket.count > 0).length);
         setText('cost-beans', fmt(stats.cost));
         setText('total-beans-won', fmt(stats.gains.beans));
+
+        // 折算来的憨豆不是从憨豆那一格转出来的，单独说一句，
+        // 免得有人拿各档位乘开去对「获得憨豆」，发现对不上
+        const swapped = swappedBeansTotal(stats);
+        const swapNote = $('beans-swap-note');
+        if (swapNote) {
+            swapNote.textContent = swapped > 0 ? `其中 ${fmt(swapped)} 来自 VIP 折算` : '';
+            swapNote.classList.toggle('is-on', swapped > 0);
+        }
         setText('total-invites', fmt(stats.gains.invite));
         setText('total-rainbow-days', `${fmt(stats.gains.rainbow)}天`);
-        setText('total-vip-days', `${fmt(stats.gains.vip)}天`);
+        // 显示中奖次数而不是天数：已经是 VIP 的用户中到 VIP 会被折算成憨豆，
+        // 天数是 0，那张卡就永远空着 —— 次数才是「中了几次」这件事本身。
+        setText('total-vip-count', `${fmt(stats.prizes.vip?.count || 0)}次`);
         setText('total-makeup-cards', fmt(stats.gains.makeup));
         setText('total-upload', `${fmt(stats.gains.upload)}GB`);
 

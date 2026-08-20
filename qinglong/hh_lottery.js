@@ -5,6 +5,8 @@
  * cron: 5 9 * * *
  *
  * 用法：把下面「配置区」里的 Cookie 填上就能跑，其余按需改。
+ * 也可以在同目录放一个 hh_lottery.config.json 把配置外置 ——
+ * 那样更新脚本（直接覆盖）不会把配置冲掉。首次运行会替你生成模板。
  * 详细说明见同目录 README.md。
  *
  * 统计会存成一份 JSON，格式和油猴版的「💾 备份 JSON」完全一致 ——
@@ -114,6 +116,54 @@ function normalizeConfig() {
     CONFIG.host = String(CONFIG.host || 'hhanclub.net').trim().replace(/\/+$/, '');
     CONFIG.statsFile = String(CONFIG.statsFile || '').trim();
     CONFIG.timezone = String(CONFIG.timezone || '').trim();
+}
+
+/* 外置配置文件。有它就以它为准 ——
+   这样 curl 覆盖脚本更新时，配置不会跟着被冲掉。 */
+const CONFIG_FILE = 'hh_lottery.config.json';
+
+function configPath() {
+    return path.join(__dirname, CONFIG_FILE);
+}
+
+/* 返回实际生效的配置文件路径；没有 / 读不出来返回空字符串 */
+function loadExternalConfig() {
+    const file = configPath();
+    if (!fs.existsSync(file)) return '';
+
+    let data;
+    try {
+        data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch (error) {
+        log(`⚠️ ${CONFIG_FILE} 不是合法 JSON（${error.message}），改用脚本里的配置`);
+        return '';
+    }
+    if (!data || typeof data !== 'object') return '';
+
+    const unknown = [];
+    Object.entries(data).forEach(([key, value]) => {
+        if (key === '//') return;
+        if (Object.prototype.hasOwnProperty.call(CONFIG, key)) CONFIG[key] = value;
+        else unknown.push(key);
+    });
+    if (unknown.length) log(`⚠️ ${CONFIG_FILE} 里有认不出的项，已忽略：${unknown.join(', ')}`);
+
+    return file;
+}
+
+function writeConfigTemplate() {
+    const file = configPath();
+    const template = {
+        '//': '配置放这里，更新脚本时不会被覆盖。各项含义见 qinglong/README.md',
+        ...CONFIG
+    };
+
+    try {
+        fs.writeFileSync(file, JSON.stringify(template, null, 4));
+        return file;
+    } catch (error) {
+        return '';
+    }
 }
 
 /* 还没填 Cookie 的占位文字要认出来，不然会拿着「在这里粘贴」去请求 */
@@ -434,7 +484,13 @@ function saveStats(current, total) {
 
     try {
         fs.mkdirSync(path.dirname(file), { recursive: true });
-        fs.writeFileSync(file, JSON.stringify(payload, null, 2));
+
+        // 先写临时文件再改名。直接往目标文件写的话，写到一半断电 / 被 SIGKILL
+        // 就会留下半截 JSON，下次读不出来 —— 攒了几千抽的统计不能这么丢
+        const temp = `${file}.tmp`;
+        fs.writeFileSync(temp, JSON.stringify(payload, null, 2));
+        fs.renameSync(temp, file);
+
         return file;
     } catch (error) {
         report(`⚠️ 统计写不进去（${error.message}）`);
@@ -955,16 +1011,28 @@ async function main() {
         process.exit(1);
     }
 
+    const configFile = loadExternalConfig();
     normalizeConfig();
 
     const cookie = readCookie();
     if (!cookie) {
-        log('❌ 还没填 Cookie。打开脚本，把最上面「配置区」里 cookie 那一行换成你的 Cookie：');
+        if (!configFile) {
+            const created = writeConfigTemplate();
+            if (created) {
+                log(`📝 已生成配置文件 ${created}`);
+                log('   把里面的 cookie 换成你的，再跑一次就行 —— 以后更新脚本不会覆盖它');
+            }
+        }
+        log('❌ 还没填 Cookie：');
         log('   浏览器登录 hhanclub.net → F12 → Network → 任意请求 → 请求头里的 Cookie 整行复制');
+        log(configFile
+            ? `   填到 ${configFile} 的 cookie 里`
+            : '   填到脚本最上面「配置区」的 cookie 里');
         process.exit(1);
     }
 
     log('🎡 HHCLUB 幸运大转盘');
+    if (configFile) log(`⚙️ 配置来自 ${configFile}`);
     log(CONFIG.draws > 0
         ? `   抽 ${CONFIG.draws} 次 · 间隔 ${CONFIG.interval} 秒`
         : `   一抽到底 · 保留 ${fmt(CONFIG.reserve)} 憨豆 · 间隔 ${CONFIG.interval} 秒`);
@@ -974,15 +1042,23 @@ async function main() {
 
     try {
         await lottery.run();
-        if (CONFIG.cleanMail) await lottery.cleanMailbox();
     } catch (error) {
         report(`❌ ${error.message}`);
     }
 
-    // 抽出来的成绩不能因为后面出岔子就丢了，无论如何先落盘
+    // 成绩先落盘再干别的。清信可能要上百个请求，卡在那儿被 kill 的话，
+    // 这一轮抽到的就全没了
     if (lottery.current.draws > 0) {
         const file = saveStats(lottery.current, lottery.total);
         if (file) report(`💾 统计已存到 ${file}（可直接在油猴面板里「导入备份」）`);
+    }
+
+    if (CONFIG.cleanMail) {
+        try {
+            await lottery.cleanMailbox();
+        } catch (error) {
+            report(`⚠️ 站内信清理失败：${error.message}`);
+        }
     }
 
     const summary = lottery.summary();

@@ -1967,6 +1967,15 @@ console.log('\n[38] 已是 VIP 时站点改发憨豆，要按憨豆记账');
     check('折算的憨豆单独记在 swappedBeans 上',
         stats.prizes.vip?.swappedBeans === 1000000, `实际 ${stats.prizes.vip?.swappedBeans}`);
 
+    check('VIP 卡片按次数显示，折算了也算一次',
+        d.getElementById('total-vip-count').textContent === '1次',
+        d.getElementById('total-vip-count').textContent);
+    check('获得憨豆卡片下注明折算来源',
+        d.getElementById('beans-swap-note').textContent === '其中 1,000,000 来自 VIP 折算',
+        d.getElementById('beans-swap-note').textContent);
+    check('说明行是显示状态',
+        d.getElementById('beans-swap-note').classList.contains('is-on'));
+
     const vipSums = Array.from(d.querySelectorAll('#detail-list .hh-row'))
         .find(row => row.dataset.type === 'vip');
     const sumTexts = Array.from(vipSums?.querySelectorAll('.hh-row-sum') || []).map(el => el.textContent);
@@ -2001,6 +2010,14 @@ console.log('\n[39] 不是 VIP 的用户中 VIP，照常记 VIP 天数');
         Object.keys(stats.prizes.vip?.tiers || {}).join(' | '));
     check('没有折算，就不该有 swappedBeans',
         !stats.prizes.vip?.swappedBeans, `实际 ${stats.prizes.vip?.swappedBeans}`);
+
+    check('VIP 卡片同样按次数显示',
+        d.getElementById('total-vip-count').textContent === '1次',
+        d.getElementById('total-vip-count').textContent);
+    check('没有折算就不显示那行说明',
+        d.getElementById('beans-swap-note').textContent === ''
+        && !d.getElementById('beans-swap-note').classList.contains('is-on'),
+        d.getElementById('beans-swap-note').textContent);
 
     const vipRow = Array.from(d.querySelectorAll('#detail-list .hh-row'))
         .find(row => row.dataset.type === 'vip');
