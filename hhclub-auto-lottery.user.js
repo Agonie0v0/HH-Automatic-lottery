@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.19.1
+// @version      1.20.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 一抽到底 · 实时余额 · 站内信清理
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -1716,36 +1716,6 @@
                 </div>
             </div>
 
-            <!-- Main Stats -->
-            <div class="hh-stats">
-                <div class="hh-stat">
-                    <div class="hh-stat-top">
-                        <span>🎲 抽奖次数</span>
-                        <span>DRAWS</span>
-                    </div>
-                    <div class="hh-stat-value" id="draw-count">0</div>
-                </div>
-                <div class="hh-stat">
-                    <div class="hh-stat-top">
-                        <span>🏆 奖项种类</span>
-                        <span>TYPES</span>
-                    </div>
-                    <div class="hh-stat-value" id="prize-type-count">0</div>
-                </div>
-            </div>
-
-            <!-- Profit -->
-            <div class="hh-profit">
-                <div>
-                    <div class="hh-profit-left" id="profit-label">🍰 憨豆盈亏</div>
-                    <div class="hh-profit-value" id="profit-loss">-</div>
-                </div>
-                <div style="text-align:right;">
-                    <div class="hh-profit-left" id="profit-rate-label">盈亏率</div>
-                    <div class="hh-profit-rate" id="profit-rate">-</div>
-                </div>
-            </div>
-
             <!-- Settings -->
             <div class="hh-section">
                 <div class="hh-section-title">
@@ -1805,6 +1775,36 @@
                 <div class="hh-actions">
                     <button id="start-lottery" class="hh-btn hh-start">🎁 开始抽奖</button>
                     <button id="stop-lottery" class="hh-btn hh-stop" disabled>🛑 停止抽奖</button>
+                </div>
+            </div>
+
+            <!-- Main Stats -->
+            <div class="hh-stats">
+                <div class="hh-stat">
+                    <div class="hh-stat-top">
+                        <span>🎲 抽奖次数</span>
+                        <span>DRAWS</span>
+                    </div>
+                    <div class="hh-stat-value" id="draw-count">0</div>
+                </div>
+                <div class="hh-stat">
+                    <div class="hh-stat-top">
+                        <span>🏆 奖项种类</span>
+                        <span>TYPES</span>
+                    </div>
+                    <div class="hh-stat-value" id="prize-type-count">0</div>
+                </div>
+            </div>
+
+            <!-- Profit -->
+            <div class="hh-profit">
+                <div>
+                    <div class="hh-profit-left" id="profit-label">🍰 憨豆盈亏</div>
+                    <div class="hh-profit-value" id="profit-loss">-</div>
+                </div>
+                <div style="text-align:right;">
+                    <div class="hh-profit-left" id="profit-rate-label">盈亏率</div>
+                    <div class="hh-profit-rate" id="profit-rate">-</div>
                 </div>
             </div>
 
