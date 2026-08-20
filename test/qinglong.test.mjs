@@ -87,10 +87,10 @@ const mailboxPage = (items, pageCount) => {
  */
 function startSite({ prizes = ['魔力 100 '], balance = 100000, cost = 2000, onDraw = null,
                      mail = [], pageSize = 100, loggedOut = false,
-                     swapBeans = 0, userClass = null } = {}) {
+                     swapBeans = 0, userClass = null, classFailTimes = 0 } = {}) {
     const state = {
         balance, cost, draws: 0, deleted: [], mailPageHits: [],
-        mail: [...mail], drawn: []
+        mail: [...mail], drawn: [], classFails: 0
     };
 
     const server = http.createServer(async (req, res) => {
@@ -113,6 +113,11 @@ function startSite({ prizes = ['魔力 100 '], balance = 100000, cost = 2000, on
         // userClass 为 null 时这两个页面不存在，脚本就查不到等级
         if (url.pathname === '/usercp.php') {
             if (!userClass) return send(404, 'not found');
+            // 前几次故意 502，模拟网络抖动
+            if (state.classFails < classFailTimes) {
+                state.classFails++;
+                return send(502, 'bad gateway');
+            }
             return send(200, userCpPage('7321'));
         }
 
@@ -998,6 +1003,66 @@ if (process.platform === 'win32') {
     check('打断时不清信，那封通知还在',
         site.state.mail.length === 1, site.state.mail.map(m => m.id).join(','));
     check('汇总照样打出来了', /本次：\d+ 抽/.test(out), out.slice(-400));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[33] 等级查失败只是这一次失败，下次还得再查');
+{
+    // 第一次查等级 502，第二次通。两注都不带余额变化 ——
+    // 所以只有「真查到等级」才可能折算，正好分得出重试有没有生效。
+    const site = await startSite({
+        prizes: ['VIP 7 Day(s)'],
+        balance: 500000,
+        swapBeans: 1000000,
+        userClass: 'vip',
+        classFailTimes: 1
+    });
+    const statsFile = path.join(TMP, 'stats-retry.json');
+
+    await runScript({ host: site.state.origin, draws: 2, statsFile });
+    const t = JSON.parse(fs.readFileSync(statsFile, 'utf8')).total;
+
+    check('两注都算 VIP 中奖', t.prizes.vip.count === 2, `实际 ${t.prizes.vip.count}`);
+    check('第一注查不到等级、余额也对不上，老实记 7 天',
+        t.prizes.vip.tiers['7 天'] === 1, JSON.stringify(t.prizes.vip.tiers));
+    check('第二注重试查到了等级，按折算记',
+        t.prizes.vip.tiers['已转换为憨豆 1,000,000'] === 1, JSON.stringify(t.prizes.vip.tiers));
+    check('憨豆只加了一注的 1,000,000', t.gains.beans === 1000000, `实际 ${t.gains.beans}`);
+    check('等级页确实被请求了两次（失败那次没被记成查过）',
+        site.state.classFails === 1, `失败 ${site.state.classFails} 次`);
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[34] 折算来的憨豆要在汇总里点明来源');
+{
+    // 不点的话，拿各档位乘开去对「获得憨豆」会差出一百万，看着像 bug
+    const site = await startSite({
+        prizes: ['VIP 7 Day(s)', '魔力 100 '],
+        balance: 500000,
+        swapBeans: 1000000,
+        userClass: 'vip'
+    });
+
+    const { out } = await runScript({ host: site.state.origin, draws: 2 });
+
+    check('获得憨豆那行注明了折算金额',
+        /获得 1,000,100 憨豆（其中 1,000,000 来自 VIP 折算）/.test(out), out.slice(-700));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[35] 没有折算时不多这一句');
+{
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
+
+    const { out } = await runScript({ host: site.state.origin, draws: 1 });
+
+    check('普通抽奖的汇总干干净净', !/来自 VIP 折算/.test(out), out.slice(-400));
 
     await site.close();
 }

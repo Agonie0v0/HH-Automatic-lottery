@@ -135,7 +135,7 @@ function loadExternalConfig() {
     try {
         data = JSON.parse(fs.readFileSync(file, 'utf8'));
     } catch (error) {
-        log(`⚠️ ${CONFIG_FILE} 不是合法 JSON（${error.message}），改用脚本里的配置`);
+        log(`⚠️ ${CONFIG_FILE} 不是合法 JSON（${error?.message || error}），改用脚本里的配置`);
         return '';
     }
     if (!data || typeof data !== 'object') return '';
@@ -447,6 +447,13 @@ function markVipSwapped(stats, prize, beans) {
     bucket.tiers[swappedLabel] = (bucket.tiers[swappedLabel] || 0) + 1;
 }
 
+/* 所有类别里被折算成憨豆的总额。目前只有 VIP 会产生，
+   写成通用的，以后站点再加别的折算规则不用改这里。 */
+function swappedBeansTotal(stats) {
+    return Object.values(stats.prizes)
+        .reduce((sum, bucket) => sum + (Number(bucket.swappedBeans) || 0), 0);
+}
+
 function statsPath() {
     if (!CONFIG.statsFile) return '';
     return path.isAbsolute(CONFIG.statsFile)
@@ -463,7 +470,7 @@ function loadTotal() {
         // 备份文件和裸的统计对象都收
         return normalizeStats(payload?.total || payload?.current || payload);
     } catch (error) {
-        report(`⚠️ 统计文件读不出来（${error.message}），这次从零开始记`);
+        report(`⚠️ 统计文件读不出来（${error?.message || error}），这次从零开始记`);
         return emptyStats();
     }
 }
@@ -493,7 +500,7 @@ function saveStats(current, total) {
 
         return file;
     } catch (error) {
-        report(`⚠️ 统计写不进去（${error.message}）`);
+        report(`⚠️ 统计写不进去（${error?.message || error}）`);
         return '';
     }
 }
@@ -607,7 +614,6 @@ class Lottery {
        得分开，前者要退回余额差兜底，后者直接就能定。 */
     async checkVipOrAbove() {
         if (this.vipClassChecked) return this.vipOrAbove;
-        this.vipClassChecked = true;
 
         try {
             const id = await this.fetchSelfUserId();
@@ -621,6 +627,9 @@ class Lottery {
             if (!rank) return null;
 
             this.vipOrAbove = rank >= CLASS_RANK.vip;
+            // 只在真查出来时才记住。查失败（网络抖一下、502）就别记 ——
+            // 记了的话整个进程都不会再试，后面再中 VIP 只能退回余额差去猜。
+            this.vipClassChecked = true;
             return this.vipOrAbove;
         } catch (error) {
             return null;
@@ -858,7 +867,7 @@ class Lottery {
             this.mailCleaned += removed;
             log(`📪 清掉 ${fmt(removed)} 封抽奖通知 · 本次累计 ${fmt(this.mailCleaned)} 封`);
         } catch (error) {
-            log(`⚠️ 站内信清理失败：${error.message}`);
+            log(`⚠️ 站内信清理失败：${error?.message || error}`);
         }
     }
 
@@ -895,7 +904,7 @@ class Lottery {
             // 扫描到删完这几秒里可能又进了新通知，补扫第一页收尾
             removed += await this.sweepFirstPage();
         } catch (error) {
-            report(`⚠️ 站内信清理失败：${error.message}`);
+            report(`⚠️ 站内信清理失败：${error?.message || error}`);
             return;
         }
 
@@ -939,9 +948,15 @@ class Lottery {
                 return [head, ...tiers];
             });
 
+        // 折算来的憨豆不在憨豆档位里，不点这一句的话，拿各档位乘开
+        // 去对「获得憨豆」会差出一大截，看着像 bug
+        const swapped = swappedBeansTotal(stats);
+        const beansLine = `  消耗 ${fmt(stats.cost)} · 获得 ${fmt(beans)} 憨豆`
+            + (swapped > 0 ? `（其中 ${fmt(swapped)} 来自 VIP 折算）` : '');
+
         return [
             `${title}：${fmt(stats.draws)} 抽`,
-            `  消耗 ${fmt(stats.cost)} · 获得 ${fmt(beans)} 憨豆`,
+            beansLine,
             `  盈亏 ${profit >= 0 ? '+' : ''}${fmt(profit)}（${rate >= 0 ? '+' : ''}${rate.toFixed(1)}%）`,
             ...detail
         ].join('\n');
@@ -978,7 +993,7 @@ async function notify(title, content) {
         try {
             await send(title, content);
         } catch (error) {
-            log(`⚠️ 通知发送失败：${error.message}`);
+            log(`⚠️ 通知发送失败：${error?.message || error}`);
         }
     }
 }
@@ -1043,7 +1058,7 @@ async function main() {
     try {
         await lottery.run();
     } catch (error) {
-        report(`❌ ${error.message}`);
+        report(`❌ ${error?.message || error}`);
     }
 
     // 成绩先落盘再干别的。清信可能要上百个请求，卡在那儿被 kill 的话，
@@ -1057,7 +1072,7 @@ async function main() {
         try {
             await lottery.cleanMailbox();
         } catch (error) {
-            report(`⚠️ 站内信清理失败：${error.message}`);
+            report(`⚠️ 站内信清理失败：${error?.message || error}`);
         }
     }
 
@@ -1068,6 +1083,6 @@ async function main() {
 }
 
 main().catch(error => {
-    log(`❌ 脚本异常：${error.stack || error.message}`);
+    log(`❌ 脚本异常：${error?.stack || error?.message || error}`);
     process.exit(1);
 });
