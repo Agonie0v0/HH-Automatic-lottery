@@ -161,35 +161,33 @@ function startSite({ prizes = ['魔力 100 '], balance = 100000, cost = 2000, on
     });
 }
 
-/* 配置写在脚本顶部，所以测试就照用户的方式来：
-   复制一份源码、把「配置区」整块换掉，再当子进程跑。
-   顺带也就验证了那两个标记还在、配置块还能被整块替换。 */
-let copyIndex = 0;
-function runScript(config, runtime = null) {
+const DEFAULT_CONFIG = {
+    cookie: 'c_secure_uid=test',
+    statsFile: '',
+    draws: 10,
+    reserve: 0,
+    interval: 3,
+    maxMinutes: 60,
+    cleanMail: false,
+    host: 'hhanclub.net',
+    timezone: 'Asia/Shanghai',
+    userAgent: 'test-agent'
+};
+
+/* 把源码里的「配置区」整块换掉。切片边界只写这一处 ——
+   之前几个用例各自手写，漏掉一个 '};' 就整个脚本语法错。 */
+function patchSource(config, runtime = null) {
     const head = 'const CONFIG = {';
     const foot = '\n};\n\n/* ===== 配置区结束 ===== */';
+    const keep = '\n\n/* ===== 配置区结束 ===== */';
 
     const start = SOURCE.indexOf(head);
     const end = SOURCE.indexOf(foot);
     if (start < 0 || end < 0) throw new Error('配置区标记不见了，测试没法注入配置');
 
-    const merged = {
-        cookie: 'c_secure_uid=test',
-        statsFile: '',
-        draws: 10,
-        reserve: 0,
-        interval: 3,
-        maxMinutes: 60,
-        cleanMail: false,
-        host: 'hhanclub.net',
-        timezone: 'Asia/Shanghai',
-        userAgent: 'test-agent',
-        ...config
-    };
-
     let patched = SOURCE.slice(0, start)
-        + `const CONFIG = ${JSON.stringify(merged, null, 4)};`
-        + SOURCE.slice(end + foot.length - '\n\n/* ===== 配置区结束 ===== */'.length);
+        + `const CONFIG = ${JSON.stringify({ ...DEFAULT_CONFIG, ...config }, null, 4)};`
+        + SOURCE.slice(end + foot.length - keep.length);
 
     // RUNTIME 里的节奏参数不在配置区，单独替换 —— 不然「每 25 抽清一次」
     // 这种要跑满 25 抽才测得出来
@@ -199,17 +197,29 @@ function runScript(config, runtime = null) {
         patched = patched.replace(re, `$1${value}`);
     });
 
-    // 每次运行给一个独立目录：脚本会往自己所在目录写 hh_lottery.config.json，
-    // 共用一个目录的话前一个用例生成的模板会盖掉后面用例注入的配置
+    return patched;
+}
+
+/* 把补好的脚本写进一个独立目录。脚本会往自己所在目录写
+   hh_lottery.config.json，共用目录的话会互相污染。 */
+let copyIndex = 0;
+function installScript(config, runtime = null, extraFiles = {}) {
     const dir = path.join(TMP, `run-${copyIndex++}`);
     fs.mkdirSync(dir, { recursive: true });
 
     const file = path.join(dir, 'hh_lottery.js');
-    fs.writeFileSync(file, patched);
+    fs.writeFileSync(file, patchSource(config, runtime));
 
+    Object.entries(extraFiles).forEach(([name, body]) => {
+        fs.writeFileSync(path.join(dir, name), body);
+    });
+
+    return { dir, file };
+}
+
+function runFile(file, dir) {
     return new Promise(resolve => {
         const child = spawn(process.execPath, [file], { cwd: ROOT });
-
         let out = '';
         child.stdout.on('data', d => { out += d; });
         child.stderr.on('data', d => { out += d; });
@@ -217,33 +227,22 @@ function runScript(config, runtime = null) {
     });
 }
 
+function runScript(config, runtime = null) {
+    const { dir, file } = installScript(config, runtime);
+    return runFile(file, dir);
+}
+
 /* 起一个脚本进程但不等它结束 —— 用来测中途打断 */
 function spawnScript(config, { onOutput } = {}) {
-    const dir = path.join(TMP, `live-${copyIndex++}`);
-    fs.mkdirSync(dir, { recursive: true });
-
-    const head = 'const CONFIG = {';
-    const foot = '\n};\n\n/* ===== 配置区结束 ===== */';
-    const merged = {
-        cookie: 'c_secure_uid=test', statsFile: '', draws: 10, reserve: 0,
-        interval: 3, maxMinutes: 60, cleanMail: false,
-        host: 'hhanclub.net', timezone: 'Asia/Shanghai', userAgent: 'test-agent',
-        ...config
-    };
-    const patched = SOURCE.slice(0, SOURCE.indexOf(head))
-        + `const CONFIG = ${JSON.stringify(merged, null, 4)};`
-        + SOURCE.slice(SOURCE.indexOf(foot) + foot.length - foot.length);
-
-    const file = path.join(dir, 'hh_lottery.js');
-    fs.writeFileSync(file, patched);
+    const { dir, file } = installScript(config);
 
     const child = spawn(process.execPath, [file], { cwd: ROOT });
     let out = '';
     child.stdout.on('data', d => { out += d; onOutput?.(String(d)); });
     child.stderr.on('data', d => { out += d; });
 
-    const done = new Promise(resolve => child.on('close', code => resolve({ code, out: out })));
-    return { child, dir, done, read: () => out };
+    const done = new Promise(resolve => child.on('close', code => resolve({ code, out })));
+    return { child, dir, done };
 }
 
 /* ---------------------------------------------------------------- */
@@ -862,37 +861,22 @@ console.log('\n[27] 外置配置：有 hh_lottery.config.json 就以它为准');
 {
     const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
 
-    // 先跑一次，脚本里的配置指向别处（会失败），外置配置把它掰回来
-    const dir = path.join(TMP, 'cfg-external');
-    fs.mkdirSync(dir, { recursive: true });
+    // 脚本里的配置指向别处（连不上），全靠外置配置掰回来
+    const { dir, file } = installScript(
+        { draws: 99, host: 'http://127.0.0.1:1', timezone: 'UTC', userAgent: 'in-script' },
+        null,
+        {
+            'hh_lottery.config.json': JSON.stringify({
+                '//': '注释项要被忽略',
+                host: site.state.origin,
+                draws: 2,
+                timezone: 'Asia/Shanghai',
+                瞎写的项: 1
+            }, null, 4)
+        }
+    );
 
-    const head = 'const CONFIG = {';
-    const foot = '\n};\n\n/* ===== 配置区结束 ===== */';
-    const inScript = {
-        cookie: 'c_secure_uid=test', statsFile: '', draws: 99,
-        reserve: 0, interval: 3, maxMinutes: 60, cleanMail: false,
-        host: 'http://127.0.0.1:1', timezone: 'UTC', userAgent: 'in-script'
-    };
-    const patched = SOURCE.slice(0, SOURCE.indexOf(head))
-        + `const CONFIG = ${JSON.stringify(inScript, null, 4)};`
-        + SOURCE.slice(SOURCE.indexOf(foot));
-
-    fs.writeFileSync(path.join(dir, 'hh_lottery.js'), patched);
-    fs.writeFileSync(path.join(dir, 'hh_lottery.config.json'), JSON.stringify({
-        '//': '注释项要被忽略',
-        host: site.state.origin,
-        draws: 2,
-        timezone: 'Asia/Shanghai',
-        瞎写的项: 1
-    }, null, 4));
-
-    const { out } = await new Promise(resolve => {
-        const child = spawn(process.execPath, [path.join(dir, 'hh_lottery.js')], { cwd: ROOT });
-        let text = '';
-        child.stdout.on('data', d => { text += d; });
-        child.stderr.on('data', d => { text += d; });
-        child.on('close', code => resolve({ code, out: text }));
-    });
+    const { out } = await runFile(file, dir);
 
     check('说明了配置来自哪个文件', /⚙️ 配置来自 .*hh_lottery\.config\.json/.test(out), out.slice(0, 400));
     check('外置的 draws 覆盖了脚本里的 99', site.state.draws === 2, `实际 ${site.state.draws}`);
@@ -926,29 +910,13 @@ console.log('\n[29] 配置文件坏了要说清楚，并退回脚本里的配置
 {
     const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
 
-    const dir = path.join(TMP, 'cfg-broken');
-    fs.mkdirSync(dir, { recursive: true });
+    const { dir, file } = installScript(
+        { draws: 1, host: site.state.origin },
+        null,
+        { 'hh_lottery.config.json': '{ 这不是 JSON' }
+    );
 
-    const head = 'const CONFIG = {';
-    const foot = '\n};\n\n/* ===== 配置区结束 ===== */';
-    const inScript = {
-        cookie: 'c_secure_uid=test', statsFile: '', draws: 1,
-        reserve: 0, interval: 3, maxMinutes: 60, cleanMail: false,
-        host: site.state.origin, timezone: 'Asia/Shanghai', userAgent: 'test'
-    };
-    fs.writeFileSync(path.join(dir, 'hh_lottery.js'),
-        SOURCE.slice(0, SOURCE.indexOf(head))
-        + `const CONFIG = ${JSON.stringify(inScript, null, 4)};`
-        + SOURCE.slice(SOURCE.indexOf(foot)));
-    fs.writeFileSync(path.join(dir, 'hh_lottery.config.json'), '{ 这不是 JSON');
-
-    const { out } = await new Promise(resolve => {
-        const child = spawn(process.execPath, [path.join(dir, 'hh_lottery.js')], { cwd: ROOT });
-        let text = '';
-        child.stdout.on('data', d => { text += d; });
-        child.stderr.on('data', d => { text += d; });
-        child.on('close', code => resolve({ code, out: text }));
-    });
+    const { out } = await runFile(file, dir);
 
     check('明说文件不是合法 JSON', /不是合法 JSON/.test(out), out.slice(0, 400));
     check('退回脚本里的配置，照样跑得起来', /本次：1 抽/.test(out), out.slice(-400));
@@ -966,11 +934,7 @@ console.log('\n[30] 成绩先落盘，再去清信');
     });
     const statsFile = path.join(TMP, 'stats-order.json');
 
-    const order = [];
-    const { out } = await runScript(
-        { host: site.state.origin, draws: 2, cleanMail: true, statsFile },
-        null
-    );
+    const { out } = await runScript({ host: site.state.origin, draws: 2, cleanMail: true, statsFile });
 
     const saveAt = out.indexOf('💾 统计已存到');
     const cleanAt = out.indexOf('📪 本次共清掉');
