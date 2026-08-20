@@ -154,7 +154,7 @@ function startSite({ prizes = ['魔力 100 '], balance = 100000, cost = 2000, on
    复制一份源码、把「配置区」整块换掉，再当子进程跑。
    顺带也就验证了那两个标记还在、配置块还能被整块替换。 */
 let copyIndex = 0;
-function runScript(config) {
+function runScript(config, runtime = null) {
     const head = 'const CONFIG = {';
     const foot = '\n};\n\n/* ===== 配置区结束 ===== */';
 
@@ -176,9 +176,17 @@ function runScript(config) {
         ...config
     };
 
-    const patched = SOURCE.slice(0, start)
+    let patched = SOURCE.slice(0, start)
         + `const CONFIG = ${JSON.stringify(merged, null, 4)};`
         + SOURCE.slice(end + foot.length - '\n\n/* ===== 配置区结束 ===== */'.length);
+
+    // RUNTIME 里的节奏参数不在配置区，单独替换 —— 不然「每 25 抽清一次」
+    // 这种要跑满 25 抽才测得出来
+    Object.entries(runtime || {}).forEach(([key, value]) => {
+        const re = new RegExp(`(\\n\\s*${key}:\\s*)\\d+`);
+        if (!re.test(patched)) throw new Error(`RUNTIME 里没有 ${key}`);
+        patched = patched.replace(re, `$1${value}`);
+    });
 
     const file = path.join(TMP, `run-${copyIndex++}.js`);
     fs.writeFileSync(file, patched);
@@ -725,6 +733,81 @@ console.log('\n[24] 等级读不到、余额差又对不上：按 VIP 记并说�
         `vip=${t.gains.vip} beans=${t.gains.beans}`);
     check('明说读不到等级、无法确认',
         /读不到你的等级，无法确认是否折算/.test(out), out.slice(-700));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[25] 抽奖途中按节奏清信，不是等全抽完才动手');
+{
+    // 每抽一次站点发一封通知。设成「每 3 抽清一次」，抽 7 次，
+    // 途中该清 2 回（第 3、6 抽），最后收尾再翻一遍
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
+
+    // 让 mock 站点每抽一次就往收件箱塞一封通知
+    let mailId = 1000;
+    const original = site.state.mail;
+    site.state.mail = original;
+
+    const siteWithMail = await startSite({
+        prizes: ['魔力 100 '],
+        balance: 100000,
+        onDraw: state => {
+            state.mail.unshift({ id: String(mailId++), subject: '幸运大转盘 中奖通知' });
+        }
+    });
+    await site.close();
+
+    const { out } = await runScript(
+        { host: siteWithMail.state.origin, draws: 7, cleanMail: true },
+        { mailCleanEveryDraws: 3 }
+    );
+
+    const midRun = (out.match(/清掉 \d+ 封抽奖通知 · 本次累计/g) || []).length;
+
+    check('途中清了 2 回（第 3、6 抽）', midRun === 2, `实际 ${midRun} 回`);
+    check('7 封通知一封不剩',
+        siteWithMail.state.mail.length === 0,
+        siteWithMail.state.mail.map(m => m.id).join(','));
+    check('收尾报的是本次合计', /本次共清掉 7 封抽奖通知/.test(out), out.slice(-800));
+
+    // 清理发生在抽奖途中：日志里第一次清信要排在最后一抽之前
+    const firstClean = out.indexOf('清掉');
+    const lastDraw = out.indexOf('🎲 第 7 抽');
+    check('第一次清信排在最后一抽之前，说明是途中清的',
+        firstClean > 0 && firstClean < lastDraw, `clean@${firstClean} draw7@${lastDraw}`);
+
+    await siteWithMail.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[26] 收尾那遍要翻全本：被压在第一页下面的也得清掉');
+{
+    // 第一页塞满「种子被删除」，抽奖通知埋在第二页 ——
+    // 只扫第一页的清法够不着，翻全本才行
+    const KEEP = Array.from({ length: 10 }, (_, i) => ({
+        id: `9${String(i).padStart(3, '0')}`, subject: '种子被删除'
+    }));
+    const BURIED = Array.from({ length: 6 }, (_, i) => ({
+        id: `1${String(i).padStart(3, '0')}`, subject: '幸运大转盘 中奖通知'
+    }));
+
+    const site = await startSite({
+        prizes: ['魔力 100 '],
+        balance: 100000,
+        mail: [...KEEP, ...BURIED],
+        pageSize: 10
+    });
+
+    const { out } = await runScript({ host: site.state.origin, draws: 1, cleanMail: true });
+    const left = site.state.mail;
+
+    check('埋在第二页的 6 封全清了',
+        left.length === 10 && left.every(m => m.subject === '种子被删除'),
+        left.map(m => m.subject).join(' | '));
+    check('10 封该留的一封没动',
+        KEEP.every(k => left.some(m => m.id === k.id)), left.map(m => m.id).join(','));
+    check('日志报了 6 封', /本次共清掉 6 封抽奖通知/.test(out), out.slice(-600));
 
     await site.close();
 }

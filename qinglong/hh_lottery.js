@@ -94,6 +94,8 @@ const RUNTIME = {
     mailMaxPages: 600,
     // 反复清第一页的轮数上限
     mailSweepRounds: 20,
+    // 抽奖途中每多少抽顺手清一次（和油猴版的节奏一致）
+    mailCleanEveryDraws: 25,
     lotteryMailKeyword: '幸运大转盘'
 };
 
@@ -258,6 +260,10 @@ function parsePrizeText(text) {
 
     return fallback;
 }
+
+/* 收件箱里只有主题带这几个字的会被删。同一个收件箱里还混着
+   「种子被删除」「憨豆 改变」这类真要看的通知，宁可漏删也不能误删。 */
+const isLotteryMail = item => item.subject.includes(RUNTIME.lotteryMailKeyword);
 
 /* 折算金额是站点明文印在抽奖页上的：
      「当中奖 [VIP] 时，如果用户已经是 VIP 或以上等级，奖励憨豆： 1000000」
@@ -456,6 +462,8 @@ class Lottery {
         // true = 是 VIP 或以上，false = 不是，null = 没查出来
         this.vipOrAbove = null;
         this.vipClassChecked = false;
+
+        this.mailCleaned = 0;
 
         this.errorStreak = 0;
         this.rateLimitStreak = 0;
@@ -680,6 +688,13 @@ class Lottery {
                 log(`🎲 第 ${this.current.draws} 抽：${prizeText.trim()} · 余额 ${fmt(this.balance)}`);
 
                 if (prize.type === 'vip') await this.reconcileVip(prize);
+
+                // 和油猴版一个节奏：每 25 抽顺手清一次。挂机跑几百抽的话，
+                // 收件箱整场都在涨，等到最后才清没道理
+                if (CONFIG.cleanMail
+                    && this.current.draws % RUNTIME.mailCleanEveryDraws === 0) {
+                    await this.sweepDuringRun();
+                }
                 continue;
             }
 
@@ -762,12 +777,43 @@ class Lottery {
         return done;
     }
 
-    async cleanMail() {
-        const isLottery = item => item.subject.includes(RUNTIME.lotteryMailKeyword);
+    /* 反复清第一页，直到第一页不再有抽奖通知。
+       新信都排在最前面，所以抽奖途中用这个就够，一次请求的事。
+       一页可能只有 10 封，清一次远不够，所以要循环。 */
+    async sweepFirstPage() {
+        let removed = 0;
+
+        for (let round = 0; round < RUNTIME.mailSweepRounds; round++) {
+            const { items } = await this.mailPage(0);
+            const ids = items.filter(isLotteryMail).map(item => item.id);
+            if (!ids.length) break;
+            removed += await this.deleteMail(ids);
+        }
+
+        return removed;
+    }
+
+    /* 抽奖途中顺手清。清信失败不该把抽奖带停，记一行就算了。 */
+    async sweepDuringRun() {
+        try {
+            const removed = await this.sweepFirstPage();
+            if (!removed) return;
+
+            this.mailCleaned += removed;
+            log(`📪 清掉 ${fmt(removed)} 封抽奖通知 · 本次累计 ${fmt(this.mailCleaned)} 封`);
+        } catch (error) {
+            log(`⚠️ 站内信清理失败：${error.message}`);
+        }
+    }
+
+    /* 收尾时翻一遍整个收件箱。
+
+       途中那种只扫第一页的清法会漏：要是第一页被「种子被删除」这类
+       通知占满了，埋在下面的抽奖通知就够不着。翻全本才收得干净。 */
+    async cleanMailbox() {
         let removed = 0;
 
         try {
-            // 翻完整个收件箱，把要删的 id 收齐
             const doomed = [];
             const seen = new Set();
             const first = await this.mailPage(0);
@@ -781,7 +827,7 @@ class Lottery {
                 items.forEach(item => {
                     if (seen.has(item.id)) return;
                     seen.add(item.id);
-                    if (isLottery(item)) doomed.push(item.id);
+                    if (isLotteryMail(item)) doomed.push(item.id);
                 });
 
                 // 下拉框读不到页数时退回长度判断，以第一页的条数为准
@@ -791,18 +837,14 @@ class Lottery {
             if (doomed.length) removed += await this.deleteMail(doomed);
 
             // 扫描到删完这几秒里可能又进了新通知，补扫第一页收尾
-            for (let round = 0; round < RUNTIME.mailSweepRounds; round++) {
-                const { items } = await this.mailPage(0);
-                const ids = items.filter(isLottery).map(item => item.id);
-                if (!ids.length) break;
-                removed += await this.deleteMail(ids);
-            }
+            removed += await this.sweepFirstPage();
         } catch (error) {
             report(`⚠️ 站内信清理失败：${error.message}`);
             return;
         }
 
-        if (removed) report(`📪 清掉 ${fmt(removed)} 封抽奖通知`);
+        this.mailCleaned += removed;
+        if (this.mailCleaned) report(`📪 本次共清掉 ${fmt(this.mailCleaned)} 封抽奖通知`);
     }
 
     /* ---------------- 汇总 ---------------- */
@@ -932,7 +974,7 @@ async function main() {
 
     try {
         await lottery.run();
-        if (CONFIG.cleanMail) await lottery.cleanMail();
+        if (CONFIG.cleanMail) await lottery.cleanMailbox();
     } catch (error) {
         report(`❌ ${error.message}`);
     }
