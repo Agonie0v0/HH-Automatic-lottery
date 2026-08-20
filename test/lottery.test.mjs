@@ -2343,8 +2343,10 @@ console.log('\n[47] 等级第一次查失败，下次还要再查');
         if (target.includes('lucky.php')) {
             return {
                 ok: true, status: 200,
+                // 余额只反映消耗，不含补偿 —— 这样第一注（等级查不到时）
+                // 走余额差也判不出折算，能干净地看出第二注是靠等级判出来的
                 text: async () => `<html><body>
-                    <div class="bean-number">${START - 4000 + 1000000}.0</div>
+                    <div class="bean-number">${START - 2000}.0</div>
                     <div class="use-bean">每次消耗憨豆： 2000</div>
                     <div>当中奖 [VIP] 时，如果用户已经是 VIP 或以上等级，奖励憨豆： 1000000</div>
                 </body></html>`
@@ -2368,7 +2370,13 @@ console.log('\n[47] 等级第一次查失败，下次还要再查');
         userdetailsHits >= 2, `实际只查了 ${userdetailsHits} 次`);
 
     const stats = JSON.parse(w.localStorage.getItem('hhanclub_lottery_stats_v4'));
-    check('第二次凭等级判出折算', stats.gains.beans === 1000000, `实际 ${stats.gains.beans}`);
+    check('两注 VIP 都记上了', stats.prizes.vip?.count === 2, `实际 ${stats.prizes.vip?.count}`);
+    check('第一注等级查不到、余额也对不上，按 VIP 记',
+        stats.prizes.vip?.tiers['7 天'] === 1, JSON.stringify(stats.prizes.vip?.tiers));
+    check('第二注凭等级判出折算',
+        stats.prizes.vip?.tiers['已转换为憨豆 1,000,000'] === 1, JSON.stringify(stats.prizes.vip?.tiers));
+    check('只折算了一注，憨豆恰好一百万',
+        stats.gains.beans === 1000000, `实际 ${stats.gains.beans}`);
 }
 
 /* ---------------------------------------------------------------- */
