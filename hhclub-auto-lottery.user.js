@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.19.0
+// @version      1.19.1
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 一抽到底 · 实时余额 · 站内信清理
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -536,7 +536,6 @@
 
     async function checkVipOrAbove() {
         if (vipClassChecked) return vipOrAbove;
-        vipClassChecked = true;
 
         try {
             const id = await fetchSelfUserId();
@@ -553,6 +552,9 @@
             if (!rank) return null;
 
             vipOrAbove = rank >= CLASS_RANK.vip;
+            // 只在真查出来时才记住。查失败就别记 —— 记了的话这一整个
+            // 会话都不会再试，后面再中 VIP 只能退回余额差去猜。
+            vipClassChecked = true;
             return vipOrAbove;
         } catch (error) {
             return null;
@@ -2758,6 +2760,14 @@
         lines.push([escapeCsv('抽奖次数'), '', stats.draws, ''].join(','));
         lines.push([escapeCsv('累计消耗憨豆'), '', stats.cost, ''].join(','));
         lines.push([escapeCsv('获得憨豆'), '', stats.gains.beans, ''].join(','));
+
+        // 面板上有这行说明，CSV 里也得有 —— 折算来的憨豆不在憨豆档位里，
+        // 少了这一行，拿各档位乘开去对「获得憨豆」会差出一大截
+        const swapped = swappedBeansTotal(stats);
+        if (swapped > 0) {
+            lines.push([escapeCsv('其中来自 VIP 折算'), '', swapped, ''].join(','));
+        }
+
         lines.push([escapeCsv('憨豆盈亏'), '', stats.gains.beans - stats.cost, ''].join(','));
 
         // 带 BOM，Excel 打开中文不乱码
@@ -3278,7 +3288,7 @@
 
             addLog(`🗑 已删除 ${fmt(removed)} 封抽奖通知，其余 ${fmt(keep)} 封原样保留`, 'success');
         } catch (error) {
-            addLog(`⚠️ ${error.message}`, 'error');
+            addLog(`⚠️ ${error?.message || error}`, 'error');
         } finally {
             restore();
         }

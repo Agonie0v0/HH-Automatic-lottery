@@ -2315,5 +2315,101 @@ console.log('\n[46] 等级读不到时退回余额差，且窄带才认');
 }
 
 /* ---------------------------------------------------------------- */
+console.log('\n[47] 等级第一次查失败，下次还要再查');
+{
+    // 第一次 userdetails 请求 502，之后恢复。早先的实现把「查过了」写死在
+    // 入口，一次失败就整个会话不再查，后面中 VIP 只能退回余额差去猜。
+    const START = 500000;
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000', balance: String(START) });
+    const w = dom.window;
+
+    let userdetailsHits = 0;
+    w.fetch = async url => {
+        const target = String(url);
+        if (target.includes('usercp.php')) {
+            return {
+                ok: true, status: 200,
+                text: async () => '<html><body><a href="userdetails.php?id=1">我</a></body></html>'
+            };
+        }
+        if (target.includes('userdetails.php')) {
+            userdetailsHits++;
+            if (userdetailsHits === 1) return { ok: false, status: 502, text: async () => '' };
+            return {
+                ok: true, status: 200,
+                text: async () => '<html><body><span>等级：</span><img src="pic/uploader.gif" /></body></html>'
+            };
+        }
+        if (target.includes('lucky.php')) {
+            return {
+                ok: true, status: 200,
+                text: async () => `<html><body>
+                    <div class="bean-number">${START - 4000 + 1000000}.0</div>
+                    <div class="use-bean">每次消耗憨豆： 2000</div>
+                    <div>当中奖 [VIP] 时，如果用户已经是 VIP 或以上等级，奖励憨豆： 1000000</div>
+                </body></html>`
+            };
+        }
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ret: 0, data: { prize_text: 'VIP 7 Day(s)' } })
+        };
+    };
+
+    await run(dom);
+    const d = w.document;
+    d.getElementById('lottery-interval').value = '3';
+    d.getElementById('max-lottery-count').value = '2';
+    d.getElementById('start-lottery').click();
+    await untilStopped(d, 40000);
+    await sleep(400);
+
+    check('失败后重试了，不是一次失败就放弃',
+        userdetailsHits >= 2, `实际只查了 ${userdetailsHits} 次`);
+
+    const stats = JSON.parse(w.localStorage.getItem('hhanclub_lottery_stats_v4'));
+    check('第二次凭等级判出折算', stats.gains.beans === 1000000, `实际 ${stats.gains.beans}`);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[48] CSV 汇总里也要注明折算来源');
+{
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+    const w = dom.window;
+
+    // 一注真憨豆 + 一注被折算的 VIP
+    w.localStorage.setItem('hhanclub_lottery_stats_v4', JSON.stringify({
+        version: 4, draws: 2, cost: 4000,
+        gains: { beans: 1000100, magic: 0, invite: 0, rainbow: 0, vip: 0, makeup: 0, upload: 0, rename: 0 },
+        prizes: {
+            beans: { count: 1, value: 100, tiers: { '100 憨豆': 1 } },
+            vip: { count: 1, value: 0, swappedBeans: 1000000, tiers: { '已转换为憨豆 1,000,000': 1 } }
+        },
+        raw: {}
+    }));
+
+    const parts = [];
+    w.Blob = function (chunks) { parts.push(String(chunks[0])); };
+
+    await run(dom);
+    const d = w.document;
+    d.getElementById('view-mode').value = 'total';
+    d.getElementById('view-mode').dispatchEvent(new w.Event('change'));
+    await sleep(150);
+
+    d.getElementById('export-stats').click();
+    await sleep(300);
+
+    const csv = parts[0] || '';
+    check('CSV 里有「其中来自 VIP 折算」这一行',
+        /其中来自 VIP 折算.*1000000/.test(csv),
+        csv.split('\r\n').slice(-6).join(' | '));
+    check('获得憨豆仍是含折算的总数',
+        /获得憨豆.*1000100/.test(csv), csv.split('\r\n').slice(-6).join(' | '));
+    check('盈亏按含折算的总数算',
+        /憨豆盈亏.*996100/.test(csv), csv.split('\r\n').slice(-6).join(' | '));
+}
+
+/* ---------------------------------------------------------------- */
 console.log(`\n=========== ${passed} passed, ${failed} failed ===========\n`);
 process.exit(failed ? 1 : 0);
