@@ -115,6 +115,17 @@ const CONFIG = {
 const RUNTIME = {
     // 连续失败多少次放弃
     maxErrors: 5,
+    /* 网络层错误（DNS 挂了、连接被重置、请求超时）单独算一档。
+
+       这类错误跟「站点返回了错误」不是一回事：站点报错说明连得上，
+       多半是号或参数的问题，多试几次没意义；网络断了则纯粹是外部原因，
+       挂机跑几小时中间抖一下很正常，熬过去就行。
+
+       配合下面的退避，10 次大约能扛住 8 分钟的断网。 */
+    maxNetworkErrors: 10,
+    // 网络错误第 n 次失败等 n × 这个数，封顶 networkRetryMaxMs
+    networkRetryStepMs: 10000,
+    networkRetryMaxMs: 90000,
     // 连续被限流多少次放弃
     maxRateLimits: 12,
     // 被限流后的退避
@@ -721,6 +732,8 @@ class Lottery {
 
         this.errorStreak = 0;
         this.rateLimitStreak = 0;
+        // 网络层失败单独计数：站点报错和机器断网是两码事，容忍度不一样
+        this.networkErrorStreak = 0;
         this.intervalMs = CONFIG.interval * 1000;
         // 上一抽的 duration 就是下一抽的冷却窗口；请求发出时服务端已开始计时
         this.lastDurationMs = 0;
@@ -766,19 +779,38 @@ class Lottery {
         return { balance, cost: cost && cost > 0 ? Math.round(cost) : null };
     }
 
+    /* 抽一次。任何失败都变成返回值，绝不往外抛。
+
+       曾经这里的 try 只包着 JSON.parse，fetch 和 response.text() 裸奔 ——
+       机器网络一断，异常直接冒出 run()，被 main() 的兜底 catch 接住，
+       整轮当场收摊。errorStreak 那套重试机制压根没机会跑。
+       线上就这么在挂了近两小时后因为一次 DNS 抖动停了。 */
     async drawOnce() {
         this.lastDrawSentAt = Date.now();
-        const response = await fetch(`${this.origin}/plugin/lucky-draw`, {
-            method: 'POST',
-            headers: this.headers({
-                'x-requested-with': 'XMLHttpRequest',
-                // 站点自己用的是 jQuery.post，对齐 Content-Type
-                'content-type': 'application/x-www-form-urlencoded; charset=UTF-8'
-            }),
-            body: ''
-        });
 
-        const text = await response.text();
+        let response;
+        try {
+            response = await fetch(`${this.origin}/plugin/lucky-draw`, {
+                method: 'POST',
+                headers: this.headers({
+                    'x-requested-with': 'XMLHttpRequest',
+                    // 站点自己用的是 jQuery.post，对齐 Content-Type
+                    'content-type': 'application/x-www-form-urlencoded; charset=UTF-8'
+                }),
+                body: ''
+            });
+        } catch (error) {
+            // 请求根本没出去或没回来 —— 网络层的事，和站点无关
+            return { ok: false, status: 0, data: null, network: true, error: `${error?.message || error}` };
+        }
+
+        let text;
+        try {
+            text = await response.text();
+        } catch (error) {
+            return { ok: false, status: response.status, data: null, network: true, error: `${error?.message || error}` };
+        }
+
         try {
             return { ok: response.ok, status: response.status, data: JSON.parse(text) };
         } catch (error) {
@@ -1076,6 +1108,26 @@ class Lottery {
 
             const result = await this.drawOnce();
 
+            // 网络层失败：外部原因，退避着多熬几次，别为一次抖动收摊
+            if (result.network) {
+                this.networkErrorStreak++;
+                const wait = Math.min(
+                    RUNTIME.networkRetryStepMs * this.networkErrorStreak,
+                    RUNTIME.networkRetryMaxMs
+                );
+
+                if (this.networkErrorStreak >= RUNTIME.maxNetworkErrors) {
+                    this.stopReason = `网络连不上，连续 ${this.networkErrorStreak} 次失败后停止（${result.error}）`;
+                    report(`🛑 网络连不上，试了 ${this.networkErrorStreak} 次还是不行，停止（${result.error}）`);
+                    return;
+                }
+
+                log(`📡 网络不通（${result.error}）· 第 ${this.networkErrorStreak}/${RUNTIME.maxNetworkErrors} 次，`
+                    + `${Math.round(wait / 1000)} 秒后重试`);
+                this.quickRetryMs = wait;
+                continue;
+            }
+
             if (!result.data) {
                 this.errorStreak++;
                 log(`❌ 请求失败（HTTP ${result.status}）`);
@@ -1088,6 +1140,10 @@ class Lottery {
             }
 
             if (result.data.ret === 0) {
+                if (this.networkErrorStreak) {
+                    log(`📡 网络恢复了，接着抽`);
+                    this.networkErrorStreak = 0;
+                }
                 this.errorStreak = 0;
                 this.rateLimitStreak = 0;
                 this.intervalMs = CONFIG.interval * 1000;

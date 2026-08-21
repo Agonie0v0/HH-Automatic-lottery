@@ -89,11 +89,14 @@ const mailboxPage = (items, pageCount) => {
  *   onDraw    每抽回调，可以自己改 state（用来模拟 VIP 换憨豆）
  *   mail      收件箱内容
  *   pageSize  收件箱每页显示多少封
+ *   killAttempts 这几次抽奖请求直接掐断连接（制造真的 fetch failed，
+ *                模拟机器断网 / DNS 挂掉，不是站点返回错误）
  */
 function startSite({ prizes = ['魔力 100 '], durations = [6000], rateLimitAttempts = [],
                      balance = 100000, cost = 2000, onDraw = null,
                      mail = [], pageSize = 100, loggedOut = false,
-                     swapBeans = 0, userClass = null, classFailTimes = 0 } = {}) {
+                     swapBeans = 0, userClass = null, classFailTimes = 0,
+                     killAttempts = [] } = {}) {
     const state = {
         balance, cost, draws: 0, deleted: [], mailPageHits: [],
         mail: [...mail], drawn: [], classFails: 0, drawAttempts: 0
@@ -135,6 +138,13 @@ function startSite({ prizes = ['魔力 100 '], durations = [6000], rateLimitAtte
 
         if (url.pathname === '/plugin/lucky-draw') {
             state.drawAttempts++;
+            // 连 HTTP 响应都不给，直接把 socket 掐了 —— 客户端拿到的
+            // 就是 fetch failed，和机器断网时一模一样
+            if (killAttempts.includes(state.drawAttempts)) {
+                state.killed = (state.killed || 0) + 1;
+                res.socket.destroy();
+                return;
+            }
             if (rateLimitAttempts.includes(state.drawAttempts)) {
                 return send(200, JSON.stringify({ ret: 1, msg: '不要重复点击，请稍后' }),
                     'application/json');
@@ -1930,6 +1940,59 @@ console.log('\n[62] 定时战报默认关着：配置里没写就不推');
 
 
 /* ---------------------------------------------------------------- */
+/* ---------------------------------------------------------------- */
+console.log('\n[63] 断网不能当场收摊：退避重试，网络回来接着抽');
+{
+    // 线上事故：挂机跑了近两小时，机器网络抖了一下（DNS EAI_AGAIN），
+    // 脚本一次 fetch failed 就退出了。根因是 drawOnce 的 try 只包着
+    // JSON.parse，fetch 本身裸奔，异常直接冒出 run()，被 main() 的
+    // 兜底 catch 接住 —— errorStreak 那套重试压根没机会跑。
+    const site = await startSite({
+        prizes: ['魔力 100 '],
+        balance: 100000,
+        killAttempts: [2, 3]          // 第 2、3 次请求直接掐断连接
+    });
+
+    // 退避实际是 10 秒起步，测试里压到 200ms
+    const { out } = await runScript(
+        { host: site.state.origin, draws: 3, interval: 0.5 },
+        { networkRetryStepMs: 200, networkRetryMaxMs: 400 }
+    );
+
+    check('确实掐断了两次', site.state.killed === 2, `实际 ${site.state.killed} 次`);
+    check('认出来是网络不通，不是站点报错',
+        /📡 网络不通/.test(out), out.slice(-900));
+    check('报了第几次、还剩几次', /第 1\/10 次/.test(out) && /第 2\/10 次/.test(out),
+        out.slice(-900));
+    check('网络回来说了一声', /📡 网络恢复了/.test(out), out.slice(-900));
+    check('三抽一次没少', site.state.draws === 3, `实际 ${site.state.draws}`);
+    check('没有被当成异常中断', !/脚本异常中断/.test(out), out.slice(-900));
+    check('汇总照常打出来', /本次：3 抽/.test(out), out.slice(-600));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[64] 网络一直不通，试够次数才停，并说清是网络的事');
+{
+    const site = await startSite({
+        prizes: ['魔力 100 '],
+        balance: 100000,
+        killAttempts: Array.from({ length: 30 }, (_, i) => i + 1)   // 全掐
+    });
+
+    const { out } = await runScript(
+        { host: site.state.origin, draws: 5, interval: 0.5 },
+        { networkRetryStepMs: 100, networkRetryMaxMs: 200 }
+    );
+
+    check('试满 10 次才放弃', /试了 10 次还是不行/.test(out), out.slice(-900));
+    check('停止原因点明是网络', /网络连不上/.test(out), out.slice(-900));
+    check('一抽都没记上', site.state.draws === 0, `实际 ${site.state.draws}`);
+
+    await site.close();
+}
+
 fs.rmSync(TMP, { recursive: true, force: true });
 
 console.log(`\n=========== ${passed} passed, ${failed} failed ===========\n`);
