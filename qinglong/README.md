@@ -96,6 +96,8 @@ curl -fLO https://raw.githubusercontent.com/SAGIRIxr/HH-Automatic-lottery/main/q
 
 配置文件里只写你要改的项也行，没写的按脚本里的默认值走。`"//"` 开头的项当注释忽略，认不出的项会在日志里点名。
 
+脚本以后新加的开关，会在下次运行时自动补进你已有的配置文件里（值就是当前生效的默认值，行为不变），日志里会说补了哪些 —— 不然照着老文件填的人根本不知道有这些项。你自己填的值、自己加的项都不动。
+
 ### 写在脚本里
 
 不想多一个文件的话，直接改脚本最上面那块也行（有外置配置时以外置的为准）：
@@ -111,9 +113,18 @@ const CONFIG = {
     maxMinutes: 60,     // ⑤ 单次运行时间上限（分钟）
     cleanMail: false,   // ⑥ 抽完顺手清抽奖站内信
     statsFile: 'hh_lottery_stats.json',   // ⑦ 统计存哪儿，留空 '' 就是不记
-    timezone: 'Asia/Shanghai',            // ⑧ 日志时间按哪个时区显示
-    host: 'hhanclub.net',
-    userAgent: '...'
+
+    notifyBigPrize: true,      // ⑧ 中了大奖当场推一条
+    bigPrizeMinBeans: 780000,  // ⑨ 多少憨豆算大奖，填 0 就只有 VIP 才推
+
+    tgBotToken: '',            // ⑩ Telegram 直推，青龙里配过 TG 就别填
+    tgUserId: '',
+    tgApiHost: 'api.telegram.org',
+    webhookUrl: '',            // ⑪ 通用 Webhook，留空不用
+
+    timezone: 'Asia/Shanghai', // ⑫ 日志时间按哪个时区显示
+    host: 'hhanclub.net',      // ⑬
+    userAgent: '...'           // ⑭
 };
 ```
 
@@ -126,7 +137,10 @@ const CONFIG = {
 | `maxMinutes` | `60` | 单次运行时间上限（分钟），防止一抽到底把任务挂死 |
 | `cleanMail` | `false` | 清掉「幸运大转盘 中奖通知」站内信：抽奖途中每 25 抽一次，收尾再翻一遍整个收件箱 |
 | `statsFile` | `hh_lottery_stats.json` | 统计存到哪个文件，相对路径按脚本所在目录算。留空 `''` 就是不记 |
+| `notifyBigPrize` | `true` | 中了大奖（VIP，或单笔憨豆到下面的门槛）当场推一条，不用等跑完 |
+| `bigPrizeMinBeans` | `780000` | 多少憨豆算大奖。填 `0` 就只有 VIP 才推 |
 | `tgBotToken` / `tgUserId` | 空 | Telegram 直推。**青龙里已经配过 TG 推送的话别填**，青龙的 `sendNotify` 会推一条，这里再推就是重复。只认填在这儿的值，不读青龙的环境变量 |
+| `tgApiHost` | `api.telegram.org` | TG API 域名，走反代才需要改 |
 | `webhookUrl` | 空 | 通用 Webhook，POST 一份 JSON。Bark / 自建 / n8n 都能接 |
 | `timezone` | `Asia/Shanghai` | 日志时间按哪个时区显示。容器里系统时区多半是 UTC，不设的话日志时间跟你对不上 |
 | `host` | `hhanclub.net` | 站点域名，一般不用改 |
@@ -290,7 +304,7 @@ c_secure_uid=NzMyMQ%3D%3D; c_secure_pass=...; c_secure_ssl=...; c_secure_tracker
 npm run test:ql
 ```
 
-会在本地起一个假站点，把脚本当子进程真跑一遍，覆盖按次数抽 / 一抽到底 / VIP 折算两种走向及其跨次留存 / 站内信清理（含每页 10 封的分页）/ 统计导出格式 / 跨次累计 / 统计文件损坏 / Cookie 没填 / Cookie 失效 / 日志时间戳与时区 / 汇总的分类分组 / 按等级判折算的四种走向 / 清信的节奏与全本扫描 / 外置配置与模板生成 / 中途打断 / 等级查失败后的重试 / 通知渠道兜底 / 大奖即时推送 / 青龙信号接管 / 间隔精度 / 老用户升级不丢设置 / 在仓库里直接运行，共 167 条断言。
+会在本地起一个假站点，把脚本当子进程真跑一遍，覆盖按次数抽 / 一抽到底 / VIP 折算两种走向及其跨次留存 / 站内信清理（含每页 10 封的分页）/ 统计导出格式 / 跨次累计 / 统计文件损坏 / Cookie 没填 / Cookie 失效 / 日志时间戳与时区 / 汇总的分类分组 / 按等级判折算的四种走向 / 清信的节奏与全本扫描 / 外置配置与模板生成 / 中途打断 / 等级查失败后的重试 / 通知渠道兜底 / 大奖即时推送 / 青龙信号接管 / 间隔精度 / 老用户升级不丢设置 / 在仓库里直接运行 / 老配置文件补新项，共 175 条断言。
 
 测试是**照你的用法来的**：复制一份源码、把配置区整块换掉、再当子进程真跑，所以配置区的写法本身也在被测。
 
