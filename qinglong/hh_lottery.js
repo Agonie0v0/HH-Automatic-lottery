@@ -74,14 +74,19 @@ const CONFIG = {
     tgUserId: '',
     tgApiHost: 'api.telegram.org',
 
-    /* ⑪ 日志时间按哪个时区显示。
+    /* ⑪ 通用 Webhook（可选）。填个 URL 就会 POST 一份
+          {"title":"...","content":"...","text":"标题\n\n正文"} 过去。
+          Bark、自建服务、n8n 之类都能接。留空就不用 */
+    webhookUrl: '',
+
+    /* ⑫ 日志时间按哪个时区显示。
           青龙容器默认常是 UTC，不设这个的话日志时间对不上 */
     timezone: 'Asia/Shanghai',
 
-    /* ⑫ 站点域名，一般不用改 */
+    /* ⑬ 站点域名，一般不用改 */
     host: 'hhanclub.net',
 
-    /* ⑬ User-Agent，一般不用改 */
+    /* ⑭ User-Agent，一般不用改 */
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
         + '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
 };
@@ -147,6 +152,7 @@ function normalizeConfig() {
     CONFIG.tgUserId = String(CONFIG.tgUserId || process.env.TG_USER_ID || '').trim();
     CONFIG.tgApiHost = String(CONFIG.tgApiHost || 'api.telegram.org').trim()
         .replace(/^https?:\/\//, '').replace(/\/+$/, '');
+    CONFIG.webhookUrl = String(CONFIG.webhookUrl || '').trim();
     CONFIG.host = String(CONFIG.host || 'hhanclub.net').trim().replace(/\/+$/, '');
     CONFIG.statsFile = String(CONFIG.statsFile || '').trim();
     CONFIG.timezone = String(CONFIG.timezone || '').trim();
@@ -1094,7 +1100,32 @@ async function sendTelegramDirect(title, content) {
     }
 }
 
-/* 返回是否真送出去了。preferTelegram 用于手动停止那条路径。 */
+/* 通用 Webhook。不在青龙里跑、又不想配 Telegram 的话走这个 ——
+   Bark、自建服务、n8n 之类都能接。 */
+async function sendWebhook(title, content) {
+    if (!CONFIG.webhookUrl) return false;
+
+    try {
+        const response = await fetch(CONFIG.webhookUrl, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ title, content, text: `${title}\n\n${content}` })
+        });
+        if (!response.ok) {
+            log(`⚠️ Webhook 推送失败（HTTP ${response.status}）`);
+            return false;
+        }
+        return true;
+    } catch (error) {
+        log(`⚠️ Webhook 推送异常：${error?.message || error}`);
+        return false;
+    }
+}
+
+/* 返回是否真送出去了。preferTelegram 用于手动停止那条路径。
+
+   渠道是「谁行谁上」而不是只挑一个：青龙里有 sendNotify 就用它，
+   自己在 Debian / NAS 上跑没有那个模块，就走 Telegram / Webhook。 */
 async function notify(title, content, { preferTelegram = false } = {}) {
     // 青龙内置的 notify 默认会去请求「一言」，在正文末尾追加一句随机标语，
     // 还得多等一次外部请求。临时关掉，跑完还原，不动用户的全局设置。
@@ -1103,21 +1134,27 @@ async function notify(title, content, { preferTelegram = false } = {}) {
     process.env.HITOKOTO = 'false';
 
     try {
-        if (preferTelegram && await sendTelegramDirect(title, content)) return true;
+        let sent = false;
 
-        const send = loadNotifyModule();
-        if (send) {
-            try {
-                await send(title, content);
-                return true;
-            } catch (error) {
-                log(`⚠️ sendNotify 发送失败：${error?.message || error}`);
+        if (preferTelegram && await sendTelegramDirect(title, content)) sent = true;
+
+        if (!sent) {
+            const send = loadNotifyModule();
+            if (send) {
+                try {
+                    await send(title, content);
+                    sent = true;
+                } catch (error) {
+                    log(`⚠️ sendNotify 发送失败：${error?.message || error}`);
+                }
             }
         }
 
-        // sendNotify 没有或者发砸了，再试一次 Telegram
-        if (!preferTelegram) return await sendTelegramDirect(title, content);
-        return false;
+        // sendNotify 没有或者发砸了，挨个兜底
+        if (!sent && !preferTelegram && await sendTelegramDirect(title, content)) sent = true;
+        if (!sent && await sendWebhook(title, content)) sent = true;
+
+        return sent;
     } finally {
         if (hadHitokoto) process.env.HITOKOTO = originalHitokoto;
         else delete process.env.HITOKOTO;

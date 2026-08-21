@@ -168,6 +168,10 @@ function startSite({ prizes = ['魔力 100 '], balance = 100000, cost = 2000, on
 
 const DEFAULT_CONFIG = {
     cookie: 'c_secure_uid=test',
+    notifyBigPrize: false,
+    tgBotToken: '',
+    tgUserId: '',
+    webhookUrl: '',
     statsFile: '',
     draws: 10,
     reserve: 0,
@@ -585,9 +589,14 @@ console.log('\n[16] 日志带时间戳，汇总块不带');
         logLines.find(line => !/^\[\d\d\/\d\d \d\d:\d\d:\d\d\] /.test(line)));
     check('抽奖那几行也带上了', logLines.some(line => /\] 🎲 第 1 抽/.test(line)),
         logLines.join(' | ').slice(0, 200));
+    // 汇总之后还会有「通知渠道」之类的日志行，那些本来就带时间戳；
+    // 这条断言的本意是「汇总块本身不套」，所以只看汇总内容行
+    const summaryLines = (after || '').split('\n')
+        .filter(line => line.trim() && !/^\[\d\d\/\d\d/.test(line));
     check('汇总块不套时间戳，免得没法看',
-        (after || '').split('\n').filter(l => l.trim()).every(line => !/^\[\d\d\/\d\d/.test(line)),
-        (after || '').slice(0, 200));
+        summaryLines.some(line => /^本次：\d+ 抽$/.test(line))
+        && summaryLines.some(line => /^ {2}消耗 /.test(line)),
+        summaryLines.join(' | ').slice(0, 200));
 
     await site.close();
 }
@@ -1063,6 +1072,203 @@ console.log('\n[35] 没有折算时不多这一句');
     const { out } = await runScript({ host: site.state.origin, draws: 1 });
 
     check('普通抽奖的汇总干干净净', !/来自 VIP 折算/.test(out), out.slice(-400));
+
+    await site.close();
+}
+
+/* 收通知的假服务器 —— 用来验非青龙环境下的推送 */
+function startWebhook() {
+    const got = [];
+    const server = http.createServer(async (req, res) => {
+        const chunks = [];
+        for await (const chunk of req) chunks.push(chunk);
+        try {
+            got.push(JSON.parse(Buffer.concat(chunks).toString()));
+        } catch (error) {
+            got.push({ raw: Buffer.concat(chunks).toString() });
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{"ok":true}');
+    });
+
+    return new Promise(resolve => {
+        server.listen(0, '127.0.0.1', () => resolve({
+            got,
+            url: `http://127.0.0.1:${server.address().port}/hook`,
+            tgHost: `127.0.0.1:${server.address().port}`,
+            close: () => new Promise(r => server.close(r))
+        }));
+    });
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[36] 不在青龙里也能收到通知：Webhook 兜底');
+{
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
+    const hook = await startWebhook();
+
+    const { out } = await runScript({
+        host: site.state.origin, draws: 2, webhookUrl: hook.url
+    });
+
+    check('推了一条', hook.got.length === 1, `实际 ${hook.got.length} 条`);
+    check('标题里有脚本名', /HHCLUB 幸运大转盘/.test(hook.got[0]?.title || ''), hook.got[0]?.title);
+    check('正文带汇总', /本次：2 抽/.test(hook.got[0]?.content || ''), (hook.got[0]?.content || '').slice(0, 200));
+    check('正文报了运行时长', /本次运行 \d+ 秒/.test(hook.got[0]?.content || ''),
+        (hook.got[0]?.content || '').slice(0, 200));
+    check('不再说「没有可用的通知渠道」', !/没有可用的通知渠道/.test(out), out.slice(-300));
+
+    await hook.close();
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[37] 一个渠道都没配时说明白，别装作推了');
+{
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
+
+    const { out } = await runScript({ host: site.state.origin, draws: 1 });
+
+    check('明说没有可用渠道', /没有可用的通知渠道，本次只写了日志/.test(out), out.slice(-300));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[38] 中大奖当场推一条');
+{
+    const site = await startSite({
+        prizes: ['魔力 780000 ', '魔力 100 '],
+        balance: 100000
+    });
+    const hook = await startWebhook();
+
+    await runScript({
+        host: site.state.origin, draws: 2,
+        notifyBigPrize: true, bigPrizeMinBeans: 780000,
+        webhookUrl: hook.url
+    });
+
+    const big = hook.got.find(item => /中大奖了/.test(item.title || ''));
+
+    check('大奖那条推出去了', !!big, hook.got.map(i => i.title).join(' | '));
+    check('写明了第几抽中的什么', /第 1 抽中了：魔力 780000/.test(big?.content || ''), big?.content);
+    check('收尾那条汇总也还在',
+        hook.got.some(item => /本次：2 抽/.test(item.content || '')),
+        hook.got.map(i => i.title).join(' | '));
+
+    await hook.close();
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[39] 普通奖不推，别刷屏');
+{
+    const site = await startSite({ prizes: ['魔力 5000 '], balance: 100000 });
+    const hook = await startWebhook();
+
+    await runScript({
+        host: site.state.origin, draws: 3,
+        notifyBigPrize: true, bigPrizeMinBeans: 780000,
+        webhookUrl: hook.url
+    });
+
+    check('只有收尾那一条', hook.got.length === 1, hook.got.map(i => i.title).join(' | '));
+    check('不是大奖通知', !/中大奖了/.test(hook.got[0]?.title || ''), hook.got[0]?.title);
+
+    await hook.close();
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[40] 青龙预注册的「立即退出」处理器要被接管');
+if (process.platform === 'win32') {
+    console.log('  · Windows 上 child.kill() 是强杀、收不到信号，这条跳过（Linux/NAS 上会跑）');
+} else {
+    // 青龙通过 NODE_OPTIONS 预加载脚本，会抢在业务脚本前面注册 SIGTERM
+    // 并直接 process.exit()。不接管的话保存和推送根本轮不到。
+    const preload = path.join(TMP, 'ql-preload.cjs');
+    fs.writeFileSync(preload,
+        "process.on('SIGTERM', () => { console.log('[preload] 立即退出'); process.exit(15); });\n");
+
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
+    const hook = await startWebhook();
+    const statsFile = path.join(TMP, 'stats-ql-signal.json');
+
+    const { dir, file } = installScript({
+        host: site.state.origin, draws: 50, statsFile, webhookUrl: hook.url
+    });
+
+    let drawn = 0;
+    const child = spawn(process.execPath, ['-r', preload, file], { cwd: dir });
+    let out = '';
+    child.stdout.on('data', d => {
+        out += d;
+        if (/🎲 第 \d+ 抽/.test(String(d))) drawn++;
+    });
+    child.stderr.on('data', d => { out += d; });
+    const done = new Promise(resolve => child.on('close', code => resolve(code)));
+
+    await until(() => drawn >= 2, 30000);
+    child.kill('SIGTERM');
+    await done;
+
+    check('日志说明接管了预注册的处理器', /已接管退出信号/.test(out), out.slice(0, 400));
+    check('预加载那个「立即退出」没能抢先', !/\[preload\] 立即退出/.test(out), out.slice(0, 400));
+    check('成绩存下来了',
+        fs.existsSync(statsFile) && JSON.parse(fs.readFileSync(statsFile, 'utf8')).total.draws >= 2,
+        fs.existsSync(statsFile) ? '有文件' : '文件不存在');
+    check('停止通知也推出去了',
+        hook.got.some(item => /手动停止/.test(item.title || '')),
+        hook.got.map(i => i.title).join(' | '));
+    check('通知里写了停止原因',
+        hook.got.some(item => /收到 SIGTERM，手动停止/.test(item.content || '')),
+        hook.got.map(i => (i.content || '').slice(0, 60)).join(' | '));
+
+    await hook.close();
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[41] 间隔说多久就是多久，不再随机抖动');
+{
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
+
+    const stamps = [];
+    site.server.on('request', req => {
+        if (req.url.includes('lucky-draw')) stamps.push(Date.now());
+    });
+
+    await runScript({ host: site.state.origin, draws: 4, interval: 3 });
+
+    const gaps = stamps.slice(1).map((at, i) => at - stamps[i]);
+    check('三次间隔都贴着 3 秒（±400ms）',
+        gaps.length === 3 && gaps.every(gap => Math.abs(gap - 3000) < 400),
+        gaps.join(', '));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[42] 间隔支持两位小数');
+{
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
+
+    const { out } = await runScript({ host: site.state.origin, draws: 1, interval: 3.25 });
+
+    check('日志里写的是 3.25 秒，不是 3', /间隔 3\.25 秒/.test(out), out.slice(0, 300));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[43] 间隔填得离谱时收敛到合法范围');
+{
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
+
+    const { out } = await runScript({ host: site.state.origin, draws: 1, interval: 0.5 });
+
+    check('低于下限 3 秒的收到 3', /间隔 3 秒/.test(out), out.slice(0, 300));
 
     await site.close();
 }
