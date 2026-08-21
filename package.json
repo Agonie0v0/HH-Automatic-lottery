@@ -5,7 +5,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node test/lottery.test.mjs",
+    "test": "node test/parallel.mjs",
+    "test:seq": "node test/lottery.test.mjs",
     "test:ql": "node test/qinglong.test.mjs",
     "test:all": "node test/lottery.test.mjs && node test/qinglong.test.mjs",
     "check": "node --check hhclub-auto-lottery.user.js && node --check qinglong/hh_lottery.js"

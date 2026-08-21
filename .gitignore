@@ -4,3 +4,6 @@ package-lock.json
 .DS_Store
 hh_lottery_stats.json
 hh_lottery.config.json
+
+test/.shard-*.mjs
+test/.timings.json
