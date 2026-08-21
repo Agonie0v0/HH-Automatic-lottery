@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.27.0
+// @version      1.28.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 一抽到底 · 实时余额 · 站内信清理
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -107,12 +107,12 @@
         vipSwapFallbackBeans: 1000000,
         /* 判定折算的主证据是余额：站点真发了那笔憨豆，账面必然多出接近
            这个数；发的是天数，账面只有做种那点零头。要求至少多出公布金额
-           的这个比例才算折算。
-
-           取一半是因为两头都要留余量 —— 同期可能还在扣抽奖成本、涨做种
-           收益，也可能有人赠送。真折算是一百万级的跳变，赠送要凑到五十万
-           才可能混淆，那种巧合可以不管。 */
+           的这个比例才算折算。 */
         vipSwapMinDriftRatio: 0.5,
+        /* 等级读不到时光有「多了一大笔」还不够 —— 奖池里有 780,000 那一档，
+           它一出就能把余额差顶过上面那个门槛。所以这种情况要求余额变动
+           落在公布金额附近的窄带里，宁可漏记也不乱记。 */
+        vipSwapTolerance: 20000,
         // 个人页，用来读等级
         userCpPageForId: '/usercp.php',
         // 每抽多少次回服务端校准一次余额，纠正本地估算的累计漂移
@@ -577,16 +577,39 @@
         return list.map(() => 0);
     }
 
-    /* 「VIP 或以上等级」说的是 NexusPHP 的 class。站点可以把等级名字改得
-       面目全非（本站叫「俺不中类」），但等级图标用的还是标准文件名，
-       所以按图标判。只要判出 class ≥ VIP，折算与否就是确定的事实，
-       不用再去猜余额 —— 别人赠送魔力、做种收益、别的标签页在花钱，
-       统统影响不到。 */
+    /* 「VIP 或以上等级」说的是 NexusPHP 的 class 序号。站点可以把等级名字
+       改得面目全非（本站发布员叫「俺不中类」），但内核生成的东西没改：
+
+           <img alt="发布员" src="pic/uploader.gif" />
+           <span class='Uploader_Name font-bold'>俺不中类</span>
+
+       CSS 类名是 {ClassName}_Name，比图标文件名可靠 —— 图标是站点资源，
+       随时能换皮，类名是内核按 class 序号拼出来的。两个都收，类名优先。
+
+       键统一小写。同一等级两种写法都列（图标 veteran / 类名 veteranuser），
+       免得站点哪边改了就整个判不出来。
+
+       序号照 NexusPHP 的 UC_* 常量。peasant 是 0 —— H&R 不达标被降级的
+       农民，挂机刷抽奖的号最容易掉进去。线上就是因为表里没有它，
+       等级判定退化成靠余额猜，给一个非 VIP 的号凭空记了一百万。 */
     const CLASS_RANK = {
-        user: 1, power: 2, elite: 3, crazy: 4, insane: 5, veteran: 6,
-        extreme: 7, ultimate: 8, nexusmaster: 9, vip: 10, retiree: 11,
-        uploader: 12, moderator: 13, coadministrator: 14,
-        administrator: 15, sysop: 16, staffleader: 17
+        peasant: 0,
+        user: 1,
+        power: 2, poweruser: 2,
+        elite: 3, eliteuser: 3,
+        crazy: 4, crazyuser: 4,
+        insane: 5, insaneuser: 5,
+        veteran: 6, veteranuser: 6,
+        extreme: 7, extremeuser: 7,
+        ultimate: 8, ultimateuser: 8,
+        nexusmaster: 9,
+        vip: 10,
+        retiree: 11,
+        uploader: 12,
+        moderator: 13,
+        coadministrator: 14, administrator: 14,
+        sysop: 15,
+        staffleader: 16
     };
 
     // true = 是 VIP 或以上，false = 不是，null = 没查出来
@@ -617,6 +640,27 @@
         return ids.size === 1 ? [...ids][0] : null;
     }
 
+    /* 从个人页里读出 class 序号。读不出返回 null。 */
+    function parseClassRank(html) {
+        // 先把范围收到「等级：」那一段，免得页面别处的图标混进来
+        const at = html.search(/等级\s*[：:]/);
+        const scope = at >= 0 ? html.slice(at, at + 400) : html;
+
+        const candidates = [];
+        const byClass = scope.match(/class=['"][^'"]*?\b([A-Za-z]+)_Name\b/);
+        if (byClass) candidates.push(byClass[1]);
+
+        const byIcon = scope.match(/pic\/(\w+)\.(?:gif|png|svg|webp)/i);
+        if (byIcon) candidates.push(byIcon[1]);
+
+        for (const name of candidates) {
+            const rank = CLASS_RANK[name.toLowerCase()];
+            // 农民是 0，不能用真假判断，否则等于没读到
+            if (rank !== undefined) return rank;
+        }
+        return null;
+    }
+
     async function checkVipOrAbove() {
         if (vipClassChecked) return vipOrAbove;
 
@@ -627,12 +671,8 @@
             const response = await fetch(`/userdetails.php?id=${id}`, { credentials: 'include' });
             if (!response.ok) return null;
 
-            const match = (await response.text())
-                .match(/等级[：:][\s\S]{0,300}?pic\/(\w+)\.(?:gif|png|svg|webp)/i);
-            if (!match) return null;
-
-            const rank = CLASS_RANK[match[1].toLowerCase()];
-            if (!rank) return null;
+            const rank = parseClassRank(await response.text());
+            if (rank === null) return null;
 
             vipOrAbove = rank >= CLASS_RANK.vip;
             // 只在真查出来时才记住。查失败就别记 —— 记了的话这一整个
@@ -821,6 +861,14 @@
         if (eligible === false) {
             addLog(`⚠️ 中了 VIP 后余额多出 ${fmt(Math.round(drift))}，但你的等级不到 VIP，`
                 + '不符合折算条件 —— 这一注按 VIP 记，多出的钱另有来源', 'warning');
+            return;
+        }
+
+        // 等级读不到：光有「多了一大笔」不作数。同期中一发 780,000
+        // 就能顶过门槛，必须贴着公布金额才敢认。
+        if (eligible === null && Math.abs(drift - beans) > CONFIG.vipSwapTolerance) {
+            addLog(`⚠️ 中了 VIP 且余额多出 ${fmt(Math.round(drift))}，但读不到你的等级、`
+                + `数额也对不上公布的 ${fmt(beans)} —— 这一注按 VIP 记`, 'warning');
             return;
         }
 

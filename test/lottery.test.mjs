@@ -2210,7 +2210,7 @@ console.log('\n[43] 站点改了折算金额，脚本跟着改');
 
 /* 抽一注 VIP。classIcon 决定站点认不认「VIP 或以上」，
    serverBalance 决定校准时读到多少余额。 */
-async function drawVipWith({ classIcon, serverBalance, swapRule = 1000000 }) {
+async function drawVipWith({ classIcon, className, serverBalance, swapRule = 1000000 }) {
     const START = 500000;
     const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000', balance: String(START) });
     const w = dom.window;
@@ -2226,11 +2226,17 @@ async function drawVipWith({ classIcon, serverBalance, swapRule = 1000000 }) {
         }
         if (target.includes('userdetails.php')) {
             userdetailsHits++;
-            if (!classIcon) return { ok: false, status: 500, text: async () => '' };
+            if (!classIcon && !className) return { ok: false, status: 500, text: async () => '' };
+            // 照抄线上的结构：图标带中文名，用户名那个 span 的 class
+            // 是内核生成的 {ClassName}_Name，站点把显示名改成了「俺不中类」
+            const icon = classIcon ? `<img alt="发布员" title="发布员" src="pic/${classIcon}.gif" />` : '';
+            const named = className
+                ? `<span class='${className}_Name font-bold'>俺不中类</span>`
+                : `<span class='font-bold'>俺不中类</span>`;
             return {
                 ok: true, status: 200,
-                text: async () => `<html><body><span>等级：</span>
-                    <span><img alt="x" src="pic/${classIcon}.gif" /><span>俺不中类</span></span>
+                text: async () => `<html><body><span class="font-bold m-auto">等级：</span>
+                    <span class='flex items-end'>${icon} ${named}</span>
                 </body></html>`
             };
         }
@@ -2843,6 +2849,60 @@ console.log('\n[57] 开抽前刚手动转过一把：残留冷却别被误判成
     check('没有被误判成持续限流', !log.includes('持续被限流'), log.slice(0, 300));
     check('日志说明冷却未知、放慢重试', /冷却剩多久未知，1000ms 后再试/.test(log),
         log.slice(0, 300));
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[58] 农民（class 0）要判成「不是 VIP」，不能判成「读不到」');
+{
+    // 线上事故的根因之一：CLASS_RANK 里没有 peasant，而且 `if (!rank)`
+    // 连 rank 为 0 都当成读不到。等级判定一退化成 null 就只能靠余额猜，
+    // 同期中一发 780,000 就把非 VIP 的号记成了折算。
+    // H&R 不达标被降级的农民，恰恰就是挂机刷抽奖最容易掉进去的等级。
+    const { stats, logs } = await drawVipWith({
+        classIcon: 'peasant',
+        className: 'Peasant',
+        serverBalance: start => start - 2000 + 780000   // 同期中了一发 780,000
+    });
+
+    check('照实记成 7 天 VIP', stats.gains.vip === 7, `实际 ${stats.gains.vip}`);
+    check('没有凭空记出一百万', stats.gains.beans === 0, `实际 ${stats.gains.beans}`);
+    check('档位是天数不是折算', stats.prizes.vip?.tiers['7 天'] === 1,
+        JSON.stringify(stats.prizes.vip?.tiers));
+    check('日志点明等级不符合折算条件',
+        logs.some(line => line.includes('不符合折算条件')), logs.slice(-3).join(' | '));
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[59] 等级认 CSS 类名，站点换了图标也不瞎');
+{
+    // 站点把等级名改成了「俺不中类」，图标也可能随时换皮，
+    // 但用户名那个 span 的 class 是内核按 class 序号生成的
+    const { stats } = await drawVipWith({
+        classIcon: null,
+        className: 'Uploader',
+        serverBalance: start => start - 2000 + 1000000
+    });
+
+    check('只凭 Uploader_Name 就判出够折算',
+        stats.gains.beans === 1000000, `实际 ${stats.gains.beans}`);
+    check('仍算一次 VIP 中奖', stats.prizes.vip?.count === 1, JSON.stringify(stats.prizes.vip));
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[60] 等级读不到时，780,000 顶上来的余额差不算折算');
+{
+    // 奖池里有 780,000 那一档，它一出就能把余额差顶过「至少一半」的门槛。
+    // 等级读不到的情况下必须贴着公布金额才敢认，否则宁可漏记。
+    const { stats, logs } = await drawVipWith({
+        classIcon: null,
+        className: null,                                 // userdetails 直接 500
+        serverBalance: start => start - 2000 + 780000
+    });
+
+    check('按 VIP 天数记', stats.gains.vip === 7, `实际 ${stats.gains.vip}`);
+    check('没把 780,000 当成折算', stats.gains.beans === 0, `实际 ${stats.gains.beans}`);
+    check('日志说明数额对不上公布金额',
+        logs.some(line => line.includes('数额也对不上公布的')), logs.slice(-3).join(' | '));
 }
 
 /* ---------------------------------------------------------------- */
