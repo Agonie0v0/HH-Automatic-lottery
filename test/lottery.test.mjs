@@ -2906,5 +2906,132 @@ console.log('\n[60] 等级读不到时，780,000 顶上来的余额差不算折�
 }
 
 /* ---------------------------------------------------------------- */
+console.log('\n[61] 大奖名册：只收大奖，带时间，跟着历史统计一起存');
+{
+    // 780,000 和 VIP 是奖池里仅有的两档大奖，中一次隔几千抽，
+    // 光靠只留 50 条的冒险日志根本回看不到
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+    const w = dom.window;
+
+    const texts = ['魔力 100 ', '魔力 780000 ', '魔力 1000 ', 'VIP 7 Day(s)'];
+    let i = 0;
+    w.fetch = async url => {
+        if (String(url).includes('lucky.php')) {
+            return { ok: true, status: 200, text: async () => '<html><body></body></html>' };
+        }
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({
+                ret: 0, data: { prize_text: texts[i++ % texts.length] }
+            })
+        };
+    };
+
+    await run(dom);
+    const d = w.document;
+    d.getElementById('lottery-interval').value = '0.5';
+    d.getElementById('max-lottery-count').value = '4';
+    d.getElementById('start-lottery').click();
+    await untilStopped(d, 30000);
+    await sleep(300);
+
+    const stats = JSON.parse(w.localStorage.getItem('hhanclub_lottery_stats_v4'));
+    check('名册进了历史统计，不是只活在内存里',
+        Array.isArray(stats.jackpots), JSON.stringify(stats.jackpots));
+    check('只收了 780,000 和 VIP 两笔', stats.jackpots.length === 2,
+        JSON.stringify(stats.jackpots.map(x => x.text)));
+    check('100 / 1,000 憨豆这种没混进来',
+        stats.jackpots.every(x => !/^魔力 (100|1000)\b/.test(x.text)),
+        JSON.stringify(stats.jackpots.map(x => x.text)));
+    check('每笔都带时间戳',
+        stats.jackpots.every(x => x.at > 0), JSON.stringify(stats.jackpots));
+    check('新的排在前面（VIP 是后中的）',
+        /VIP/.test(stats.jackpots[0].text), JSON.stringify(stats.jackpots.map(x => x.text)));
+
+    const rows = d.querySelectorAll('#jackpot-log .hh-jackpot-row');
+    check('面板上两行都渲染出来了', rows.length === 2, `实际 ${rows.length} 行`);
+    check('行里有时间', /\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(rows[0].textContent),
+        rows[0].textContent);
+    check('标题报了次数', d.getElementById('jackpot-count').textContent === '2 次',
+        d.getElementById('jackpot-count').textContent);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[62] 本次没中过大奖时，指一下历史里还存着');
+{
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+    const w = dom.window;
+
+    w.localStorage.setItem('hhanclub_lottery_stats_v4', JSON.stringify({
+        version: 4, draws: 5000, cost: 10000000,
+        gains: { beans: 0, magic: 0, invite: 0, rainbow: 0, vip: 0, makeup: 0, upload: 0, rename: 0 },
+        prizes: {}, raw: {},
+        jackpots: [{ at: 1787280000000, text: '魔力 780000' }]
+    }));
+
+    await run(dom);
+    const d = w.document;
+
+    check('本次视图下提示历史里有',
+        /历史里存着 1 次/.test(d.getElementById('jackpot-log').textContent),
+        d.getElementById('jackpot-log').textContent);
+
+    d.getElementById('view-mode').value = 'total';
+    d.getElementById('view-mode').dispatchEvent(new w.Event('change'));
+    await sleep(150);
+
+    check('切到历史总计就列出来了',
+        d.querySelectorAll('#jackpot-log .hh-jackpot-row').length === 1,
+        d.getElementById('jackpot-log').textContent);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[63] 全屏庆祝留够截图时间，点一下 / Esc 都能关掉');
+{
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+    const w = dom.window;
+
+    w.fetch = async url => {
+        if (String(url).includes('lucky.php')) {
+            return { ok: true, status: 200, text: async () => '<html><body></body></html>' };
+        }
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ret: 0, data: { prize_text: '魔力 780000 ' } })
+        };
+    };
+
+    await run(dom);
+    const d = w.document;
+    d.getElementById('lottery-interval').value = '0.5';
+    d.getElementById('max-lottery-count').value = '1';
+    d.getElementById('start-lottery').click();
+    await untilStopped(d, 20000);
+    await sleep(300);
+
+    const overlay = d.querySelector('.hh-jackpot-overlay');
+    check('大奖弹了全屏庆祝', !!overlay);
+    check('有关闭按钮', !!overlay.querySelector('.hh-jackpot-close'));
+    check('按钮上带倒计时秒数',
+        /\d+/.test(overlay.querySelector('.hh-jackpot-left').textContent),
+        overlay.querySelector('.hh-jackpot-close').textContent);
+    check('写明了抽奖没停',
+        /抽奖没停/.test(overlay.querySelector('.hh-jackpot-hint').textContent));
+
+    // 3 秒后还在 —— 老版本 3.2 秒就开始淡出了，截图根本来不及
+    await sleep(3000);
+    check('3 秒后还挂着，没有自己溜走',
+        !!d.querySelector('.hh-jackpot-overlay') && !d.querySelector('.hh-jackpot-overlay.is-out'));
+
+    // Esc 关掉
+    d.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Escape' }));
+    await sleep(50);
+    check('按 Esc 开始收起', d.querySelector('.hh-jackpot-overlay.is-out') !== null);
+
+    await sleep(800);
+    check('收起后节点也清掉了', d.querySelector('.hh-jackpot-overlay') === null);
+}
+
+/* ---------------------------------------------------------------- */
 console.log(`\n=========== ${passed} passed, ${failed} failed ===========\n`);
 process.exit(failed ? 1 : 0);

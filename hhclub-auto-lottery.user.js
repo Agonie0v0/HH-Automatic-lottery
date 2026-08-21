@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.28.0
+// @version      1.29.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 一抽到底 · 实时余额 · 站内信清理
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -97,6 +97,12 @@
         maxRateLimitRetries: 12,
         // 日志保留条数
         logLimit: 50,
+        // 大奖名册保留条数。大奖几千抽才碰一次，留久一点，
+        // 它跟着历史统计一起存，换会话、关页面都不丢
+        jackpotLogLimit: 100,
+        /* 大奖全屏庆祝停留多久。够截图是第一位的 —— 抽奖本身在后台
+           照跑，遮罩多留一会儿不耽误事。也可以随手点掉或按 Esc。 */
+        jackpotHoldMs: 15000,
         // 官方爆率低于这个值的奖品算大奖，走全屏庆祝。
         // 现奖池里够格的是 VIP（0.02%）和 780,000 憨豆（0.11%），
         // 邀请（0.38%）刚好不算 —— 大奖太廉价就不叫大奖了。
@@ -301,6 +307,8 @@
             gains: { beans: 0, magic: 0, invite: 0, rainbow: 0, vip: 0, makeup: 0, upload: 0, rename: 0 },
             prizes: {},
             raw: {},
+            // 大奖名册：[{ at, text }]，新的在前
+            jackpots: [],
             firstAt: null,
             lastAt: null
         };
@@ -337,6 +345,13 @@
         });
 
         stats.raw = { ...(data.raw || {}) };
+
+        // 老版本没有这个字段，读到就是空的，不影响其余统计
+        stats.jackpots = (Array.isArray(data.jackpots) ? data.jackpots : [])
+            .filter(item => item && item.text)
+            .map(item => ({ at: Number(item.at) || 0, text: String(item.text) }))
+            .slice(0, CONFIG.jackpotLogLimit);
+
         return stats;
     }
 
@@ -885,15 +900,23 @@
 
     function recordDraw(prizeText) {
         const prize = parsePrizeText(prizeText);
+        const jackpot = isJackpot(prize);
 
-        const apply = stats => applyPrize(stats, prizeText, singleCost, prize);
+        const apply = stats => {
+            applyPrize(stats, prizeText, singleCost, prize);
+            // 大奖顺手记进名册。和统计写在同一次提交里，
+            // 免得中间态里出现「统计有、名册没有」
+            if (jackpot) {
+                stats.jackpots.unshift({ at: Date.now(), text: String(prizeText).trim() });
+                stats.jackpots.length = Math.min(stats.jackpots.length, CONFIG.jackpotLogLimit);
+            }
+        };
 
         apply(currentStats);
         commitTotal(apply);
 
         render();
 
-        const jackpot = isJackpot(prize);
         if (jackpot) addLog(`👑 大奖！${prizeText}`, 'success');
         if (settings.animation) {
             if (jackpot) showJackpotAnimation(prizeText);
@@ -1484,6 +1507,44 @@
 }
 
 
+#lottery-control-panel .hh-jackpot-log {
+    max-height: 132px;
+    overflow-y: auto;
+    padding: 4px 6px;
+    border-radius: 10px;
+    background: linear-gradient(180deg, #fdf3e0, #faeeda);
+    border: 1px solid #e8d5bc;
+}
+#lottery-control-panel .hh-jackpot-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 4px 5px;
+    border-radius: 6px;
+}
+#lottery-control-panel .hh-jackpot-row + .hh-jackpot-row {
+    border-top: 1px dashed rgba(200, 170, 130, .45);
+}
+#lottery-control-panel .hh-jackpot-row b {
+    font-size: 11px;
+    font-weight: 800;
+    color: #b26a12;
+    white-space: nowrap;
+}
+#lottery-control-panel .hh-jackpot-when {
+    font-family: "SF Mono", "Menlo", "Consolas", monospace;
+    font-size: 9px;
+    color: #a08066;
+    white-space: nowrap;
+}
+#lottery-control-panel .hh-jackpot-empty {
+    padding: 10px 6px;
+    text-align: center;
+    font-size: 9px;
+    color: #a08066;
+}
+
 /* ===== 中奖弹窗 ===== */
 .hh-win-overlay {
     position: fixed;
@@ -1707,7 +1768,9 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    pointer-events: none;
+    /* 要能点掉，所以不能整块 pointer-events: none。
+       抽奖在后台照跑，遮罩挡着的只是视线。 */
+    cursor: pointer;
     background: radial-gradient(ellipse at center, rgba(70, 40, 10, .55) 0%, rgba(10, 6, 2, .82) 70%);
     animation: hhJackpotFade .45s ease-out;
 }
@@ -1755,6 +1818,34 @@
     font-size: clamp(11px, 2.4vw, 15px);
     font-weight: 600;
     color: rgba(255, 233, 180, .8);
+}
+.hh-jackpot-when {
+    margin-top: 6px;
+    font-family: "SF Mono", "Menlo", "Consolas", monospace;
+    font-size: clamp(10px, 1.8vw, 12px);
+    color: rgba(255, 233, 180, .55);
+}
+.hh-jackpot-close {
+    margin-top: 22px;
+    padding: 9px 26px;
+    border: 1px solid rgba(255, 214, 110, .55);
+    border-radius: 999px;
+    background: rgba(255, 214, 110, .12);
+    color: #ffe9a8;
+    font-family: inherit;
+    font-size: clamp(11px, 2vw, 14px);
+    font-weight: 700;
+    cursor: pointer;
+    transition: background .18s, transform .18s;
+}
+.hh-jackpot-close:hover {
+    background: rgba(255, 214, 110, .26);
+    transform: translateY(-1px);
+}
+.hh-jackpot-hint {
+    margin-top: 10px;
+    font-size: clamp(9px, 1.6vw, 11px);
+    color: rgba(255, 233, 180, .45);
 }
 .hh-firework {
     position: fixed;
@@ -2049,12 +2140,21 @@
             </div>
 
             <!-- Log -->
-            <div class="hh-section" style="margin-bottom:0;">
+            <div class="hh-section">
                 <div class="hh-section-title">
                     <div>📜 冒险日志</div>
                     <span>最近 ${CONFIG.logLimit} 条</span>
                 </div>
                 <div id="lottery-log" class="hh-log"></div>
+            </div>
+
+            <!-- Jackpot Log -->
+            <div class="hh-section" style="margin-bottom:0;">
+                <div class="hh-section-title">
+                    <div>👑 大奖名册</div>
+                    <span id="jackpot-count">-</span>
+                </div>
+                <div id="jackpot-log" class="hh-jackpot-log"></div>
             </div>
 
         `;
@@ -2339,6 +2439,44 @@
 
         renderProfit(stats);
         renderPrizeDetail(stats);
+        renderJackpotLog(stats);
+    }
+
+    /* 中奖时刻。跨天的记录光有时分看不出是哪天，所以带上月日。 */
+    function whenText(at) {
+        if (!at) return '';
+        const date = new Date(at);
+        const pad = value => String(value).padStart(2, '0');
+        return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
+            + `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+    }
+
+    /* 大奖名册：几千抽才碰一次的那几笔，单独列出来好回看。
+       跟着历史统计一起存，关页面、换会话都还在。 */
+    function renderJackpotLog(stats) {
+        const list = $('jackpot-log');
+        if (!list) return;
+
+        const rows = stats.jackpots || [];
+        setText('jackpot-count', rows.length ? `${fmt(rows.length)} 次` : '还没有');
+
+        if (!rows.length) {
+            // 大奖几千抽才碰一次，本次会话空着是常态 —— 与其干说「没有」，
+            // 不如指一下历史里其实还存着
+            const archived = (totalStats.jackpots || []).length;
+            const hint = settings.viewMode !== 'total' && archived
+                ? `本次还没中过 · 历史里存着 ${fmt(archived)} 次，切到「历史总计」看`
+                : '还没中过大奖 · 中了会连时间一起记在这里，换会话也不丢';
+            list.innerHTML = `<div class="hh-jackpot-empty">${hint}</div>`;
+            return;
+        }
+
+        list.innerHTML = rows.map(item =>
+            `<div class="hh-jackpot-row">`
+            + `<b>👑 ${escapeHtml(item.text)}</b>`
+            + `<span class="hh-jackpot-when">${escapeHtml(whenText(item.at))}</span>`
+            + `</div>`
+        ).join('');
     }
 
     /* 憨豆盈亏。奖池里 type 1001 就是憨豆，所以这个数字是实打实的：
@@ -2505,6 +2643,7 @@
 
         document.querySelectorAll('.hh-jackpot-overlay').forEach(node => node.remove());
 
+        const seconds = Math.round(CONFIG.jackpotHoldMs / 1000);
         const overlay = document.createElement('div');
         overlay.className = 'hh-jackpot-overlay';
         overlay.innerHTML = `
@@ -2513,14 +2652,43 @@
                 <div class="hh-jackpot-kicker">✨ 大 奖 ✨</div>
                 <div class="hh-jackpot-prize">${escapeHtml(prizeText)}</div>
                 <div class="hh-jackpot-sub">这一注值得截图</div>
+                <div class="hh-jackpot-when">${escapeHtml(whenText(Date.now()))}</div>
+                <button type="button" class="hh-jackpot-close">
+                    截好了，关掉（<span class="hh-jackpot-left">${seconds}</span>s）
+                </button>
+                <div class="hh-jackpot-hint">点任意处或按 Esc 也能关 · 抽奖没停，在后台照跑</div>
             </div>
         `;
 
         document.body.appendChild(overlay);
         createFireworks();
 
-        setTimeout(() => overlay.classList.add('is-out'), 3200);
-        setTimeout(() => overlay.remove(), 3800);
+        // 一个出口收口所有关闭方式，免得计时器和点击各关各的、
+        // 或者关过之后计时器又来动一次已经没了的节点
+        let closed = false;
+        const close = () => {
+            if (closed) return;
+            closed = true;
+            clearInterval(ticking);
+            document.removeEventListener('keydown', onKey);
+            overlay.classList.add('is-out');
+            setTimeout(() => overlay.remove(), 600);
+        };
+
+        const onKey = event => {
+            if (event.key === 'Escape') close();
+        };
+
+        const left = overlay.querySelector('.hh-jackpot-left');
+        let remain = seconds;
+        const ticking = setInterval(() => {
+            remain -= 1;
+            if (left) left.textContent = Math.max(0, remain);
+            if (remain <= 0) close();
+        }, 1000);
+
+        overlay.addEventListener('click', close);
+        document.addEventListener('keydown', onKey);
     }
 
     /* 从屏幕左右下角各打一束，比普通粒子更密、更慢、带重力感 */
@@ -3053,6 +3221,19 @@
         Object.entries(other.raw).forEach(([text, count]) => {
             result.raw[text] = (result.raw[text] || 0) + count;
         });
+
+        // 名册按时间倒序合并；同一条记录（时刻 + 文案都一样）只留一份，
+        // 免得同一份备份导入两次就多出一堆重影
+        const seen = new Set();
+        result.jackpots = [...result.jackpots, ...other.jackpots]
+            .filter(item => {
+                const key = `${item.at}|${item.text}`;
+                if (seen.has(key)) return false;
+                seen.add(key);
+                return true;
+            })
+            .sort((a, b) => b.at - a.at)
+            .slice(0, CONFIG.jackpotLogLimit);
 
         const firsts = [base?.firstAt, extra?.firstAt].filter(Boolean);
         if (firsts.length) result.firstAt = Math.min(...firsts);
