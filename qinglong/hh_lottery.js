@@ -197,6 +197,8 @@ function writeConfigTemplate() {
         '//': '配置放这里，更新脚本时不会被覆盖。各项含义见 qinglong/README.md',
         ...CONFIG
     };
+    // 已经有了就别动，免得把用户改过的覆盖回去
+    if (fs.existsSync(file)) return '';
 
     try {
         fs.writeFileSync(file, JSON.stringify(template, null, 4));
@@ -1261,7 +1263,18 @@ async function main() {
     }
 
     log('🎡 HHCLUB 幸运大转盘');
-    if (configFile) log(`⚙️ 配置来自 ${configFile}`);
+    if (configFile) {
+        log(`⚙️ 配置来自 ${configFile}`);
+    } else {
+        // 老用户的设置是直接写在脚本里的，更新脚本（ql raw / curl 覆盖）
+        // 就全丢了。头一次跑先把当前生效的设置固化成配置文件 ——
+        // 之后再覆盖脚本，设置照样在。
+        const created = writeConfigTemplate();
+        if (created) {
+            log(`📝 已把当前设置存成 ${created}`);
+            log('   以后更新脚本直接覆盖就行，设置不会丢；要改设置改这个文件');
+        }
+    }
     log(CONFIG.draws > 0
         ? `   抽 ${CONFIG.draws} 次 · 间隔 ${intervalText(CONFIG.interval)} 秒`
         : `   一抽到底 · 保留 ${fmt(CONFIG.reserve)} 憨豆 · 间隔 ${intervalText(CONFIG.interval)} 秒`);
