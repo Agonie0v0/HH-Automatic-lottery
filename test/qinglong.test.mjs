@@ -1420,6 +1420,71 @@ console.log('\n[48] 自己在配置里填了 TG 才直连');
 }
 
 /* ---------------------------------------------------------------- */
+console.log('\n[49] 同目录的 sendNotify.js 依赖缺失时要跳过，不能就此放弃');
+{
+    // 实机上踩到的：/ql/data/scripts/sendNotify.js 是别的脚本留下的残骸，
+    // require 直接抛 Cannot find module 'got'。当时那是候选列表的第一项，
+    // 抛了之后没有别的能用，通知就静默没了。
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
+    const hook = await startWebhook();
+
+    const { dir, file } = installScript(
+        { host: site.state.origin, draws: 1, webhookUrl: hook.url },
+        null,
+        { 'sendNotify.js': "require('这个模块根本不存在');\nmodule.exports = {};\n" }
+    );
+
+    const { out } = await runFile(file, dir);
+
+    check('没有因为它抛异常就崩',
+        /本次：1 抽/.test(out) && !/Cannot find module/.test(out.split('───')[0]),
+        out.slice(-400));
+    check('Webhook 照常送达', hook.got.length === 1, `实际 ${hook.got.length} 条`);
+    check('日志里报了 Webhook', /Webhook ✓/.test(out), out.slice(-400));
+
+    await hook.close();
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[50] 青龙注入的 QLAPI.systemNotify 能兜底');
+{
+    // 新版青龙把通知能力挂在全局 QLAPI 上。没有任何 sendNotify 模块时
+    // 应该退到这条路 —— 用 --require 预加载一个假的 QLAPI 来模拟。
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
+
+    const preload = path.join(TMP, 'fake-qlapi.cjs');
+    const marker = path.join(TMP, 'qlapi-called.txt');
+    fs.writeFileSync(preload, `
+        const fs = require('fs');
+        globalThis.QLAPI = {
+            systemNotify: async ({ title, content }) => {
+                fs.writeFileSync(${JSON.stringify(marker)}, title + '\\n' + content.slice(0, 80));
+                return true;
+            }
+        };
+    `);
+
+    const { dir, file } = installScript({ host: site.state.origin, draws: 1 });
+
+    const out = await new Promise(resolve => {
+        const child = spawn(process.execPath, ['-r', preload, file], { cwd: ROOT });
+        let text = '';
+        child.stdout.on('data', d => { text += d; });
+        child.stderr.on('data', d => { text += d; });
+        child.on('close', () => resolve(text));
+    });
+
+    check('走到了 QLAPI 这条路', fs.existsSync(marker), '没被调用');
+    check('标题传对了',
+        fs.existsSync(marker) && fs.readFileSync(marker, 'utf8').startsWith('🎡 HHCLUB 幸运大转盘'),
+        fs.existsSync(marker) ? fs.readFileSync(marker, 'utf8').slice(0, 60) : '');
+    check('不再说没有可用渠道', !/没有可用的通知渠道/.test(out), out.slice(-300));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
 fs.rmSync(TMP, { recursive: true, force: true });
 
 console.log(`\n=========== ${passed} passed, ${failed} failed ===========\n`);

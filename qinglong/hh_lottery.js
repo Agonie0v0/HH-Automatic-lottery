@@ -1063,6 +1063,10 @@ class Lottery {
 /* sendNotify 在不同青龙版本 / 不同装法下位置差挺多，挨个试。
    自己下下来在 Debian 上跑的话一个都找不到，那就走 Telegram 兜底。 */
 const NOTIFY_PATHS = [
+    // 新版青龙自己 preload 进来的通知模块，签名是 sendNotify(text, desp)。
+    // 放第一个：/ql/data/scripts 下经常躺着别的脚本留下的 sendNotify.js，
+    // 依赖没装的话 require 会直接抛（实机上就是 Cannot find module 'got'）
+    '/ql/shell/preload/__ql_notify__.js',
     path.join(__dirname, 'sendNotify.js'),
     path.join(__dirname, 'sendNotify'),
     path.join(__dirname, '..', 'sendNotify.js'),
@@ -1084,9 +1088,16 @@ function loadNotifyModule() {
             const send = sender?.sendNotify || sender;
             if (typeof send === 'function') return send;
         } catch (error) {
-            // 这个路径没有就换下一个
+            // 这个路径没有、或者它自己的依赖缺了，换下一个
         }
     }
+
+    // 都不行的话看看青龙注入的全局 API
+    const api = globalThis.QLAPI;
+    if (api && typeof api.systemNotify === 'function') {
+        return (title, content) => api.systemNotify({ title, content });
+    }
+
     return null;
 }
 
