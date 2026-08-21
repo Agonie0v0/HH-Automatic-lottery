@@ -11,7 +11,7 @@
     "statsFile": "hh_lottery_stats.json",
     "notifyBigPrize": true,
     "bigPrizeMinBeans": 780000,
-    "notifyPeriodic": true,
+    "notifyPeriodic": false,
     "periodicMinutes": 30,
     "tgBotToken": "",
     "tgUserId": "",

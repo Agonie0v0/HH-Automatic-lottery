@@ -1897,6 +1897,37 @@ console.log('\n[61] 提示不能只留在日志里：VIP 折算说明要进通�
     await hook.close();
     await site.close();
 }
+console.log('\n[62] 定时战报默认关着：配置里没写就不推');
+{
+    const site = await startSite({
+        prizes: ['魔力 100 ', '补签卡 1 '],
+        balance: 100000
+    });
+    const hook = await startWebhook();
+
+    // notifyPeriodic 传 undefined，JSON.stringify 会把它整个丢掉 ——
+    // 模拟配置区里压根没有这一项，走的就是脚本默认值
+    const { dir, file } = installScript({
+        host: site.state.origin,
+        draws: 2,
+        notifyPeriodic: undefined,
+        periodicMinutes: 0.00001,
+        webhookUrl: hook.url
+    });
+
+    await runFile(file, dir);
+
+    check('没写就是不开，一条定时战报都没有',
+        !hook.got.some(item => /定时战报/.test(item.title || '')),
+        hook.got.map(i => i.title).join(' | '));
+    check('收尾那条照旧推', hook.got.length === 1, hook.got.map(i => i.title).join(' | '));
+
+    await hook.close();
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+
 
 /* ---------------------------------------------------------------- */
 fs.rmSync(TMP, { recursive: true, force: true });

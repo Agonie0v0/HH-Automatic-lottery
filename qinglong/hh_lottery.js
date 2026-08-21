@@ -73,13 +73,13 @@ const CONFIG = {
     /* ⑪ 多少憨豆算大奖。填 0 就只有 VIP 才推 */
     bigPrizeMinBeans: 780000,
 
-    /* ⑫ 定时播报战报（分钟）。
-          一抽到底或长跑时，每隔指定分钟推送一次增量战报。
-          填 0 为关闭定时播报。
+    /* ⑫ 定时播报战报。默认关着 —— 跑一轮就推一条收尾通知已经够用了，
+          想要中途也播报再打开。开了之后每隔 periodicMinutes 分钟推一次
+          增量战报，间隔填 0 也是关。
 
           注意别填得比 maxMinutes 还大 —— 一轮都跑完了还没到播报点，
           等于白开 */
-    notifyPeriodic: true,
+    notifyPeriodic: false,
     periodicMinutes: 30,
 
     /* ⑬ Telegram 直推（可选）。手动停止时优先走它 —— 路径短，
@@ -190,7 +190,9 @@ function normalizeConfig() {
     CONFIG.cleanMail = CONFIG.cleanMail === true;
     CONFIG.notifyBigPrize = CONFIG.notifyBigPrize !== false;
     CONFIG.bigPrizeMinBeans = int(CONFIG.bigPrizeMinBeans, 780000, 0);
-    CONFIG.notifyPeriodic = CONFIG.notifyPeriodic !== false;
+    // 这个是默认关的，得显式打开 —— 和 notifyBigPrize 那种默认开的不一样，
+    // 别照着抄成 !== false
+    CONFIG.notifyPeriodic = CONFIG.notifyPeriodic === true;
     CONFIG.periodicMinutes = float(CONFIG.periodicMinutes, 30, 0);
     if (CONFIG.periodicMinutes <= 0) CONFIG.notifyPeriodic = false;
     // 播报间隔不小于单次运行上限的话，一轮跑完都轮不到播报一次 ——

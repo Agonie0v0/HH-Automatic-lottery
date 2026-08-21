@@ -118,7 +118,7 @@ const CONFIG = {
 
     notifyBigPrize: true,      // ⑩ 中了大奖当场推一条
     bigPrizeMinBeans: 780000,  // ⑪ 多少憨豆算大奖，填 0 就只有 VIP 才推
-    notifyPeriodic: true,      // ⑫ 定时播报战报
+    notifyPeriodic: false,     // ⑫ 定时播报战报，默认关
     periodicMinutes: 30,       // ⑬ 定时战报推送间隔（分钟），0 = 关闭
 
     tgBotToken: '',            // ⑭ Telegram 直推，青龙里配过 TG 就别填
@@ -145,7 +145,7 @@ const CONFIG = {
 | `statsFile` | `hh_lottery_stats.json` | 统计存到哪个文件，相对路径按脚本所在目录算。留空 `''` 就是不记 |
 | `notifyBigPrize` | `true` | 中了大奖（VIP，或单笔憨豆到下面的门槛）当场推一条，不用等跑完 |
 | `bigPrizeMinBeans` | `780000` | 多少憨豆算大奖。填 `0` 就只有 VIP 才推 |
-| `notifyPeriodic` | `true` | 定时推送战报。挂机或一抽到底时定期播报增量与历史明细。**升级上来的老用户会被自动补上这一项并默认开启**，不想要就在配置文件里改成 `false` |
+| `notifyPeriodic` | `false` | 定时推送战报。**默认关着** —— 跑一轮推一条收尾通知已经够用，挂机长跑想中途也收到播报再改成 `true` |
 | `periodicMinutes` | `30` | 定时战报推送间隔（分钟）。填 `0` 为关闭定时播报。别填得比 `maxMinutes` 还大 —— 一轮跑完都没到播报点，等于白开，脚本启动时会提醒你 |
 | `tgBotToken` / `tgUserId` | 空 | Telegram 直推。**青龙里已经配过 TG 推送的话别填**，青龙的 `sendNotify` 会推一条，这里再推就是重复。只认填在这儿的值，不读青龙的环境变量 |
 | `tgApiHost` | `api.telegram.org` | TG API 域名，走反代才需要改 |
