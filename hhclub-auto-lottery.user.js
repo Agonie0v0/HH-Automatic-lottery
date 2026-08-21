@@ -1807,7 +1807,7 @@
                 <div class="hh-drain">
                     <label class="hh-drain-toggle">
                         <input type="checkbox" id="follow-duration">
-                        <span>⏱ 跟随转盘时长</span>
+                        <span>⚡ 自适应延迟</span>
                     </label>
                     <div class="hh-drain-reserve">
                         <span>缓冲</span>
@@ -1820,7 +1820,7 @@
                     转盘转多久就等多久，自动排队。缓冲越小抽得越快（可为负），被挡回也不扣憨豆
                 </div>
                 <div class="hh-drain" style="justify-content:flex-end;">
-                    <span id="duration-info" class="hh-duration-info">等站点报第一个转盘时长</span>
+                    <span id="duration-info" class="hh-duration-info">等第一抽后自动调节</span>
                 </div>
 
                 <div class="hh-drain">
@@ -2591,7 +2591,7 @@
         if (!info) return;
         info.textContent = lastDurationMs
             ? `上一抽转盘 ${intervalText(lastDurationMs / 1000)}s · 本次等 ${intervalText(plannedGapMs() / 1000)}s`
-            : '等站点报第一个转盘时长';
+            : '等第一抽后自动调节';
     }
 
     function setCurrentIntervalDisplay() {
