@@ -120,8 +120,13 @@ const RUNTIME = {
     blindRetryMs: 1000,
     // 读不到站点公布的折算金额时用这个兜底
     vipSwapFallbackBeans: 1000000,
-    // 查不到等级时才用余额差兜底判断。容差收得比较紧 ——
-    // 松了的话别人赠送一笔魔力就可能被误判成折算
+    /* 判定折算的主证据是余额：站点真发了那笔憨豆，账面必然多出接近
+       这个数；发的是天数，账面只有做种那点零头。要求至少多出公布金额
+       的这个比例才算折算。 */
+    vipSwapMinDriftRatio: 0.5,
+    /* 等级读不到时光有「多了一大笔」还不够 —— 奖池里有 780,000 那一档，
+       它一出就能把余额差顶过上面那个门槛。这种情况要求余额变动落在
+       公布金额附近的窄带里，宁可漏记也不乱记 */
     vipSwapTolerance: 20000,
     // 站内信一次提交多少个 id
     mailChunk: 100,
@@ -435,16 +440,61 @@ function parseVipSwapBeansFrom(html) {
     return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
-/* 「VIP 或以上等级」说的是 NexusPHP 的 class。站点可以把等级名字改得
-   面目全非（本站叫「俺不中类」），但等级图标用的还是标准文件名，
-   所以按图标判。只要判出 class ≥ VIP，折算与否就是确定的事实，
-   不用再去猜余额 —— 别人赠送魔力、做种收益统统影响不到。 */
+/* 「VIP 或以上等级」说的是 NexusPHP 的 class 序号。站点可以把等级名字
+   改得面目全非（本站发布员叫「俺不中类」），但内核生成的东西没改：
+
+       <img alt="发布员" src="pic/uploader.gif" />
+       <span class='Uploader_Name font-bold'>俺不中类</span>
+
+   CSS 类名是 {ClassName}_Name，比图标文件名可靠 —— 图标是站点资源，
+   随时能换皮，类名是内核按 class 序号拼出来的。两个都收，类名优先。
+
+   键统一小写。同一等级两种写法都列（图标 veteran / 类名 veteranuser），
+   免得站点哪边改了就整个判不出来。
+
+   序号照 NexusPHP 的 UC_* 常量。peasant 是 0 —— H&R 不达标被降级的
+   农民，挂机刷抽奖的号最容易掉进去。线上就是因为表里没有它，
+   等级判定退化成靠余额猜，给一个非 VIP 的号凭空记了一百万。 */
 const CLASS_RANK = {
-    user: 1, power: 2, elite: 3, crazy: 4, insane: 5, veteran: 6,
-    extreme: 7, ultimate: 8, nexusmaster: 9, vip: 10, retiree: 11,
-    uploader: 12, moderator: 13, coadministrator: 14,
-    administrator: 15, sysop: 16, staffleader: 17
+    peasant: 0,
+    user: 1,
+    power: 2, poweruser: 2,
+    elite: 3, eliteuser: 3,
+    crazy: 4, crazyuser: 4,
+    insane: 5, insaneuser: 5,
+    veteran: 6, veteranuser: 6,
+    extreme: 7, extremeuser: 7,
+    ultimate: 8, ultimateuser: 8,
+    nexusmaster: 9,
+    vip: 10,
+    retiree: 11,
+    uploader: 12,
+    moderator: 13,
+    coadministrator: 14, administrator: 14,
+    sysop: 15,
+    staffleader: 16
 };
+
+/* 从个人页里读出 class 序号。读不出返回 null。 */
+function parseClassRank(html) {
+    // 先把范围收到「等级：」那一段，免得页面别处的图标混进来
+    const at = html.search(/等级\s*[：:]/);
+    const scope = at >= 0 ? html.slice(at, at + 400) : html;
+
+    const candidates = [];
+    const byClass = scope.match(/class=['"][^'"]*?\b([A-Za-z]+)_Name\b/);
+    if (byClass) candidates.push(byClass[1]);
+
+    const byIcon = scope.match(/pic\/(\w+)\.(?:gif|png|svg|webp)/i);
+    if (byIcon) candidates.push(byIcon[1]);
+
+    for (const name of candidates) {
+        const rank = CLASS_RANK[name.toLowerCase()];
+        // 农民是 0，不能用真假判断，否则等于没读到
+        if (rank !== undefined) return rank;
+    }
+    return null;
+}
 
 /* =========================================================
    统计
@@ -709,18 +759,33 @@ class Lottery {
 
     /* 抽奖页写着：「当中奖 [VIP] 时，如果用户已经是 VIP 或以上等级，
        奖励憨豆：1000000」。接口返回的文案还是 VIP，替换是发奖时做的。
-       所以中到 VIP 就回服务端核一次余额，真多出一大笔就改记成憨豆。
+       所以中到 VIP 就回服务端核一次余额。
 
-       不用去猜用户是不是 VIP —— 余额说了算。而且要是哪天 prize_text
-       本身就返回「魔力 1000000」，那笔憨豆已经记进去了、估算和实际对得上，
-       这里不会重复计。 */
+       定性只认余额，等级仅作佐证。等级这条线太脆：usercp 上第一个
+       userdetails 链接未必是自己，「等级」二字也可能先出现在别处，
+       一旦认错行就会凭空记出一百万 —— 线上真发生过：一个不是 VIP 的
+       号只中过一次 VIP，账面一分没多，却被记成了折算。
+
+       余额则是硬事实。要是哪天 prize_text 本身就返回「魔力 1000000」，
+       那笔憨豆已经记进去了、估算和实际对得上，这里也不会重复计。 */
     readVipSwapBeans() {
         return this.vipSwapBeans || RUNTIME.vipSwapFallbackBeans;
     }
 
+    /* 取自己的 user id。不能抓页面上第一个 userdetails 链接就走 ——
+       站内信发件人、邀请列表里全是别人的链接，抓错了就会拿别人的等级
+       当自己的。优先认链接里紧跟着 <b> 或 {Class}_Name 的那个（NexusPHP
+       就是这么渲染本人用户名的），实在认不出才退回全页唯一的那个 id。 */
     async fetchSelfUserId() {
-        const match = (await this.get('/usercp.php')).match(/userdetails\.php\?id=(\d+)/);
-        return match ? match[1] : null;
+        const html = await this.get('/usercp.php');
+
+        const owner = html.match(/userdetails\.php\?id=(\d+)[^>]*>\s*(?:<b>|<span[^>]*_Name)/i);
+        if (owner) return owner[1];
+
+        const ids = [...new Set(
+            [...html.matchAll(/userdetails\.php\?id=(\d+)/g)].map(m => m[1])
+        )];
+        return ids.length === 1 ? ids[0] : null;
     }
 
     /* 查一次就记住。读不到返回 null —— 「没查出来」和「不是 VIP」
@@ -732,12 +797,8 @@ class Lottery {
             const id = await this.fetchSelfUserId();
             if (!id) return null;
 
-            const html = await this.get(`/userdetails.php?id=${id}`);
-            const match = html.match(/等级[：:][\s\S]{0,300}?pic\/(\w+)\.(?:gif|png|svg|webp)/i);
-            if (!match) return null;
-
-            const rank = CLASS_RANK[match[1].toLowerCase()];
-            if (!rank) return null;
+            const rank = parseClassRank(await this.get(`/userdetails.php?id=${id}`));
+            if (rank === null) return null;
 
             this.vipOrAbove = rank >= CLASS_RANK.vip;
             // 只在真查出来时才记住。查失败（网络抖一下、502）就别记 ——
@@ -765,21 +826,31 @@ class Lottery {
         this.balance = actual;
 
         const beans = this.readVipSwapBeans();
-
-        // 先按等级判 —— 这是确定的事实，不受赠送魔力 / 做种收益干扰
         const eligible = await this.checkVipOrAbove();
 
-        if (eligible === false) return;                 // 不是 VIP，真拿到了天数
-        if (eligible === null) {
-            // 等级读不到才退回余额差，而且要求落在公布金额附近的窄带里。
-            // 放宽的话，抽奖期间有人赠送一笔魔力就会被误判成折算。
-            if (Math.abs(drift - beans) > RUNTIME.vipSwapTolerance) {
-                if (drift > RUNTIME.vipSwapTolerance) {
-                    report(`⚠️ 中了 VIP 且余额变动 ${drift > 0 ? '+' : ''}${fmt(Math.round(drift))}，`
-                        + '但读不到你的等级，无法确认是否折算 —— 这一注按 VIP 记');
-                }
-                return;
+        // 账面没多出那笔钱，就是真拿到了天数 —— 不管等级看着像什么
+        if (drift < beans * RUNTIME.vipSwapMinDriftRatio) {
+            if (eligible === true) {
+                report(`ℹ️ 中了 VIP，你的等级也够折算，但账面只变动 `
+                    + `${drift > 0 ? '+' : ''}${fmt(Math.round(drift))} —— 站点发的是天数，按 VIP 记`);
             }
+            return;
+        }
+
+        // 钱到账了，但等级明确不够 —— 这笔多出来的多半来自别处（赠送、
+        // 别的实例在抽）。宁可少记也不能凭空造一个一百万的档位。
+        if (eligible === false) {
+            report(`⚠️ 中了 VIP 后余额多出 ${fmt(Math.round(drift))}，但你的等级不到 VIP，`
+                + '不符合折算条件 —— 这一注按 VIP 记，多出的钱另有来源');
+            return;
+        }
+
+        // 等级读不到：光有「多了一大笔」不作数。同期中一发 780,000
+        // 就能顶过门槛，必须贴着公布金额才敢认。
+        if (eligible === null && Math.abs(drift - beans) > RUNTIME.vipSwapTolerance) {
+            report(`⚠️ 中了 VIP 且余额多出 ${fmt(Math.round(drift))}，但读不到你的等级、`
+                + `数额也对不上公布的 ${fmt(beans)} —— 这一注按 VIP 记`);
+            return;
         }
 
         // 金额一律按站点公布的来。drift 里混着做种收益、赠送、别的标签页的

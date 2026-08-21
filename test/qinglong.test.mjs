@@ -48,10 +48,15 @@ const luckyPage = (balance, cost = 2000, swapBeans = 0) => `<!doctype html><html
     <script>let prizes = [{"type":1001,"typeText":"\\u9b54\\u529b","amountText":"100 ","priority":99}];</script>
 </body></html>`;
 
-/* 等级是按图标文件名判的 —— 站点能把等级名字改得面目全非，图标名不变 */
-const userDetailsPage = klass => `<html><body>
-    <table><tr><td class="rowhead">等级：</td>
-    <td class="rowfollow"><img class="rank" src="pic/${klass}.gif" alt="${klass}"></td></tr></table>
+/* 照抄线上的结构：图标带中文名，用户名那个 span 的 class 是内核生成的
+   {ClassName}_Name。站点把显示名改成了「俺不中类」，类名没动。
+   className 传 null 就只留图标，用来验证图标兜底那条路。 */
+const userDetailsPage = (klass, className = null) => `<html><body>
+    <table><tr><td class="rowhead"><span class="font-bold">等级：</span></td>
+    <td class="rowfollow"><span class='flex items-end'>
+        <img class="rank" src="pic/${klass}.gif" alt="${klass}">
+        ${className === null ? '' : `<span class='${className}_Name font-bold'>俺不中类</span>`}
+    </span></td></tr></table>
 </body></html>`;
 
 const userCpPage = uid => `<html><body>
@@ -764,26 +769,80 @@ console.log('\n[22] 按等级判：普通用户中真 VIP，同时收到大额�
 }
 
 /* ---------------------------------------------------------------- */
-console.log('\n[23] 等级说是 VIP 就是 VIP，不用等余额对上');
+console.log('\n[23] 等级够 VIP 但钱没到账：不能记成折算');
 {
-    // 余额一点没变（读数滞后 / 别的标签页同时在花），
-    // 按等级判照样能定，不再依赖余额差
+    // 线上事故：一个非 VIP 的号账面一分没多，却被记了一百万 ——
+    // 旧逻辑「等级说是就是」，整条路径不看余额。等级那条线本来就脆，
+    // 必须由余额定性。
     const site = await startSite({
         prizes: ['VIP 7 Day(s)'],
         balance: 500000,
         swapBeans: 1000000,
-        userClass: 'uploader'      // 比 VIP 还高的等级，也该算
+        userClass: 'uploader'          // 等级够，但站点没发那笔钱
     });
     const statsFile = path.join(TMP, 'stats-class.json');
 
     const { out } = await runScript({ host: site.state.origin, draws: 1, statsFile });
     const t = JSON.parse(fs.readFileSync(statsFile, 'utf8')).total;
 
-    check('余额没变也认定为折算', /站点改发了 1,000,000 憨豆/.test(out), out.slice(-700));
+    check('不认定为折算', !/站点改发/.test(out), out.slice(-700));
+    check('没有凭空记出一百万', t.gains.beans === 0, `实际 ${t.gains.beans}`);
+    check('照实记 7 天 VIP',
+        t.gains.vip === 7 && Object.keys(t.prizes.vip.tiers).join() === '7 天',
+        JSON.stringify(t.prizes.vip));
+    check('日志说明等级够但账面没动',
+        /站点发的是天数/.test(out), out.slice(-700));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[23b] 等级够 VIP 且钱到账了，才记折算');
+{
+    const site = await startSite({
+        prizes: ['VIP 7 Day(s)'],
+        balance: 500000,
+        swapBeans: 1000000,
+        userClass: 'uploader',                            // 比 VIP 还高，也该算
+        onDraw: state => { state.balance += 1000000; }
+    });
+    const statsFile = path.join(TMP, 'stats-class-paid.json');
+
+    const { out } = await runScript({ host: site.state.origin, draws: 1, statsFile });
+    const t = JSON.parse(fs.readFileSync(statsFile, 'utf8')).total;
+
+    check('认定为折算', /站点改发了 1,000,000 憨豆/.test(out), out.slice(-700));
     check('VIP 以上的等级同样算', t.prizes.vip.swappedBeans === 1000000,
         JSON.stringify(t.prizes.vip));
     check('查等级只查一次，不是每抽都查',
         (site.state.classPageHits || 0) === 1, `实际 ${site.state.classPageHits} 次`);
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[23c] 农民（class 0）要判成「不是 VIP」，不是「读不到」');
+{
+    // 事故的另一半：等级表里没有 peasant，而且 `if (!rank)` 连 0 都
+    // 当成读不到，一退化就只能靠余额猜。奖池里那发 780,000 一出来，
+    // 就足够把非 VIP 的号顶成折算。
+    // H&R 不达标被降级的农民，恰恰是挂机刷抽奖最容易掉进去的等级。
+    const site = await startSite({
+        prizes: ['VIP 7 Day(s)'],
+        balance: 500000,
+        swapBeans: 1000000,
+        userClass: 'peasant',
+        onDraw: state => { state.balance += 780000; }     // 同期中了一发 780,000
+    });
+    const statsFile = path.join(TMP, 'stats-peasant.json');
+
+    const { out } = await runScript({ host: site.state.origin, draws: 1, statsFile });
+    const t = JSON.parse(fs.readFileSync(statsFile, 'utf8')).total;
+
+    check('照实记 7 天 VIP', t.gains.vip === 7, `实际 ${t.gains.vip}`);
+    check('没把 780,000 顶成折算', t.gains.beans === 0, `实际 ${t.gains.beans}`);
+    check('日志点明等级不符合折算条件',
+        /不符合折算条件/.test(out), out.slice(-700));
 
     await site.close();
 }
@@ -805,8 +864,8 @@ console.log('\n[24] 等级读不到、余额差又对不上：按 VIP 记并说�
 
     check('不瞎猜，按 VIP 记', t.gains.vip === 7 && t.gains.beans === 0,
         `vip=${t.gains.vip} beans=${t.gains.beans}`);
-    check('明说读不到等级、无法确认',
-        /读不到你的等级，无法确认是否折算/.test(out), out.slice(-700));
+    check('明说读不到等级、数额也对不上',
+        /读不到你的等级、数额也对不上公布的/.test(out), out.slice(-700));
 
     await site.close();
 }
@@ -1035,14 +1094,15 @@ if (process.platform === 'win32') {
 /* ---------------------------------------------------------------- */
 console.log('\n[33] 等级查失败只是这一次失败，下次还得再查');
 {
-    // 第一次查等级 502，第二次通。两注都不带余额变化 ——
-    // 所以只有「真查到等级」才可能折算，正好分得出重试有没有生效。
+    // 第一次查等级 502，第二次通。第一注账面不动（等级又查不到）→
+    // 按天数记；第二注那笔钱真到账，配合重试查到的等级 → 判出折算。
     const site = await startSite({
         prizes: ['VIP 7 Day(s)'],
         balance: 500000,
         swapBeans: 1000000,
         userClass: 'vip',
-        classFailTimes: 1
+        classFailTimes: 1,
+        onDraw: state => { if (state.draws === 2) state.balance += 1000000; }
     });
     const statsFile = path.join(TMP, 'stats-retry.json');
 
@@ -1050,9 +1110,9 @@ console.log('\n[33] 等级查失败只是这一次失败，下次还得再查');
     const t = JSON.parse(fs.readFileSync(statsFile, 'utf8')).total;
 
     check('两注都算 VIP 中奖', t.prizes.vip.count === 2, `实际 ${t.prizes.vip.count}`);
-    check('第一注查不到等级、余额也对不上，老实记 7 天',
+    check('第一注查不到等级、账面也没多钱，老实记 7 天',
         t.prizes.vip.tiers['7 天'] === 1, JSON.stringify(t.prizes.vip.tiers));
-    check('第二注重试查到了等级，按折算记',
+    check('第二注重试查到了等级、钱也到账，按折算记',
         t.prizes.vip.tiers['已转换为憨豆 1,000,000'] === 1, JSON.stringify(t.prizes.vip.tiers));
     check('憨豆只加了一注的 1,000,000', t.gains.beans === 1000000, `实际 ${t.gains.beans}`);
     check('等级页确实被请求了两次（失败那次没被记成查过）',
@@ -1069,7 +1129,8 @@ console.log('\n[34] 折算来的憨豆要在汇总里点明来源');
         prizes: ['VIP 7 Day(s)', '魔力 100 '],
         balance: 500000,
         swapBeans: 1000000,
-        userClass: 'vip'
+        userClass: 'vip',
+        onDraw: (state, text) => { if (text.includes('VIP')) state.balance += 1000000; }
     });
 
     const { out } = await runScript({ host: site.state.origin, draws: 2 });
