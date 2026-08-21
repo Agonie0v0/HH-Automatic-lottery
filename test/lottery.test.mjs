@@ -3033,5 +3033,73 @@ console.log('\n[63] 全屏庆祝留够截图时间，点一下 / Esc 都能关�
 }
 
 /* ---------------------------------------------------------------- */
+console.log('\n[64] 名册之前中过的大奖：次数认得出来，时间是真没有');
+{
+    // 名册是后加的，老数据每抽只累加次数、没留时间戳，本地找不回来。
+    // 但原始文案里数得出中过几次，如实标一行比装作没中过强。
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+    const w = dom.window;
+
+    w.localStorage.setItem('hhanclub_lottery_stats_v4', JSON.stringify({
+        version: 4, draws: 17821, cost: 35642000,
+        gains: { beans: 43264300, magic: 0, invite: 41, rainbow: 428, vip: 0, makeup: 1041, upload: 1235, rename: 0 },
+        prizes: {
+            beans: { count: 15071, value: 42264300, tiers: { '780,000 憨豆': 18, '100 憨豆': 4743 } },
+            vip: { count: 5, value: 0, swappedBeans: 5000000, tiers: { '已转换为憨豆 1,000,000': 5 } }
+        },
+        raw: { '魔力 780000': 18, 'VIP 7 Day(s)': 5, '魔力 100': 4743 }
+        // 没有 jackpots 字段 —— 就是升级前的老数据
+    }));
+
+    await run(dom);
+    const d = w.document;
+    d.getElementById('view-mode').value = 'total';
+    d.getElementById('view-mode').dispatchEvent(new w.Event('change'));
+    await sleep(150);
+
+    const log = d.getElementById('jackpot-log');
+    check('数出了 18 次 780,000 + 5 次 VIP = 23 次',
+        /更早还中过 23 次/.test(log.textContent), log.textContent);
+    check('说清了时间没有', /还没开始记时间/.test(log.textContent), log.textContent);
+    check('100 憨豆这种没被算成大奖',
+        !/更早还中过 4/.test(log.textContent), log.textContent);
+    check('标题上的次数把老账也算进去',
+        d.getElementById('jackpot-count').textContent === '23 次',
+        d.getElementById('jackpot-count').textContent);
+    check('没有伪造出带时间的条目',
+        d.querySelectorAll('#jackpot-log .hh-jackpot-row').length === 0,
+        log.innerHTML.slice(0, 200));
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[65] 老账和新记的能并排显示，互不重复计数');
+{
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+    const w = dom.window;
+
+    // 老数据里 3 次 780,000，其中 1 次已经被新版记进了名册
+    w.localStorage.setItem('hhanclub_lottery_stats_v4', JSON.stringify({
+        version: 4, draws: 5000, cost: 10000000,
+        gains: { beans: 0, magic: 0, invite: 0, rainbow: 0, vip: 0, makeup: 0, upload: 0, rename: 0 },
+        prizes: {}, raw: { '魔力 780000': 3 },
+        jackpots: [{ at: 1787280000000, text: '魔力 780000' }]
+    }));
+
+    await run(dom);
+    const d = w.document;
+    d.getElementById('view-mode').value = 'total';
+    d.getElementById('view-mode').dispatchEvent(new w.Event('change'));
+    await sleep(150);
+
+    const log = d.getElementById('jackpot-log');
+    check('带时间的那次单独列出来',
+        d.querySelectorAll('#jackpot-log .hh-jackpot-row').length === 1, log.textContent);
+    check('剩下 2 次归到老账，没把已列出的重复计',
+        /更早还中过 2 次/.test(log.textContent), log.textContent);
+    check('标题合计 3 次', d.getElementById('jackpot-count').textContent === '3 次',
+        d.getElementById('jackpot-count').textContent);
+}
+
+/* ---------------------------------------------------------------- */
 console.log(`\n=========== ${passed} passed, ${failed} failed ===========\n`);
 process.exit(failed ? 1 : 0);

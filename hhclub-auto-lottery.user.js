@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.29.0
+// @version      1.30.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 一抽到底 · 实时余额 · 站内信清理
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -1538,6 +1538,13 @@
     color: #a08066;
     white-space: nowrap;
 }
+#lottery-control-panel .hh-jackpot-legacy {
+    padding: 6px 5px 3px;
+    margin-top: 3px;
+    border-top: 1px dashed rgba(200, 170, 130, .45);
+    font-size: 9px;
+    color: #a08066;
+}
 #lottery-control-panel .hh-jackpot-empty {
     padding: 10px 6px;
     text-align: center;
@@ -2453,21 +2460,43 @@
 
     /* 大奖名册：几千抽才碰一次的那几笔，单独列出来好回看。
        跟着历史统计一起存，关页面、换会话都还在。 */
+    /* 名册是 1.29 才有的，之前每抽只累加次数、没留过时间戳。所以老数据
+       里的大奖只知道中过几次，时间是真找不回来了 —— 本地没存。
+       与其装作没中过，不如按原始文案数出来，如实标一行。 */
+    function legacyJackpotCount(stats) {
+        const counted = Object.entries(stats.raw || {})
+            .reduce((sum, [text, count]) => (
+                isJackpot(parsePrizeText(text)) ? sum + (Number(count) || 0) : sum
+            ), 0);
+        return Math.max(0, counted - (stats.jackpots || []).length);
+    }
+
     function renderJackpotLog(stats) {
         const list = $('jackpot-log');
         if (!list) return;
 
         const rows = stats.jackpots || [];
-        setText('jackpot-count', rows.length ? `${fmt(rows.length)} 次` : '还没有');
+        const legacy = legacyJackpotCount(stats);
+
+        const total = rows.length + legacy;
+        setText('jackpot-count', total ? `${fmt(total)} 次` : '还没有');
+
+        // 老数据只数得出次数，没有时间，单独挂一行说明
+        const legacyRow = legacy
+            ? `<div class="hh-jackpot-legacy">`
+              + `👑 更早还中过 ${fmt(legacy)} 次 · 那时候还没开始记时间`
+              + `</div>`
+            : '';
 
         if (!rows.length) {
             // 大奖几千抽才碰一次，本次会话空着是常态 —— 与其干说「没有」，
             // 不如指一下历史里其实还存着
-            const archived = (totalStats.jackpots || []).length;
+            const archived = (totalStats.jackpots || []).length
+                + legacyJackpotCount(totalStats);
             const hint = settings.viewMode !== 'total' && archived
                 ? `本次还没中过 · 历史里存着 ${fmt(archived)} 次，切到「历史总计」看`
                 : '还没中过大奖 · 中了会连时间一起记在这里，换会话也不丢';
-            list.innerHTML = `<div class="hh-jackpot-empty">${hint}</div>`;
+            list.innerHTML = legacyRow || `<div class="hh-jackpot-empty">${hint}</div>`;
             return;
         }
 
@@ -2476,7 +2505,7 @@
             + `<b>👑 ${escapeHtml(item.text)}</b>`
             + `<span class="hh-jackpot-when">${escapeHtml(whenText(item.at))}</span>`
             + `</div>`
-        ).join('');
+        ).join('') + legacyRow;
     }
 
     /* 憨豆盈亏。奖池里 type 1001 就是憨豆，所以这个数字是实打实的：
