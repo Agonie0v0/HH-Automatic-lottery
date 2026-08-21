@@ -91,12 +91,14 @@ const mailboxPage = (items, pageCount) => {
  *   pageSize  收件箱每页显示多少封
  *   killAttempts 这几次抽奖请求直接掐断连接（制造真的 fetch failed，
  *                模拟机器断网 / DNS 挂掉，不是站点返回错误）
+ *   killMailAttempts 这几次站内信请求掐断连接。挂机几小时后 Node 的
+ *                    连接池里会有被服务端关掉的死连接，复用就是这个效果
  */
 function startSite({ prizes = ['魔力 100 '], durations = [6000], rateLimitAttempts = [],
                      balance = 100000, cost = 2000, onDraw = null,
                      mail = [], pageSize = 100, loggedOut = false,
                      swapBeans = 0, userClass = null, classFailTimes = 0,
-                     killAttempts = [] } = {}) {
+                     killAttempts = [], killMailAttempts = [] } = {}) {
     const state = {
         balance, cost, draws: 0, deleted: [], mailPageHits: [],
         mail: [...mail], drawn: [], classFails: 0, drawAttempts: 0
@@ -164,6 +166,15 @@ function startSite({ prizes = ['魔力 100 '], durations = [6000], rateLimitAtte
                 data: { prize_text: text, winning_record_id: 900 + state.draws, duration }
             }),
                 'application/json');
+        }
+
+        if (url.pathname === '/messages.php') {
+            state.mailAttempts = (state.mailAttempts || 0) + 1;
+            if (killMailAttempts.includes(state.mailAttempts)) {
+                state.mailKilled = (state.mailKilled || 0) + 1;
+                res.socket.destroy();
+                return;
+            }
         }
 
         if (url.pathname === '/messages.php' && req.method === 'POST') {
@@ -1991,6 +2002,62 @@ console.log('\n[64] 网络一直不通，试够次数才停，并说清是网络
     check('一抽都没记上', site.state.draws === 0, `实际 ${site.state.draws}`);
 
     await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[65] 清信途中网络抖一下，重试自愈，不是整轮放弃');
+{
+    // 清一次信要翻页加批量删好几个请求，任何一个撞上死连接就
+    // 「⚠️ 站内信清理失败：fetch failed」整轮放弃。Node 的 fetch 会复用
+    // 连接池，挂机几小时后池子里难免有被服务端悄悄关掉的连接 ——
+    // 直接用 nodejs 长跑的人尤其容易碰上。
+    const site = await startSite({
+        prizes: ['魔力 100 '],
+        balance: 100000,
+        mail: Array.from({ length: 6 }, (_, i) => ({
+            id: String(700 + i), subject: '幸运大转盘 中奖通知'
+        })),
+        killMailAttempts: [1, 2]        // 头两次站内信请求掐断
+    });
+
+    const { out } = await runScript(
+        { host: site.state.origin, draws: 1, interval: 0.5, cleanMail: true },
+        { requestRetryStepMs: 100 }
+    );
+
+    check('确实掐断了两次', site.state.mailKilled === 2, `实际 ${site.state.mailKilled} 次`);
+    check('重试了，没有直接放弃', /网络不通/.test(out), out.slice(-900));
+    check('没有报「站内信清理失败」',
+        !/站内信清理失败/.test(out), out.slice(-900));
+    check('信最后还是清干净了', site.state.mail.length === 0,
+        JSON.stringify(site.state.mail));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[66] 抽奖那个 POST 绝不能重试 —— 重发就是又扣一次憨豆');
+{
+    // 幂等的请求（读页面、删信）才配重试。抽奖 POST 可能已经在服务端
+    // 生效了，只是响应没回来，重发等于白扣两千。
+    const source = fs.readFileSync(path.join(ROOT, 'qinglong', 'hh_lottery.js'), 'utf8');
+
+    const drawOnce = source.slice(
+        source.indexOf('async drawOnce()'),
+        source.indexOf('record(prizeText, prize)')
+    );
+
+    check('drawOnce 直接用 fetch，没走重试包装',
+        /await fetch\(/.test(drawOnce) && !/requestIdempotent/.test(drawOnce),
+        drawOnce.slice(0, 300));
+
+    // 注释挂在方法上面，起点要往前留出来
+    const idempotent = source.slice(
+        Math.max(0, source.indexOf('async requestIdempotent') - 600),
+        source.indexOf('async snapshot()')
+    );
+    check('重试包装的注释点明了不能给抽奖用',
+        /重发就是又扣一次憨豆/.test(idempotent), idempotent.slice(0, 400));
 }
 
 fs.rmSync(TMP, { recursive: true, force: true });

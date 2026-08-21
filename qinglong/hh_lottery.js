@@ -126,6 +126,15 @@ const RUNTIME = {
     // 网络错误第 n 次失败等 n × 这个数，封顶 networkRetryMaxMs
     networkRetryStepMs: 10000,
     networkRetryMaxMs: 90000,
+    /* 单个幂等请求（读页面、删站内信）的网络重试。
+
+       和上面那组不是一回事：那组管的是抽奖主循环整体的节奏，这组只在
+       一次请求内部打转。清一次信要翻页加批量删好几个请求，中间抖一下
+       就整轮放弃太亏；而且 Node 的 fetch 会复用连接池，挂机几小时后
+       池子里难免有被服务端悄悄关掉的死连接，拿来发就是 fetch failed，
+       重试一次会新建连接，多半就好了。 */
+    requestRetries: 3,
+    requestRetryStepMs: 1000,
     // 连续被限流多少次放弃
     maxRateLimits: 12,
     // 被限流后的退避
@@ -753,8 +762,29 @@ class Lottery {
         };
     }
 
+    /* 幂等请求专用：网络抖了就重试。
+
+       只给读页面和删站内信用。抽奖那个 POST 绝不能走这里 —— 请求可能
+       已经在服务端生效了，重发就是又扣一次憨豆。 */
+    async requestIdempotent(url, options, label) {
+        for (let attempt = 0; ; attempt++) {
+            try {
+                return await fetch(url, options);
+            } catch (error) {
+                if (attempt >= RUNTIME.requestRetries) throw error;
+
+                const wait = RUNTIME.requestRetryStepMs * (attempt + 1);
+                log(`📡 ${label}网络不通（${error?.message || error}），`
+                    + `${Math.round(wait / 1000)} 秒后重试（${attempt + 1}/${RUNTIME.requestRetries}）`);
+                await sleep(wait);
+            }
+        }
+    }
+
     async get(urlPath) {
-        const response = await fetch(`${this.origin}${urlPath}`, { headers: this.headers() });
+        const response = await this.requestIdempotent(
+            `${this.origin}${urlPath}`, { headers: this.headers() }, `读 ${urlPath} 时`
+        );
         if (!response.ok) throw new Error(`${urlPath} 请求失败（HTTP ${response.status}）`);
         return response.text();
     }
@@ -1261,11 +1291,13 @@ class Lottery {
             chunk.forEach(id => body.append('messages[]', id));
             body.append('delete', '删除');
 
-            const response = await fetch(`${this.origin}/messages.php`, {
+            // 删除是幂等的 —— 同一批 id 删两次，第二次什么也不会发生，
+            // 所以这里可以放心重试
+            const response = await this.requestIdempotent(`${this.origin}/messages.php`, {
                 method: 'POST',
                 headers: this.headers({ 'content-type': 'application/x-www-form-urlencoded' }),
                 body
-            });
+            }, '删站内信时');
             if (!response.ok) throw new Error(`删除站内信失败（HTTP ${response.status}）`);
 
             done += chunk.length;
