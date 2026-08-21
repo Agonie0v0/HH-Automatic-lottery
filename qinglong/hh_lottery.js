@@ -380,11 +380,11 @@ function numberAfterClass(html, className) {
 const PRIZE_META = {
     beans: { name: '憨豆', icon: '💰', unit: '' },
     magic: { name: '憨豆（旧魔力）', icon: '💰', unit: '' },
-    invite: { name: '邀请', icon: '💌', unit: '个' },
+    invite: { name: '邀请', icon: '📧', unit: '' },
     rainbow: { name: '彩虹ID', icon: '🌈', unit: '天' },
     vip: { name: 'VIP', icon: '⭐', unit: '天' },
     makeup: { name: '补签卡', icon: '🎫', unit: '个' },
-    upload: { name: '上传量', icon: '📤', unit: 'GB' },
+    upload: { name: '上传量', icon: '⬆️', unit: 'GB' },
     rename: { name: '改名卡', icon: '📛', unit: '张' },
     unknown: { name: '其他奖品', icon: '🎁', unit: '' }
 };
@@ -425,14 +425,10 @@ function parsePrizeText(text) {
             if (value === null) break;
         }
 
-        const tierLabel = rule.type === 'invite'
-            ? `${fmt(value)} 邀请`
-            : `${fmt(value)}${meta.unit ? ' ' + meta.unit : ' ' + meta.name}`;
-
         return {
             type: rule.type,
             value,
-            label: tierLabel
+            label: `${fmt(value)}${meta.unit ? ' ' + meta.unit : ' ' + meta.name}`
         };
     }
 
