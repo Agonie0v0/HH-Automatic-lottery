@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.20.0
+// @version      1.21.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 一抽到底 · 实时余额 · 站内信清理
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -27,6 +27,22 @@
     const LEGACY_STATS_KEY = 'hhanclub_lottery_stats_v3';
     const SETTINGS_KEY = 'hhanclub_lottery_settings_v1';
 
+    /* 抽奖间隔允许填小数，但只认到两位 —— 再细没有意义，
+       也免得 0.1+0.2 这类浮点尾巴写进设置里。 */
+    function normalizeInterval(raw, fallback) {
+        const value = typeof raw === 'number' ? raw : parseFloat(raw);
+        const seconds = Number.isFinite(value) ? value : fallback;
+        return Math.min(
+            CONFIG.maxInterval,
+            Math.max(CONFIG.minInterval, Math.round(seconds * 100) / 100)
+        );
+    }
+
+    /* 3 → 「3」，3.5 → 「3.5」，3.25 → 「3.25」；不留没用的 0 */
+    function intervalText(seconds) {
+        return String(Math.round(seconds * 100) / 100);
+    }
+
     const CONFIG = {
         // 抽奖间隔允许范围（秒）
         minInterval: 3,
@@ -35,8 +51,6 @@
         backoffAfterErrors: 3,
         backoffFactor: 1.5,
         maxBackoffMs: 30000,
-        // 请求节奏抖动比例，避免固定频率特征
-        jitterRatio: 0.15,
         // 连续失败多少次后自动停止，避免接口异常时无限重试
         maxConsecutiveErrors: 5,
         // 连续被限流多少次后放弃，避免退避到上限后一直空转
@@ -368,10 +382,7 @@
 
         // 存下来的值可能来自旧版本、别的合法区间，或者被手改过。
         // 不在这里收敛的话，输入框会显示一个和实际生效值不一样的数字。
-        settings.interval = Math.min(
-            CONFIG.maxInterval,
-            Math.max(CONFIG.minInterval, parseInt(settings.interval, 10) || 7)
-        );
+        settings.interval = normalizeInterval(settings.interval, 7);
         settings.maxCount = Math.max(1, parseInt(settings.maxCount, 10) || 10);
         if (settings.viewMode !== 'total') settings.viewMode = 'current';
         if (settings.detailOpen !== 'all') settings.detailOpen = 'none';
@@ -1726,7 +1737,7 @@
                 <div class="hh-settings">
                     <div class="hh-field">
                         <label>⏱ 抽奖间隔 · 秒</label>
-                        <input type="number" id="lottery-interval" value="7"
+                        <input type="number" id="lottery-interval" value="7" step="0.01"
                                min="${CONFIG.minInterval}" max="${CONFIG.maxInterval}">
                     </div>
                     <div class="hh-field">
@@ -2464,22 +2475,18 @@
     ========================================================= */
 
     function baseIntervalMs() {
-        const raw = parseInt($('lottery-interval')?.value, 10);
-        const seconds = Math.min(
-            CONFIG.maxInterval,
-            Math.max(CONFIG.minInterval, Number.isFinite(raw) ? raw : settings.interval)
-        );
-        return seconds * 1000;
+        const seconds = normalizeInterval($('lottery-interval')?.value, settings.interval);
+        return Math.round(seconds * 1000);
     }
 
-    /* 加入随机抖动，避免固定频率的请求特征 */
+    /* 说多久就是多久 —— 以前会在设定值上下浮动 15%，
+       填 3 秒实际可能跑成 2.55 或 3.45 秒，对不上账。 */
     function nextDelayMs() {
-        const jitter = 1 + (Math.random() * 2 - 1) * CONFIG.jitterRatio;
-        return Math.max(1000, Math.round(dynamicInterval * jitter));
+        return Math.max(1000, Math.round(dynamicInterval));
     }
 
     function setCurrentIntervalDisplay() {
-        setText('current-interval', (dynamicInterval / 1000).toFixed(1).replace(/\.0$/, ''));
+        setText('current-interval', intervalText(dynamicInterval / 1000));
     }
 
     async function runSingleDraw(maxCount) {
@@ -2607,13 +2614,10 @@
     function startLottery() {
         if (running) return;
 
-        const interval = Math.min(
-            CONFIG.maxInterval,
-            Math.max(CONFIG.minInterval, parseInt($('lottery-interval')?.value, 10) || settings.interval)
-        );
+        const interval = normalizeInterval($('lottery-interval')?.value, settings.interval);
         const maxCount = Math.max(1, parseInt($('max-lottery-count')?.value, 10) || settings.maxCount);
 
-        if ($('lottery-interval')) $('lottery-interval').value = interval;
+        if ($('lottery-interval')) $('lottery-interval').value = intervalText(interval);
         if ($('max-lottery-count')) $('max-lottery-count').value = maxCount;
 
         settings.interval = interval;
@@ -2635,7 +2639,7 @@
             return;
         }
 
-        dynamicInterval = interval * 1000;
+        dynamicInterval = Math.round(interval * 1000);
         errorStreak = 0;
         rateLimitStreak = 0;
         mailCleaned = 0;
@@ -2646,7 +2650,9 @@
 
         const status = $('lottery-status');
         if (status) {
-            status.textContent = settings.drainMode ? `一抽到底 · ${interval}s` : `运行中 · ${interval}s`;
+            status.textContent = settings.drainMode
+                ? `一抽到底 · ${intervalText(interval)}s`
+                : `运行中 · ${intervalText(interval)}s`;
             status.style.color = '#4d8a3a';
         }
 
@@ -2659,8 +2665,8 @@
         if (stopButton) stopButton.disabled = false;
 
         addLog(settings.drainMode
-            ? `🔥 一抽到底 · 保留 ${fmt(reserve)} 憨豆 · 间隔 ${interval} 秒`
-            : `🚀 开始抽奖 · ${maxCount} 次 · 间隔 ${interval} 秒`, 'success');
+            ? `🔥 一抽到底 · 保留 ${fmt(reserve)} 憨豆 · 间隔 ${intervalText(interval)} 秒`
+            : `🚀 开始抽奖 · ${maxCount} 次 · 间隔 ${intervalText(interval)} 秒`, 'success');
 
         // 循环里任何一处抛异常都不能静默吞掉 —— 不接这个 catch 的话
         // running 会一直卡在 true，面板显示「抽奖进行中」但其实早停了
@@ -3457,17 +3463,14 @@
         });
 
         on('lottery-interval', 'change', event => {
-            const value = Math.min(
-                CONFIG.maxInterval,
-                Math.max(CONFIG.minInterval, parseInt(event.target.value, 10) || settings.interval)
-            );
-            event.target.value = value;
+            const value = normalizeInterval(event.target.value, settings.interval);
+            event.target.value = intervalText(value);
             settings.interval = value;
             saveSettings();
 
             // 运行中改间隔立刻生效，不必重启
             if (running) {
-                dynamicInterval = value * 1000;
+                dynamicInterval = Math.round(value * 1000);
                 setCurrentIntervalDisplay();
             }
         });
@@ -3544,7 +3547,7 @@
 
     function applySettingsToUI() {
         const intervalInput = $('lottery-interval');
-        if (intervalInput) intervalInput.value = settings.interval;
+        if (intervalInput) intervalInput.value = intervalText(settings.interval);
 
         const maxInput = $('max-lottery-count');
         if (maxInput) maxInput.value = settings.maxCount;
@@ -3567,7 +3570,7 @@
         setText('toggle-animation', `🎉 中奖动画：${settings.animation ? '开' : '关'}`);
         setText('toggle-all-tiers', settings.detailOpen === 'all' ? '🔼 收起全部档位' : '🔽 展开全部档位');
 
-        dynamicInterval = settings.interval * 1000;
+        dynamicInterval = Math.round(settings.interval * 1000);
         setCurrentIntervalDisplay();
     }
 

@@ -2419,5 +2419,72 @@ console.log('\n[48] CSV 汇总里也要注明折算来源');
 }
 
 /* ---------------------------------------------------------------- */
+console.log('\n[49] 间隔可以填两位小数');
+{
+    const dom = makeDom();
+    const w = dom.window;
+    await run(dom);
+    const d = w.document;
+
+    const input = d.getElementById('lottery-interval');
+    const set = value => {
+        input.value = value;
+        input.dispatchEvent(new w.Event('change'));
+        return JSON.parse(w.localStorage.getItem('hhanclub_lottery_settings_v1')).interval;
+    };
+
+    check('3.25 秒原样收下', set('3.25') === 3.25);
+    check('输入框回填不补零', input.value === '3.25', input.value);
+    check('当前间隔也显示小数',
+        d.getElementById('current-interval').textContent === '3.25',
+        d.getElementById('current-interval').textContent);
+
+    check('第三位小数四舍五入到两位', set('3.256') === 3.26);
+    check('整数不拖小数尾巴', set('5') === 5 && input.value === '5', input.value);
+    check('低于下限收敛到 3', set('0.5') === 3);
+    check('高于上限收敛到 300', set('9999') === 300);
+    check('填了看不懂的东西就退回上一个值', set('abc') === 300, input.value);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[50] 间隔说多久就是多久，不再随机浮动');
+{
+    // 旧实现在设定值上下浮动 15%，填 3 秒实际可能跑成 2.55 秒。
+    // 这里连抽 4 次，量相邻两次请求的实际间距。
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+    const w = dom.window;
+
+    const stamps = [];
+    w.fetch = async url => {
+        const target = String(url);
+        if (target.includes('lucky-draw')) stamps.push(Date.now());
+        if (target.includes('lucky.php')) {
+            return { ok: true, status: 200, text: async () => '<html><body></body></html>' };
+        }
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ret: 0, data: { prize_text: '100 魔力' } })
+        };
+    };
+
+    await run(dom);
+    const d = w.document;
+    d.getElementById('lottery-interval').value = '3.5';
+    d.getElementById('max-lottery-count').value = '4';
+    d.getElementById('start-lottery').click();
+    await untilStopped(d, 40000);
+
+    check('4 次都抽出去了', stamps.length === 4, `实际 ${stamps.length} 次`);
+
+    const gaps = stamps.slice(1).map((t, i) => t - stamps[i]);
+    // 只卡下限：抖动会让间距缩到 2975ms 上下，没抖动就绝不会短于 3500。
+    // 上限放宽到 5s —— jsdom 里 await 本身有开销，卡太死会假红。
+    check('每次间隔都不短于设定的 3.5 秒',
+        gaps.every(gap => gap >= 3450), gaps.join(' / '));
+    check('也没有被拖长成别的数',
+        gaps.every(gap => gap < 5000), gaps.join(' / '));
+}
+
+/* ---------------------------------------------------------------- */
 console.log(`\n=========== ${passed} passed, ${failed} failed ===========\n`);
 process.exit(failed ? 1 : 0);
