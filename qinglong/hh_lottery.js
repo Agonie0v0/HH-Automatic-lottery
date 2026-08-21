@@ -59,14 +59,29 @@ const CONFIG = {
           留空字符串 '' 就是不记 */
     statsFile: 'hh_lottery_stats.json',
 
-    /* ⑧ 日志时间按哪个时区显示。
+    /* ⑧ 中了大奖立刻推一条通知（VIP，或单笔憨豆达到下面的门槛）。
+          挂机跑一晚上的话，中了大奖当场就能知道 */
+    notifyBigPrize: true,
+
+    /* ⑨ 多少憨豆算大奖。填 0 就只有 VIP 才推 */
+    bigPrizeMinBeans: 780000,
+
+    /* ⑩ Telegram 直推（可选）。青龙的 sendNotify 找不到或发失败时用它兜底；
+          手动停止时也优先走它 —— 路径短，来不及绕远路。
+          留空就不用。青龙里设过 TG_BOT_TOKEN / TG_USER_ID 环境变量的话，
+          这里不填也会自动拿来用 */
+    tgBotToken: '',
+    tgUserId: '',
+    tgApiHost: 'api.telegram.org',
+
+    /* ⑪ 日志时间按哪个时区显示。
           青龙容器默认常是 UTC，不设这个的话日志时间对不上 */
     timezone: 'Asia/Shanghai',
 
-    /* ⑨ 站点域名，一般不用改 */
+    /* ⑫ 站点域名，一般不用改 */
     host: 'hhanclub.net',
 
-    /* ⑩ User-Agent，一般不用改 */
+    /* ⑬ User-Agent，一般不用改 */
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
         + '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
 };
@@ -75,8 +90,6 @@ const CONFIG = {
 
 /* 下面这些是内部节奏参数，除非站点风控变了，否则不用碰 */
 const RUNTIME = {
-    // 请求节奏抖动比例，避免固定频率特征
-    jitter: 0.15,
     // 连续失败多少次放弃
     maxErrors: 5,
     // 连续被限流多少次放弃
@@ -98,8 +111,23 @@ const RUNTIME = {
     mailSweepRounds: 20,
     // 抽奖途中每多少抽顺手清一次（和油猴版的节奏一致）
     mailCleanEveryDraws: 25,
-    lotteryMailKeyword: '幸运大转盘'
+    lotteryMailKeyword: '幸运大转盘',
+    // 停止通知最多等多久 —— 卡在推送上不退出更糟
+    notifyTimeoutMs: 8000
 };
+
+/* 间隔允许填小数，但只认到两位 —— 再细没有意义，
+   也免得 0.1+0.2 这类浮点尾巴写进配置里。 */
+function normalizeInterval(raw, fallback) {
+    const value = typeof raw === 'number' ? raw : parseFloat(raw);
+    const seconds = Number.isFinite(value) ? value : fallback;
+    return Math.min(300, Math.max(3, Math.round(seconds * 100) / 100));
+}
+
+/* 3 → 「3」，3.5 → 「3.5」，3.25 → 「3.25」；不留没用的 0 */
+function intervalText(seconds) {
+    return String(Math.round(seconds * 100) / 100);
+}
 
 /* 配置是手填的，收一遍边界，免得填了个负数或者字符串就跑出怪结果 */
 function normalizeConfig() {
@@ -110,9 +138,15 @@ function normalizeConfig() {
 
     CONFIG.draws = int(CONFIG.draws, 10, 0);
     CONFIG.reserve = int(CONFIG.reserve, 0, 0);
-    CONFIG.interval = int(CONFIG.interval, 8, 3);
+    CONFIG.interval = normalizeInterval(CONFIG.interval, 8);
     CONFIG.maxMinutes = int(CONFIG.maxMinutes, 60, 1);
     CONFIG.cleanMail = CONFIG.cleanMail === true;
+    CONFIG.notifyBigPrize = CONFIG.notifyBigPrize !== false;
+    CONFIG.bigPrizeMinBeans = int(CONFIG.bigPrizeMinBeans, 780000, 0);
+    CONFIG.tgBotToken = String(CONFIG.tgBotToken || process.env.TG_BOT_TOKEN || '').trim();
+    CONFIG.tgUserId = String(CONFIG.tgUserId || process.env.TG_USER_ID || '').trim();
+    CONFIG.tgApiHost = String(CONFIG.tgApiHost || 'api.telegram.org').trim()
+        .replace(/^https?:\/\//, '').replace(/\/+$/, '');
     CONFIG.host = String(CONFIG.host || 'hhanclub.net').trim().replace(/\/+$/, '');
     CONFIG.statsFile = String(CONFIG.statsFile || '').trim();
     CONFIG.timezone = String(CONFIG.timezone || '').trim();
@@ -527,6 +561,7 @@ class Lottery {
         this.vipClassChecked = false;
 
         this.mailCleaned = 0;
+        this.startedAt = Date.now();
 
         this.errorStreak = 0;
         this.rateLimitStreak = 0;
@@ -682,9 +717,35 @@ class Lottery {
         }
     }
 
+    /* 说多久就是多久 —— 以前会在设定值上下浮动 15%，
+       填 3 秒实际可能跑成 2.55 或 3.45 秒，对不上账。 */
+    /* 挂机跑一晚上，中了大奖当场推一条 —— 不然要等跑完才知道。
+       口径和油猴版的全屏庆祝一致：VIP，或单笔憨豆到门槛。
+       推送失败不能影响抽奖，吞掉就是了。 */
+    async pushBigPrize(prize, prizeText) {
+        if (!CONFIG.notifyBigPrize) return;
+
+        const big = prize.type === 'vip'
+            || (CONFIG.bigPrizeMinBeans > 0
+                && prize.type === 'beans'
+                && prize.value >= CONFIG.bigPrizeMinBeans);
+        if (!big) return;
+
+        const body = [
+            `第 ${fmt(this.current.draws)} 抽中了：${String(prizeText).trim()}`,
+            `当前余额 ${fmt(this.balance)} 憨豆`,
+            `已跑 ${formatDuration(Date.now() - this.startedAt)}`
+        ].join('\n');
+
+        try {
+            await notify('👑 HHCLUB 幸运大转盘 · 中大奖了', body);
+        } catch (error) {
+            log(`⚠️ 大奖通知发送失败：${error?.message || error}`);
+        }
+    }
+
     nextDelay() {
-        const jitter = 1 + (Math.random() * 2 - 1) * RUNTIME.jitter;
-        return Math.max(1000, Math.round(this.intervalMs * jitter));
+        return Math.max(1000, Math.round(this.intervalMs));
     }
 
     shouldContinue() {
@@ -753,6 +814,7 @@ class Lottery {
                 log(`🎲 第 ${this.current.draws} 抽：${prizeText.trim()} · 余额 ${fmt(this.balance)}`);
 
                 if (prize.type === 'vip') await this.reconcileVip(prize);
+                await this.pushBigPrize(prize, prizeText);
 
                 // 和油猴版一个节奏：每 25 抽顺手清一次。挂机跑几百抽的话，
                 // 收件箱整场都在涨，等到最后才清没道理
@@ -771,7 +833,7 @@ class Lottery {
 
                 if (this.rateLimitStreak >= RUNTIME.backoffAfter) {
                     this.intervalMs = Math.min(this.intervalMs * RUNTIME.backoffFactor, RUNTIME.maxBackoffMs);
-                    log(`🔄 间隔上调到 ${(this.intervalMs / 1000).toFixed(1)} 秒`);
+                    log(`🔄 间隔上调到 ${intervalText(this.intervalMs / 1000)} 秒`);
                 }
                 if (this.rateLimitStreak >= RUNTIME.maxRateLimits) {
                     report(`🛑 连续 ${this.rateLimitStreak} 次被限流，停止`);
@@ -976,48 +1038,163 @@ class Lottery {
    入口
 ========================================================= */
 
-async function notify(title, content) {
-    let sender = null;
-    for (const modulePath of ['./sendNotify', '/ql/data/scripts/sendNotify', '/ql/scripts/sendNotify']) {
+/* sendNotify 在不同青龙版本 / 不同装法下位置差挺多，挨个试。
+   自己下下来在 Debian 上跑的话一个都找不到，那就走 Telegram 兜底。 */
+const NOTIFY_PATHS = [
+    path.join(__dirname, 'sendNotify.js'),
+    path.join(__dirname, 'sendNotify'),
+    path.join(__dirname, '..', 'sendNotify.js'),
+    path.join(__dirname, '..', 'sendNotify'),
+    path.join(process.cwd(), 'sendNotify.js'),
+    path.join(process.cwd(), 'sendNotify'),
+    '/ql/data/scripts/sendNotify.js',
+    '/ql/data/scripts/sendNotify',
+    '/ql/scripts/sendNotify.js',
+    '/ql/scripts/sendNotify',
+    '/ql/shell/sendNotify.js',
+    '/ql/shell/sendNotify'
+];
+
+function loadNotifyModule() {
+    for (const modulePath of NOTIFY_PATHS) {
         try {
-            sender = require(modulePath);
-            break;
+            const sender = require(modulePath);
+            const send = sender?.sendNotify || sender;
+            if (typeof send === 'function') return send;
         } catch (error) {
-            // 没装通知模块就算了，日志里一样看得到
+            // 这个路径没有就换下一个
         }
     }
-    if (!sender) return;
+    return null;
+}
 
-    const send = sender.sendNotify || sender;
-    if (typeof send === 'function') {
-        try {
-            await send(title, content);
-        } catch (error) {
-            log(`⚠️ 通知发送失败：${error?.message || error}`);
+/* Telegram 直推。青龙的 sendNotify 找不到 / 发失败时兜底，
+   手动停止时也优先走它 —— 少绕一圈，来得及送出去。 */
+async function sendTelegramDirect(title, content) {
+    if (!CONFIG.tgBotToken || !CONFIG.tgUserId) return false;
+
+    try {
+        const response = await fetch(`https://${CONFIG.tgApiHost}/bot${CONFIG.tgBotToken}/sendMessage`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+                chat_id: CONFIG.tgUserId,
+                text: `${title}\n\n${content}`,
+                disable_web_page_preview: true
+            })
+        });
+        if (!response.ok) {
+            log(`⚠️ Telegram 推送失败（HTTP ${response.status}）`);
+            return false;
         }
+        return true;
+    } catch (error) {
+        log(`⚠️ Telegram 推送异常：${error?.message || error}`);
+        return false;
     }
 }
 
-/* 直接在终端跑的时候 Ctrl-C 很常见，抽到一半的成绩不能就这么没了。
-   青龙停任务发的也是 SIGTERM，同样接住。 */
-function guardExit(lottery) {
-    let bailing = false;
+/* 返回是否真送出去了。preferTelegram 用于手动停止那条路径。 */
+async function notify(title, content, { preferTelegram = false } = {}) {
+    // 青龙内置的 notify 默认会去请求「一言」，在正文末尾追加一句随机标语，
+    // 还得多等一次外部请求。临时关掉，跑完还原，不动用户的全局设置。
+    const hadHitokoto = Object.prototype.hasOwnProperty.call(process.env, 'HITOKOTO');
+    const originalHitokoto = process.env.HITOKOTO;
+    process.env.HITOKOTO = 'false';
 
-    const bail = signal => () => {
-        if (bailing) process.exit(130);
-        bailing = true;
+    try {
+        if (preferTelegram && await sendTelegramDirect(title, content)) return true;
 
-        log(`\n⚠️ 收到 ${signal}，先把已抽到的存下来再退出`);
-        if (lottery.current.draws > 0) {
-            const file = saveStats(lottery.current, lottery.total);
-            if (file) log(`💾 统计已存到 ${file}`);
+        const send = loadNotifyModule();
+        if (send) {
+            try {
+                await send(title, content);
+                return true;
+            } catch (error) {
+                log(`⚠️ sendNotify 发送失败：${error?.message || error}`);
+            }
         }
-        raw(`\n${'─'.repeat(40)}\n${lottery.summary()}`);
-        process.exit(130);
+
+        // sendNotify 没有或者发砸了，再试一次 Telegram
+        if (!preferTelegram) return await sendTelegramDirect(title, content);
+        return false;
+    } finally {
+        if (hadHitokoto) process.env.HITOKOTO = originalHitokoto;
+        else delete process.env.HITOKOTO;
+    }
+}
+
+function formatDuration(ms) {
+    const total = Math.max(0, Math.round(ms / 1000));
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const seconds = total % 60;
+
+    if (hours) return `${hours} 小时 ${minutes} 分`;
+    if (minutes) return `${minutes} 分 ${seconds} 秒`;
+    return `${seconds} 秒`;
+}
+
+/* 直接在终端跑的时候 Ctrl-C 很常见，抽到一半的成绩不能就这么没了。
+   青龙里点「停止」发的是 SIGTERM，同样要接住。 */
+function guardExit(lottery) {
+    let stopping = null;
+
+    const handleExit = signal => {
+        // 连着来两个信号就别重复跑一遍保存和推送了
+        if (stopping) return stopping;
+
+        stopping = (async () => {
+            const reason = `收到 ${signal}，手动停止`;
+            log(`⚠️ ${reason} —— 先保存再退出`);
+
+            if (lottery.current.draws > 0) {
+                const file = saveStats(lottery.current, lottery.total);
+                if (file) log(`💾 统计已存到 ${file}`);
+            }
+
+            const summary = lottery.summary();
+            raw(`\n${'─'.repeat(40)}\n${summary}`);
+
+            // 推送卡住的话宁可不推也要退出去，不能挂在这儿
+            const watchdog = setTimeout(() => {
+                log('⚠️ 停止通知等太久了，不等了，数据已经存好');
+                process.exit(130);
+            }, RUNTIME.notifyTimeoutMs);
+
+            try {
+                const body = [
+                    reason,
+                    `已跑 ${formatDuration(Date.now() - lottery.startedAt)}`,
+                    '',
+                    summary
+                ].join('\n');
+
+                const sent = await notify('🛑 HHCLUB 幸运大转盘 · 手动停止', body, { preferTelegram: true });
+                log(sent ? '✅ 停止通知已发出' : 'ℹ️ 没有可用的通知渠道，跳过推送');
+            } catch (error) {
+                log(`⚠️ 停止通知发送异常：${error?.message || error}`);
+            } finally {
+                clearTimeout(watchdog);
+            }
+
+            process.exit(130);
+        })();
+
+        return stopping;
     };
 
-    process.on('SIGINT', bail('Ctrl-C'));
-    process.on('SIGTERM', bail('SIGTERM'));
+    // 青龙通过 NODE_OPTIONS 预加载自己的脚本，会比业务脚本更早注册 SIGTERM，
+    // 里面直接 process.exit()。EventEmitter 按注册顺序调，不把它摘掉的话
+    // 上面那些保存和推送根本轮不到执行 —— 点一下「停止」成绩就没了。
+    const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+    const inherited = signals.reduce((sum, signal) => sum + process.listenerCount(signal), 0);
+    signals.forEach(signal => process.removeAllListeners(signal));
+
+    // 不能用 once：青龙的 task.sh 可能连着转发好几个同类信号
+    signals.forEach(signal => process.on(signal, () => { handleExit(signal); }));
+
+    if (inherited > 0) log(`🛡️ 已接管退出信号（替换了 ${inherited} 个预注册的立即退出处理器）`);
 }
 
 async function main() {
@@ -1049,8 +1226,8 @@ async function main() {
     log('🎡 HHCLUB 幸运大转盘');
     if (configFile) log(`⚙️ 配置来自 ${configFile}`);
     log(CONFIG.draws > 0
-        ? `   抽 ${CONFIG.draws} 次 · 间隔 ${CONFIG.interval} 秒`
-        : `   一抽到底 · 保留 ${fmt(CONFIG.reserve)} 憨豆 · 间隔 ${CONFIG.interval} 秒`);
+        ? `   抽 ${CONFIG.draws} 次 · 间隔 ${intervalText(CONFIG.interval)} 秒`
+        : `   一抽到底 · 保留 ${fmt(CONFIG.reserve)} 憨豆 · 间隔 ${intervalText(CONFIG.interval)} 秒`);
 
     const lottery = new Lottery(cookie);
     guardExit(lottery);
@@ -1079,7 +1256,16 @@ async function main() {
     const summary = lottery.summary();
     raw(`\n${'─'.repeat(40)}\n${summary}`);
 
-    await notify('HHCLUB 幸运大转盘', [...messages, '', summary].join('\n').trim());
+    const body = [
+        ...messages,
+        '',
+        `本次运行 ${formatDuration(Date.now() - lottery.startedAt)}`,
+        '',
+        summary
+    ].join('\n').trim();
+
+    const sent = await notify('🎡 HHCLUB 幸运大转盘', body);
+    if (!sent) log('ℹ️ 没有可用的通知渠道，本次只写了日志');
 }
 
 main().catch(error => {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.21.0
+// @version      1.22.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 一抽到底 · 实时余额 · 站内信清理
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -45,8 +45,22 @@
 
     const CONFIG = {
         // 抽奖间隔允许范围（秒）
-        minInterval: 3,
+        minInterval: 0.5,
         maxInterval: 300,
+        /* 自适应间隔。
+
+           站点返回的 data.duration 是转盘动画时长，页面要等它转完才让再抽 ——
+           这就是「重复点击」提示的来源。所以真正的节奏由站点说了算，
+           盯着一个固定的 7 秒纯属瞎等。
+
+           策略：以 duration + 缓冲起步，连续成功就一点点往下探，
+           一被限流就退回来并记住这个速度不安全，之后不再探到它以下。 */
+        pace: {
+            bufferMs: 300,        // 动画时长之外多留一点，覆盖网络抖动
+            probeStepMs: 200,     // 每次往下探的步长
+            probeAfterSuccess: 3, // 连续成功几次才敢再探一档
+            floorMs: 600          // 绝对下限，再快也不往下走
+        },
         // 被限流时的退避策略
         backoffAfterErrors: 3,
         backoffFactor: 1.5,
@@ -127,6 +141,11 @@
     let errorStreak = 0;
     let rateLimitStreak = 0;
     let dynamicInterval = 7000;
+    // 自适应间隔的运行时状态
+    let serverDurationMs = 0;   // 站点最近一次给的转盘时长，0 = 还没读到
+    let paceMs = 0;             // 当前自适应出来的间隔，0 = 还没起步
+    let paceFloorMs = 0;        // 已经被限流证明「不安全」的速度，不再往下探
+    let paceSuccessStreak = 0;
     let roundStartDraws = 0;
     let sleepTimer = null;
     let sleepResolve = null;
@@ -139,6 +158,7 @@
 
     let settings = {
         interval: 7,
+        autoPace: true,
         maxCount: 10,
         viewMode: 'current',
         animation: true,
@@ -383,6 +403,7 @@
         // 存下来的值可能来自旧版本、别的合法区间，或者被手改过。
         // 不在这里收敛的话，输入框会显示一个和实际生效值不一样的数字。
         settings.interval = normalizeInterval(settings.interval, 7);
+        settings.autoPace = settings.autoPace !== false;
         settings.maxCount = Math.max(1, parseInt(settings.maxCount, 10) || 10);
         if (settings.viewMode !== 'total') settings.viewMode = 'current';
         if (settings.detailOpen !== 'all') settings.detailOpen = 'none';
@@ -1552,6 +1573,17 @@
     background: #fffdf9;
     text-align: right;
 }
+#lottery-control-panel .hh-pace-info {
+    flex: 0 0 auto;
+    font-size: 10px;
+    font-weight: 700;
+    color: #5a4030;
+    padding: 3px 8px;
+    border: 1px solid #e8d5bc;
+    border-radius: 6px;
+    background: #fffdf9;
+    white-space: nowrap;
+}
 #lottery-control-panel .hh-drain-hint {
     margin-top: 5px;
     font-size: 9px;
@@ -1744,6 +1776,17 @@
                         <label>🎯 最大抽奖次数</label>
                         <input type="number" id="max-lottery-count" value="10" min="1" max="1000">
                     </div>
+                </div>
+
+                <div class="hh-drain">
+                    <label class="hh-drain-toggle">
+                        <input type="checkbox" id="auto-pace">
+                        <span>⚡ 自适应间隔</span>
+                    </label>
+                    <span id="pace-info" class="hh-pace-info">等站点报时长</span>
+                </div>
+                <div id="pace-hint" class="hh-drain-hint">
+                    跟着站点转盘时长走，连续成功就自动提速，被限流就退回来 —— 上面的间隔不再生效
                 </div>
 
                 <div class="hh-drain">
@@ -2482,7 +2525,64 @@
     /* 说多久就是多久 —— 以前会在设定值上下浮动 15%，
        填 3 秒实际可能跑成 2.55 或 3.45 秒，对不上账。 */
     function nextDelayMs() {
-        return Math.max(1000, Math.round(dynamicInterval));
+        return Math.max(CONFIG.pace.floorMs, Math.round(dynamicInterval));
+    }
+
+    /* 自适应模式的起步值：站点报了转盘时长就用它，没报就先用手填的。 */
+    function paceStartMs() {
+        return serverDurationMs
+            ? serverDurationMs + CONFIG.pace.bufferMs
+            : baseIntervalMs();
+    }
+
+    function resetPace() {
+        serverDurationMs = 0;
+        paceMs = 0;
+        paceFloorMs = CONFIG.pace.floorMs;
+        paceSuccessStreak = 0;
+        setPaceInfo();
+    }
+
+    /* 抽成了一次：记下站点报的时长，够稳了就往下探一档。 */
+    function paceOnSuccess(data) {
+        const raw = Number(data?.data?.duration);
+        if (Number.isFinite(raw) && raw > 0 && raw <= 300000) {
+            if (!serverDurationMs) {
+                addLog(`⚡ 站点转盘时长 ${intervalText(raw / 1000)} 秒，按它排下一抽`, 'info');
+            }
+            serverDurationMs = raw;
+            setPaceInfo();
+        }
+
+        if (!paceMs) {
+            paceMs = paceStartMs();
+            paceSuccessStreak = 0;
+            return;
+        }
+
+        paceSuccessStreak++;
+        if (paceSuccessStreak < CONFIG.pace.probeAfterSuccess) return;
+        paceSuccessStreak = 0;
+
+        const next = Math.max(paceFloorMs, paceMs - CONFIG.pace.probeStepMs);
+        if (next < paceMs) {
+            paceMs = next;
+            addLog(`⚡ 一路顺，提速到 ${intervalText(paceMs / 1000)} 秒`, 'info');
+        }
+    }
+
+    /* 被限流了：这个速度不安全，退回去并记死下限。
+       自适应模式下第一次被拒就退 —— 我们本来就在试边界，被拒就是答案。 */
+    function paceOnRateLimit() {
+        paceSuccessStreak = 0;
+        if (!paceMs) paceMs = paceStartMs();
+
+        paceFloorMs = Math.max(paceFloorMs, paceMs + CONFIG.pace.probeStepMs);
+        paceMs = Math.min(
+            CONFIG.maxBackoffMs,
+            Math.max(paceFloorMs, Math.round(paceMs * CONFIG.backoffFactor), paceStartMs())
+        );
+        addLog(`🐢 太快了，退回 ${intervalText(paceMs / 1000)} 秒`, 'warning');
     }
 
     function setCurrentIntervalDisplay() {
@@ -2511,7 +2611,12 @@
         if (data.ret === 0) {
             errorStreak = 0;
             rateLimitStreak = 0;
-            dynamicInterval = baseIntervalMs();
+            if (settings.autoPace) {
+                paceOnSuccess(data);
+                dynamicInterval = paceMs;
+            } else {
+                dynamicInterval = baseIntervalMs();
+            }
             setCurrentIntervalDisplay();
 
             const prizeText = decodeUnicode(data.data?.prize_text || '未知奖品');
@@ -2539,10 +2644,14 @@
             rateLimitStreak++;
             addLog(`⏳ ${msg}`, 'warning');
 
-            if (rateLimitStreak >= CONFIG.backoffAfterErrors) {
+            if (settings.autoPace) {
+                paceOnRateLimit();
+                dynamicInterval = paceMs;
+                setCurrentIntervalDisplay();
+            } else if (rateLimitStreak >= CONFIG.backoffAfterErrors) {
                 dynamicInterval = Math.min(dynamicInterval * CONFIG.backoffFactor, CONFIG.maxBackoffMs);
                 setCurrentIntervalDisplay();
-                addLog(`🔄 请求频繁，间隔自动调整至 ${(dynamicInterval / 1000).toFixed(1)} 秒`, 'warning');
+                addLog(`🔄 请求频繁，间隔自动调整至 ${intervalText(dynamicInterval / 1000)} 秒`, 'warning');
             }
 
             if (rateLimitStreak >= CONFIG.maxRateLimitRetries) {
@@ -2639,7 +2748,8 @@
             return;
         }
 
-        dynamicInterval = Math.round(interval * 1000);
+        resetPace();
+        dynamicInterval = settings.autoPace ? paceStartMs() : Math.round(interval * 1000);
         errorStreak = 0;
         rateLimitStreak = 0;
         mailCleaned = 0;
@@ -2650,9 +2760,8 @@
 
         const status = $('lottery-status');
         if (status) {
-            status.textContent = settings.drainMode
-                ? `一抽到底 · ${intervalText(interval)}s`
-                : `运行中 · ${intervalText(interval)}s`;
+            const pace = settings.autoPace ? '自适应' : `${intervalText(interval)}s`;
+            status.textContent = settings.drainMode ? `一抽到底 · ${pace}` : `运行中 · ${pace}`;
             status.style.color = '#4d8a3a';
         }
 
@@ -2664,9 +2773,12 @@
         const stopButton = $('stop-lottery');
         if (stopButton) stopButton.disabled = false;
 
+        const paceText = settings.autoPace
+            ? '间隔自适应（跟站点转盘时长）'
+            : `间隔 ${intervalText(interval)} 秒`;
         addLog(settings.drainMode
-            ? `🔥 一抽到底 · 保留 ${fmt(reserve)} 憨豆 · 间隔 ${intervalText(interval)} 秒`
-            : `🚀 开始抽奖 · ${maxCount} 次 · 间隔 ${intervalText(interval)} 秒`, 'success');
+            ? `🔥 一抽到底 · 保留 ${fmt(reserve)} 憨豆 · ${paceText}`
+            : `🚀 开始抽奖 · ${maxCount} 次 · ${paceText}`, 'success');
 
         // 循环里任何一处抛异常都不能静默吞掉 —— 不接这个 catch 的话
         // running 会一直卡在 true，面板显示「抽奖进行中」但其实早停了
@@ -3462,6 +3574,22 @@
             render();
         });
 
+        on('auto-pace', 'change', event => {
+            settings.autoPace = !!event.target.checked;
+            saveSettings();
+            applyPaceUI();
+
+            if (settings.autoPace) {
+                // 开着抽的时候切过来，从站点报的时长重新起步，别继承手填的数
+                paceMs = paceStartMs();
+                paceSuccessStreak = 0;
+                if (running) dynamicInterval = paceMs;
+            } else if (running) {
+                dynamicInterval = baseIntervalMs();
+            }
+            setCurrentIntervalDisplay();
+        });
+
         on('lottery-interval', 'change', event => {
             const value = normalizeInterval(event.target.value, settings.interval);
             event.target.value = intervalText(value);
@@ -3470,8 +3598,10 @@
 
             // 运行中改间隔立刻生效，不必重启；没在跑的时候也要跟上，
             // 否则「当前间隔」会一直挂着上一次的数，和输入框对不上
-            dynamicInterval = Math.round(value * 1000);
-            setCurrentIntervalDisplay();
+            if (!settings.autoPace) {
+                dynamicInterval = Math.round(value * 1000);
+                setCurrentIntervalDisplay();
+            }
         });
 
         on('max-lottery-count', 'change', event => {
@@ -3554,6 +3684,9 @@
         const viewSelect = $('view-mode');
         if (viewSelect) viewSelect.value = settings.viewMode;
 
+        const paceToggle = $('auto-pace');
+        if (paceToggle) paceToggle.checked = !!settings.autoPace;
+
         const drainToggle = $('drain-mode');
         if (drainToggle) drainToggle.checked = !!settings.drainMode;
 
@@ -3563,17 +3696,39 @@
         const mailToggle = $('auto-clean-mail');
         if (mailToggle) mailToggle.checked = !!settings.autoCleanMail;
 
+        applyPaceUI();
         applyDrainUI();
         applyMailUI();
 
         setText('toggle-animation', `🎉 中奖动画：${settings.animation ? '开' : '关'}`);
         setText('toggle-all-tiers', settings.detailOpen === 'all' ? '🔼 收起全部档位' : '🔽 展开全部档位');
 
+        paceFloorMs = CONFIG.pace.floorMs;
         dynamicInterval = Math.round(settings.interval * 1000);
         setCurrentIntervalDisplay();
+        setPaceInfo();
     }
 
     /* 一抽到底开着时「最大抽奖次数」不起作用，置灰，免得以为设了有用 */
+    function applyPaceUI() {
+        const intervalInput = $('lottery-interval');
+        if (intervalInput) {
+            intervalInput.disabled = !!settings.autoPace;
+            intervalInput.style.opacity = settings.autoPace ? '.45' : '';
+        }
+        $('pace-hint')?.classList.toggle('is-on', !!settings.autoPace);
+        const info = $('pace-info');
+        if (info) info.style.display = settings.autoPace ? '' : 'none';
+    }
+
+    function setPaceInfo() {
+        const info = $('pace-info');
+        if (!info) return;
+        info.textContent = serverDurationMs
+            ? `站点转盘 ${intervalText(serverDurationMs / 1000)}s`
+            : '等站点报时长';
+    }
+
     function applyDrainUI() {
         const maxInput = $('max-lottery-count');
         if (maxInput) {
