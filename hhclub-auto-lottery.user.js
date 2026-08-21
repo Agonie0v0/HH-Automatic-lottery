@@ -3468,11 +3468,10 @@
             settings.interval = value;
             saveSettings();
 
-            // 运行中改间隔立刻生效，不必重启
-            if (running) {
-                dynamicInterval = Math.round(value * 1000);
-                setCurrentIntervalDisplay();
-            }
+            // 运行中改间隔立刻生效，不必重启；没在跑的时候也要跟上，
+            // 否则「当前间隔」会一直挂着上一次的数，和输入框对不上
+            dynamicInterval = Math.round(value * 1000);
+            setCurrentIntervalDisplay();
         });
 
         on('max-lottery-count', 'change', event => {
