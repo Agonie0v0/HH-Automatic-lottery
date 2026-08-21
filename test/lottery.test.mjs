@@ -2527,12 +2527,15 @@ console.log('\n[51] 站点的冷却就是上一抽的 duration，跟着它排队
 
     check('3 次都抽出去了', stamps.length === 3, `实际 ${stamps.length} 次`);
 
+    // 缓冲默认 0，计时从「发出请求」那刻算 —— 发枪间距应该就是 2500 上下
     const gaps = stamps.slice(1).map((t, i) => t - stamps[i]);
-    check('按 2500 + 500 排，没有按填的 1 秒',
-        gaps.every(gap => gap >= 2900 && gap < 4200), gaps.join(' / '));
+    check('按转盘的 2500ms 排，没有按填的 1 秒',
+        gaps.every(gap => gap >= 2350 && gap < 3600), gaps.join(' / '));
     check('面板报出上一抽的转盘时长和本次要等多久',
-        d.getElementById('duration-info').textContent === '上一抽转盘 2.5s · 本次等 3s',
+        d.getElementById('duration-info').textContent === '上一抽转盘 2.5s · 本次等 2.5s',
         d.getElementById('duration-info').textContent);
+    check('缓冲输入框默认 0', d.getElementById('duration-buffer').value === '0',
+        d.getElementById('duration-buffer').value);
 }
 
 /* ---------------------------------------------------------------- */
@@ -2566,7 +2569,7 @@ console.log('\n[52] 填的间隔只当下限，站点转得快也不会更快');
 
     const gaps = stamps.slice(1).map((t, i) => t - stamps[i]);
     check('转盘只要 0.6 秒，但填了 3 秒下限，就走 3 秒',
-        gaps.every(gap => gap >= 2900 && gap < 4200), gaps.join(' / '));
+        gaps.every(gap => gap >= 2850 && gap < 4200), gaps.join(' / '));
 }
 
 /* ---------------------------------------------------------------- */
@@ -2601,24 +2604,26 @@ console.log('\n[53] 每抽的 duration 都不一样，逐抽跟上');
     await untilStopped(d, 30000);
 
     const gaps = stamps.slice(1).map((t, i2) => t - stamps[i2]);
-    check('第一段按 3000 + 500 等', gaps[0] >= 3400 && gaps[0] < 4600, `实际 ${gaps[0]}`);
-    check('第二段按 1000 + 500 等，跟着降下来', gaps[1] >= 1400 && gaps[1] < 2600, `实际 ${gaps[1]}`);
+    check('第一段按 3000 等', gaps[0] >= 2850 && gaps[0] < 4100, `实际 ${gaps[0]}`);
+    check('第二段按 1000 等，跟着降下来', gaps[1] >= 900 && gaps[1] < 2100, `实际 ${gaps[1]}`);
 }
 
 /* ---------------------------------------------------------------- */
-console.log('\n[54] 被「不要重复点击」挡回时，日志说清是没等够');
+console.log('\n[54] 被「不要重复点击」挡回时快速补枪，不等满一个周期');
 {
+    // 实测：被拒不会重置服务端的冷却计时，也不扣憨豆，
+    // 所以贴边失手的正确处理是 300ms 后直接补一枪
     const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
     const w = dom.window;
 
-    let draws = 0;
+    const stamps = [];
     w.fetch = async url => {
         const target = String(url);
         if (target.includes('lucky.php')) {
             return { ok: true, status: 200, text: async () => '<html><body></body></html>' };
         }
-        draws++;
-        if (draws === 2) {
+        stamps.push(Date.now());
+        if (stamps.length === 2) {
             return {
                 ok: true, status: 200,
                 text: async () => JSON.stringify({ ret: -1, msg: '不要重复点击！' })
@@ -2640,8 +2645,14 @@ console.log('\n[54] 被「不要重复点击」挡回时，日志说清是没等
     d.getElementById('start-lottery').click();
     await untilStopped(d, 30000);
 
+    check('被拒后是补枪，总共 3 个请求换 2 次成功', stamps.length === 3, `实际 ${stamps.length}`);
+    check('补枪来得快（~300ms），没等满一个周期',
+        stamps[2] - stamps[1] >= 250 && stamps[2] - stamps[1] < 1100,
+        `实际 ${stamps[2] - stamps[1]}ms`);
+
     const log = d.getElementById('lottery-log').textContent;
-    check('日志点出上一抽转盘多久', /不要重复点击.*上一抽转盘 1.2 秒，没等够/.test(log),
+    check('日志说清没等够、几毫秒后补枪',
+        /不要重复点击.*上一抽转盘 1.2 秒，没等够 · 300ms 后补一枪/.test(log),
         log.slice(0, 300));
 }
 
@@ -2685,6 +2696,52 @@ console.log('\n[55] 关掉跟随，就只认填的间隔');
     const gaps = stamps.slice(1).map((t, i) => t - stamps[i]);
     check('站点报 5 秒也不管，就走填的 1.5 秒',
         gaps.every(gap => gap >= 1400 && gap < 2600), gaps.join(' / '));
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[56] 缓冲可以自定义，负值也行');
+{
+    // 服务端在请求路上就开始计时，所以负缓冲是合法的贴边策略
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+    const w = dom.window;
+
+    const stamps = [];
+    w.fetch = async url => {
+        const target = String(url);
+        if (target.includes('lucky.php')) {
+            return { ok: true, status: 200, text: async () => '<html><body></body></html>' };
+        }
+        stamps.push(Date.now());
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({
+                ret: 0, data: { prize_text: '100 魔力', duration: 2000 }
+            })
+        };
+    };
+
+    await run(dom, { followDuration: true });
+    const d = w.document;
+
+    const buffer = d.getElementById('duration-buffer');
+    buffer.value = '-9999';
+    buffer.dispatchEvent(new w.Event('change'));
+    check('低于下限收敛到 -500', buffer.value === '-500', buffer.value);
+
+    buffer.value = '-300';
+    buffer.dispatchEvent(new w.Event('change'));
+    check('负缓冲存下来了',
+        JSON.parse(w.localStorage.getItem('hhanclub_lottery_settings_v1')).bufferMs === -300);
+
+    d.getElementById('lottery-interval').value = '0.5';
+    d.getElementById('lottery-interval').dispatchEvent(new w.Event('change'));
+    d.getElementById('max-lottery-count').value = '3';
+    d.getElementById('start-lottery').click();
+    await untilStopped(d, 30000);
+
+    const gaps = stamps.slice(1).map((t, i) => t - stamps[i]);
+    check('间距按 2000 - 300 = 1700 排',
+        gaps.every(gap => gap >= 1550 && gap < 2700), gaps.join(' / '));
 }
 
 /* ---------------------------------------------------------------- */

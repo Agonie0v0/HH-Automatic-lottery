@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.24.0
+// @version      1.25.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 一抽到底 · 实时余额 · 站内信清理
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -43,6 +43,13 @@
         return String(Math.round(seconds * 100) / 100);
     }
 
+    /* 转盘缓冲（毫秒），允许负值 —— 服务端在请求路上就开始计时了 */
+    function normalizeBufferMs(raw, fallback) {
+        const value = parseInt(raw, 10);
+        const ms = Number.isFinite(value) ? value : fallback;
+        return Math.min(CONFIG.maxBufferMs, Math.max(CONFIG.minBufferMs, ms));
+    }
+
     const CONFIG = {
         // 抽奖间隔允许范围（秒）
         minInterval: 0.5,
@@ -58,10 +65,20 @@
            一次的值都不相关，相关系数 -0.06）。所以任何固定间隔都躲不掉
            「不要重复点击」—— 填 5.1 秒时超过一半的抽会撞上。
 
-           跟着 duration 排队才是对的：同样 100 抽，0 次被拒，平均间隔
-           6.4 秒。500ms 缓冲覆盖「服务端受理时刻」和「我们收到响应的
-           时刻」之间的往返差，实测最小余量 616ms。 */
-        durationBufferMs: 500,
+           跟着 duration 排队才是对的：同样 100 抽，0 次被拒。
+
+           两个能再抠时间的实测事实：
+           1. 服务端从「受理请求」那一刻起计时，响应回到我们手里时它已经
+              计了半个往返（~130ms）。所以计时起点用「发出请求」的时刻，
+              缓冲设 0 甚至负值都是可行的 —— 用户实测缓冲 0 没被拒。
+           2. 被「不要重复点击」挡回不会重置服务端的计时（边界探测时连吃
+              16 个拒绝后照样按原时刻放行），被拒也不扣憨豆。所以贴边
+              失手的代价只是一个空请求，300ms 后补一枪就行，不必再等
+              一个完整周期。 */
+        minBufferMs: -500,
+        maxBufferMs: 5000,
+        // 被「不要重复点击」挡回后多久补一枪
+        rateLimitRetryMs: 300,
         // 被限流时的退避策略
         backoffAfterErrors: 3,
         backoffFactor: 1.5,
@@ -144,6 +161,11 @@
     let dynamicInterval = 6800;
     // 站点最近一次给的转盘时长，就是下一抽的冷却下限
     let lastDurationMs = 0;
+    // 上一次抽奖请求「发出」的时刻 —— 服务端的冷却从受理那刻起算，
+    // 等待时间要从这里量，处理响应花掉的时间不用重复等
+    let lastDrawSentAt = 0;
+    // 被限流后下一次等待的覆盖值（快速补枪），用一次就清
+    let quickRetryMs = 0;
     let roundStartDraws = 0;
     let sleepTimer = null;
     let sleepResolve = null;
@@ -157,6 +179,7 @@
     let settings = {
         interval: 6.8,
         followDuration: true,
+        bufferMs: 0,
         maxCount: 10,
         viewMode: 'current',
         animation: true,
@@ -402,6 +425,7 @@
         // 不在这里收敛的话，输入框会显示一个和实际生效值不一样的数字。
         settings.interval = normalizeInterval(settings.interval, 6.8);
         settings.followDuration = settings.followDuration !== false;
+        settings.bufferMs = normalizeBufferMs(settings.bufferMs, 0);
         settings.maxCount = Math.max(1, parseInt(settings.maxCount, 10) || 10);
         if (settings.viewMode !== 'total') settings.viewMode = 'current';
         if (settings.detailOpen !== 'all') settings.detailOpen = 'none';
@@ -1781,11 +1805,20 @@
                         <input type="checkbox" id="follow-duration">
                         <span>⏱ 跟随转盘时长</span>
                     </label>
-                    <span id="duration-info" class="hh-duration-info">等站点报第一个转盘时长</span>
+                    <div class="hh-drain-reserve">
+                        <span>缓冲</span>
+                        <input type="number" id="duration-buffer" value="0" step="50"
+                               min="${CONFIG.minBufferMs}" max="${CONFIG.maxBufferMs}">
+                        <span>ms</span>
+                    </div>
                 </div>
                 <div id="duration-hint" class="hh-drain-hint">
-                    站点的冷却就是上一抽转盘转多久（实测 4~7.7 秒随机）—— 跟着它排队才不会被
-                    「不要重复点击」挡回。上面填的间隔只当下限，想快就往小了填
+                    站点的冷却就是上一抽转盘转多久（实测 3~8 秒随机），跟着它排队；上面填的间隔只当下限。
+                    缓冲可以为负 —— 请求在网络上飞的时候服务端已经在计时。
+                    贴边被「不要重复点击」挡回不扣憨豆，${CONFIG.rateLimitRetryMs}ms 后自动补一枪
+                </div>
+                <div class="hh-drain" style="justify-content:flex-end;">
+                    <span id="duration-info" class="hh-duration-info">等站点报第一个转盘时长</span>
                 </div>
 
                 <div class="hh-drain">
@@ -2523,21 +2556,39 @@
 
     /* 说多久就是多久 —— 以前会在设定值上下浮动 15%，
        填 3 秒实际可能跑成 2.55 或 3.45 秒，对不上账。 */
-    /* 下一抽等多久。
+    /* 计划中的这一轮抽奖间隔（从发出上一枪算起）。
 
        站点的冷却就是上一抽的 duration，所以真正的下限由它说了算；
        手填的间隔只作为「再慢也不低于这个数」的底。 */
-    function nextDelayMs() {
+    function plannedGapMs() {
         const floor = Math.max(500, Math.round(dynamicInterval));
         if (!settings.followDuration || !lastDurationMs) return floor;
-        return Math.max(floor, lastDurationMs + CONFIG.durationBufferMs);
+        return Math.max(floor, lastDurationMs + settings.bufferMs);
+    }
+
+    function nextDelayMs() {
+        // 被限流后的快速补枪：被拒不会重置服务端计时，等满一个周期纯属浪费
+        if (quickRetryMs > 0) {
+            const wait = quickRetryMs;
+            quickRetryMs = 0;
+            return wait;
+        }
+
+        const gap = plannedGapMs();
+        if (settings.followDuration && lastDurationMs && lastDrawSentAt) {
+            // 计时起点是「发出请求」那一刻 —— 响应传输和本地结算花掉的
+            // 时间已经在冷却里数过了，从间隔里扣掉
+            const elapsed = Date.now() - lastDrawSentAt;
+            return Math.max(250, gap - elapsed);
+        }
+        return gap;
     }
 
     function setDurationInfo() {
         const info = $('duration-info');
         if (!info) return;
         info.textContent = lastDurationMs
-            ? `上一抽转盘 ${intervalText(lastDurationMs / 1000)}s · 本次等 ${intervalText(nextDelayMs() / 1000)}s`
+            ? `上一抽转盘 ${intervalText(lastDurationMs / 1000)}s · 本次等 ${intervalText(plannedGapMs() / 1000)}s`
             : '等站点报第一个转盘时长';
     }
 
@@ -2551,6 +2602,9 @@
         addLog(settings.drainMode
             ? `🎲 第 ${roundCount + 1} 次抽奖 · 余额 ${fmt(beanBalance)}`
             : `🎲 第 ${roundCount + 1}/${maxCount} 次抽奖`, 'info');
+
+        // 冷却从服务端受理这一枪就开始计时，把发出时刻记下来当起点
+        lastDrawSentAt = Date.now();
 
         const result = await performLottery();
         if (!running) return;
@@ -2598,16 +2652,19 @@
 
         if (msg.includes('重复点击') || msg.includes('请稍后') || msg.includes('频繁')) {
             rateLimitStreak++;
-            if (settings.followDuration && lastDurationMs) {
-                addLog(`⏳ ${msg}（上一抽转盘 ${intervalText(lastDurationMs / 1000)} 秒，没等够）`, 'warning');
+            if (settings.followDuration) {
+                // 被拒不重置服务端计时、也不扣憨豆，快速补枪即可
+                quickRetryMs = CONFIG.rateLimitRetryMs;
+                addLog(lastDurationMs
+                    ? `⏳ ${msg}（上一抽转盘 ${intervalText(lastDurationMs / 1000)} 秒，没等够 · ${CONFIG.rateLimitRetryMs}ms 后补一枪）`
+                    : `⏳ ${msg}（${CONFIG.rateLimitRetryMs}ms 后补一枪）`, 'warning');
             } else {
                 addLog(`⏳ ${msg}`, 'warning');
-            }
-
-            if (rateLimitStreak >= CONFIG.backoffAfterErrors) {
-                dynamicInterval = Math.min(dynamicInterval * CONFIG.backoffFactor, CONFIG.maxBackoffMs);
-                setCurrentIntervalDisplay();
-                addLog(`🔄 请求频繁，间隔自动调整至 ${intervalText(dynamicInterval / 1000)} 秒`, 'warning');
+                if (rateLimitStreak >= CONFIG.backoffAfterErrors) {
+                    dynamicInterval = Math.min(dynamicInterval * CONFIG.backoffFactor, CONFIG.maxBackoffMs);
+                    setCurrentIntervalDisplay();
+                    addLog(`🔄 请求频繁，间隔自动调整至 ${intervalText(dynamicInterval / 1000)} 秒`, 'warning');
+                }
             }
 
             if (rateLimitStreak >= CONFIG.maxRateLimitRetries) {
@@ -2705,6 +2762,8 @@
         }
 
         lastDurationMs = 0;
+        lastDrawSentAt = 0;
+        quickRetryMs = 0;
         setDurationInfo();
         dynamicInterval = Math.round(interval * 1000);
         errorStreak = 0;
@@ -3536,6 +3595,14 @@
             setDurationInfo();
         });
 
+        on('duration-buffer', 'change', event => {
+            const value = normalizeBufferMs(event.target.value, settings.bufferMs);
+            event.target.value = value;
+            settings.bufferMs = value;
+            saveSettings();
+            setDurationInfo();
+        });
+
         on('lottery-interval', 'change', event => {
             const value = normalizeInterval(event.target.value, settings.interval);
             event.target.value = intervalText(value);
@@ -3632,6 +3699,9 @@
         const followToggle = $('follow-duration');
         if (followToggle) followToggle.checked = !!settings.followDuration;
 
+        const bufferInput = $('duration-buffer');
+        if (bufferInput) bufferInput.value = settings.bufferMs;
+
         const drainToggle = $('drain-mode');
         if (drainToggle) drainToggle.checked = !!settings.drainMode;
 
@@ -3658,6 +3728,11 @@
         $('duration-hint')?.classList.toggle('is-on', !!settings.followDuration);
         const info = $('duration-info');
         if (info) info.style.display = settings.followDuration ? '' : 'none';
+        const buffer = $('duration-buffer');
+        if (buffer) {
+            buffer.disabled = !settings.followDuration;
+            buffer.style.opacity = settings.followDuration ? '' : '.45';
+        }
     }
 
     function applyDrainUI() {
