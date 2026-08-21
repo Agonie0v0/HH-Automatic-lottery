@@ -221,19 +221,28 @@ function readCookie() {
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 /* 日志时间。跑在容器里的话系统时区多半是 UTC，跟人对不上，
-   所以按 CONFIG.timezone 显示；时区名写错就退回 ISO。 */
+   所以按 CONFIG.timezone 显示；时区名写错就退回 ISO。
+
+   自己拼而不是直接用 toLocaleString 的返回值 —— 那个的分隔符跟平台的
+   ICU 版本走：Windows 上是「08/19 09:05:01」，Linux 上会变成
+   「08/21, 10:30:27」，多个逗号。日志格式不该看跑在哪台机器上。 */
 function stamp() {
     const now = new Date();
     try {
-        return now.toLocaleString('zh-CN', {
+        const parts = new Intl.DateTimeFormat('en-GB', {
             timeZone: CONFIG.timezone || undefined,
-            hour12: false,
+            hourCycle: 'h23',
             month: '2-digit',
             day: '2-digit',
             hour: '2-digit',
             minute: '2-digit',
             second: '2-digit'
-        });
+        }).formatToParts(now).reduce((acc, part) => {
+            acc[part.type] = part.value;
+            return acc;
+        }, {});
+
+        return `${parts.month}/${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
     } catch (error) {
         return now.toISOString().slice(5, 19).replace('T', ' ');
     }
@@ -1136,27 +1145,39 @@ async function notify(title, content, { preferTelegram = false } = {}) {
     process.env.HITOKOTO = 'false';
 
     try {
-        let sent = false;
+        const done = [];
+        let telegramSent = false;
 
-        if (preferTelegram && await sendTelegramDirect(title, content)) sent = true;
+        // 手动停止时先走 Telegram：路径最短，来得及送出去
+        if (preferTelegram && CONFIG.tgBotToken && CONFIG.tgUserId) {
+            telegramSent = await sendTelegramDirect(title, content);
+            done.push(`Telegram ${telegramSent ? '✓' : '✗'}`);
+        }
 
-        if (!sent) {
-            const send = loadNotifyModule();
-            if (send) {
-                try {
-                    await send(title, content);
-                    sent = true;
-                } catch (error) {
-                    log(`⚠️ sendNotify 发送失败：${error?.message || error}`);
-                }
+        // 青龙的 sendNotify：一个渠道都没配的时候它也不会报错、也不返回状态，
+        // 所以这里只能说「调用了」，不能当成「送达了」—— 实测遇到过日志写着
+        // 通知已发出、实际什么都没收到。
+        const send = loadNotifyModule();
+        if (send) {
+            try {
+                await send(title, content);
+                done.push('青龙 sendNotify（已调用，送达与否取决于你在青龙里配了哪些渠道）');
+            } catch (error) {
+                log(`⚠️ sendNotify 发送失败：${error?.message || error}`);
             }
         }
 
-        // sendNotify 没有或者发砸了，挨个兜底
-        if (!sent && !preferTelegram && await sendTelegramDirect(title, content)) sent = true;
-        if (!sent && await sendWebhook(title, content)) sent = true;
+        // 自己配在这个脚本里的渠道一律照发 —— 配了就是想用，
+        // 不能因为 sendNotify 没报错就跳过。不想重复推的话别两边都配。
+        if (!telegramSent && CONFIG.tgBotToken && CONFIG.tgUserId) {
+            done.push(`Telegram ${await sendTelegramDirect(title, content) ? '✓' : '✗'}`);
+        }
+        if (CONFIG.webhookUrl) {
+            done.push(`Webhook ${await sendWebhook(title, content) ? '✓' : '✗'}`);
+        }
 
-        return sent;
+        if (done.length) log(`📤 通知：${done.join(' · ')}`);
+        return done.length > 0;
     } finally {
         if (hadHitokoto) process.env.HITOKOTO = originalHitokoto;
         else delete process.env.HITOKOTO;
@@ -1210,7 +1231,7 @@ function guardExit(lottery) {
                 ].join('\n');
 
                 const sent = await notify('🛑 HHCLUB 幸运大转盘 · 手动停止', body, { preferTelegram: true });
-                log(sent ? '✅ 停止通知已发出' : 'ℹ️ 没有可用的通知渠道，跳过推送');
+                if (!sent) log('ℹ️ 没有可用的通知渠道，数据已存好，直接退出');
             } catch (error) {
                 log(`⚠️ 停止通知发送异常：${error?.message || error}`);
             } finally {

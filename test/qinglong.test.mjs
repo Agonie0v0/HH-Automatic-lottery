@@ -1117,6 +1117,7 @@ console.log('\n[36] 不在青龙里也能收到通知：Webhook 兜底');
     check('正文报了运行时长', /本次运行 \d+ 秒/.test(hook.got[0]?.content || ''),
         (hook.got[0]?.content || '').slice(0, 200));
     check('不再说「没有可用的通知渠道」', !/没有可用的通知渠道/.test(out), out.slice(-300));
+    check('日志里逐个渠道报了结果', /📤 通知：Webhook ✓/.test(out), out.slice(-400));
 
     await hook.close();
     await site.close();
@@ -1307,6 +1308,55 @@ console.log('\n[44] 老用户把设置写在脚本里：头一次跑就固化成
         site.state.draws === 4, `两次共抽了 ${site.state.draws} 次`);
     check('不会重复生成、把改过的覆盖回去',
         !/📝 已把当前设置存成/.test(second.out), second.out.slice(0, 400));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[45] sendNotify 在但一个渠道都没配时，自己配的渠道照发');
+{
+    // 线上实测踩到的：青龙里 sendNotify.js 存在，但 config.sh 一个推送
+    // 渠道都没配。调它不报错，于是被当成「发出去了」，Webhook 兜底根本
+    // 没走 —— 日志写着通知已发出，实际什么都没收到。
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
+    const hook = await startWebhook();
+
+    const { dir, file } = installScript(
+        { host: site.state.origin, draws: 1, webhookUrl: hook.url },
+        null,
+        {
+            // 装样子的 sendNotify：不报错，也什么都不做，跟没配渠道时一模一样
+            'sendNotify.js': 'module.exports = async function () { return; };\n'
+        }
+    );
+
+    const { out } = await runFile(file, dir);
+
+    check('sendNotify 被调用了', /青龙 sendNotify（已调用/.test(out), out.slice(-500));
+    check('不打包票说「已送达」', !/sendNotify ✓/.test(out), out.slice(-500));
+    check('Webhook 照样发了 —— 这就是那个 bug',
+        hook.got.length === 1, `实际 ${hook.got.length} 条`);
+    check('逐个渠道报了结果', /📤 通知：.*Webhook ✓/.test(out), out.slice(-500));
+
+    await hook.close();
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[46] 时间戳格式不随平台变（Linux 上曾多出个逗号）');
+{
+    // toLocaleString('zh-CN') 的分隔符跟 ICU 版本走：
+    // Windows 上「08/19 09:05:01」，Linux 上「08/21, 10:30:27」。
+    // 一直在 Windows 上跑测试，所以这个差异到实机才暴露。
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
+
+    const { out } = await runScript({ host: site.state.origin, draws: 1 });
+    const stamps = [...out.matchAll(/^\[([^\]]+)\]/gm)].map(m => m[1]);
+
+    check('每条日志的时间戳都是 MM/DD HH:MM:SS',
+        stamps.length > 0 && stamps.every(text => /^\d\d\/\d\d \d\d:\d\d:\d\d$/.test(text)),
+        stamps.find(text => !/^\d\d\/\d\d \d\d:\d\d:\d\d$/.test(text)) || stamps[0]);
+    check('里面没有逗号', stamps.every(text => !text.includes(',')), stamps[0]);
 
     await site.close();
 }
