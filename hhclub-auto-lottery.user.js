@@ -1817,7 +1817,7 @@
                     </div>
                 </div>
                 <div id="duration-hint" class="hh-drain-hint">
-                    转盘转多久就等多久，自动排队。缓冲越小抽得越快（可为负），被挡回也不扣憨豆
+                    转盘转多久就等多久，自动排队。缓冲越小抽得越快（可为负）
                 </div>
                 <div class="hh-drain" style="justify-content:flex-end;">
                     <span id="duration-info" class="hh-duration-info">等第一抽后自动调节</span>
