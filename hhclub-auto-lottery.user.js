@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.25.0
+// @version      1.26.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 一抽到底 · 实时余额 · 站内信清理
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -79,6 +79,10 @@
         maxBufferMs: 5000,
         // 被「不要重复点击」挡回后多久补一枪
         rateLimitRetryMs: 300,
+        // 自适应模式下还没拿到第一个 duration 时先按这个等（取实测中位数）。
+        // 正常只有第一抽失败时才轮得到它 —— 第一抽本来就不用等，
+        // 抽成了下一轮就有真的 duration 了
+        blindGapMs: 5000,
         // 冷却剩多久不知道时（本轮还没成功过，比如开抽前刚手动转过一把）
         // 补枪要放慢：残留冷却最长 8 秒，300ms 连打会在它结束前就攒满
         // maxRateLimitRetries 而误停，1 秒一枪则 12 次能兜住 12 秒
@@ -1817,7 +1821,7 @@
                     </div>
                 </div>
                 <div id="duration-hint" class="hh-drain-hint">
-                    转盘转多久就等多久，自动排队。缓冲越小抽得越快（可为负）
+                    转盘转多久就等多久，上面填的间隔不生效。缓冲越小抽得越快（可为负）
                 </div>
                 <div class="hh-drain" style="justify-content:flex-end;">
                     <span id="duration-info" class="hh-duration-info">等第一抽后自动调节</span>
@@ -2563,9 +2567,13 @@
        站点的冷却就是上一抽的 duration，所以真正的下限由它说了算；
        手填的间隔只作为「再慢也不低于这个数」的底。 */
     function plannedGapMs() {
-        const floor = Math.max(500, Math.round(dynamicInterval));
-        if (!settings.followDuration || !lastDurationMs) return floor;
-        return Math.max(floor, lastDurationMs + settings.bufferMs);
+        // 自适应模式下节奏完全由站点定，手填的间隔一点都不掺和 ——
+        // 拿它当下限的话，站点只要转得比它快，那点便宜就白白丢了
+        if (settings.followDuration) {
+            const base = lastDurationMs || CONFIG.blindGapMs;
+            return Math.max(500, base + settings.bufferMs);
+        }
+        return Math.max(500, Math.round(dynamicInterval));
     }
 
     function nextDelayMs() {
@@ -2577,7 +2585,7 @@
         }
 
         const gap = plannedGapMs();
-        if (settings.followDuration && lastDurationMs && lastDrawSentAt) {
+        if (settings.followDuration && lastDrawSentAt) {
             // 计时起点是「发出请求」那一刻 —— 响应传输和本地结算花掉的
             // 时间已经在冷却里数过了，从间隔里扣掉
             const elapsed = Date.now() - lastDrawSentAt;
@@ -2595,7 +2603,7 @@
     }
 
     function setCurrentIntervalDisplay() {
-        setText('current-interval', intervalText(dynamicInterval / 1000));
+        setText('current-interval', intervalText(plannedGapMs() / 1000));
     }
 
     async function runSingleDraw(maxCount) {
@@ -2780,9 +2788,8 @@
 
         const status = $('lottery-status');
         if (status) {
-            status.textContent = settings.drainMode
-                ? `一抽到底 · ${intervalText(interval)}s`
-                : `运行中 · ${intervalText(interval)}s`;
+            const pace = settings.followDuration ? '自适应' : `${intervalText(interval)}s`;
+            status.textContent = settings.drainMode ? `一抽到底 · ${pace}` : `运行中 · ${pace}`;
             status.style.color = '#4d8a3a';
         }
 
@@ -2794,9 +2801,12 @@
         const stopButton = $('stop-lottery');
         if (stopButton) stopButton.disabled = false;
 
+        const paceText = settings.followDuration
+            ? '间隔自适应'
+            : `间隔 ${intervalText(interval)} 秒`;
         addLog(settings.drainMode
-            ? `🔥 一抽到底 · 保留 ${fmt(reserve)} 憨豆 · 间隔 ${intervalText(interval)} 秒`
-            : `🚀 开始抽奖 · ${maxCount} 次 · 间隔 ${intervalText(interval)} 秒`, 'success');
+            ? `🔥 一抽到底 · 保留 ${fmt(reserve)} 憨豆 · ${paceText}`
+            : `🚀 开始抽奖 · ${maxCount} 次 · ${paceText}`, 'success');
 
         // 循环里任何一处抛异常都不能静默吞掉 —— 不接这个 catch 的话
         // running 会一直卡在 true，面板显示「抽奖进行中」但其实早停了
@@ -3614,10 +3624,10 @@
             saveSettings();
 
             // 运行中改间隔立刻生效，不必重启；没在跑的时候也要跟上，
-            // 否则「当前间隔」会一直挂着上一次的数，和输入框对不上
+            // 否则「当前间隔」会一直挂着上一次的数，和输入框对不上。
+            // 自适应开着时这个值根本不参与节奏，改了也只是存起来备用。
             dynamicInterval = Math.round(value * 1000);
             setCurrentIntervalDisplay();
-            setDurationInfo();
         });
 
         on('max-lottery-count', 'change', event => {
@@ -3732,11 +3742,21 @@
         $('duration-hint')?.classList.toggle('is-on', !!settings.followDuration);
         const info = $('duration-info');
         if (info) info.style.display = settings.followDuration ? '' : 'none';
+
         const buffer = $('duration-buffer');
         if (buffer) {
             buffer.disabled = !settings.followDuration;
             buffer.style.opacity = settings.followDuration ? '' : '.45';
         }
+
+        // 自适应接管以后手填的间隔完全不生效，置灰免得以为还管用
+        const interval = $('lottery-interval');
+        if (interval) {
+            interval.disabled = !!settings.followDuration;
+            interval.style.opacity = settings.followDuration ? '.45' : '';
+        }
+
+        setCurrentIntervalDisplay();
     }
 
     function applyDrainUI() {

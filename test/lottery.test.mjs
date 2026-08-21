@@ -150,12 +150,11 @@ console.log('\n[3] 分奖项统计聚合（A2 核心）');
     await run(dom);
     const d = w.document;
 
-    d.getElementById('lottery-interval').value = '3';
+    // 这一组验的是统计怎么聚合，跟间隔多长没关系，用下限跑最快
+    d.getElementById('lottery-interval').value = '0.5';
     d.getElementById('max-lottery-count').value = '10';
     d.getElementById('start-lottery').click();
-
-    // 10 抽 × ~3s 间隔（含抖动），留足余量
-    await sleep(34000);
+    await untilStopped(d, 40000);
 
     check(`实际发出 10 次请求（发出 ${calls} 次）`, calls === 10);
 
@@ -422,7 +421,8 @@ console.log('\n[9] 线上真实文案的归类与官方爆率对比');
         d.getElementById('single-cost').textContent === '2,000',
         d.getElementById('single-cost').textContent);
 
-    d.getElementById('lottery-interval').value = '3';
+    // 验的是文案怎么归类，间隔用下限
+    d.getElementById('lottery-interval').value = '0.5';
     d.getElementById('max-lottery-count').value = String(TEXTS.length);
     d.getElementById('start-lottery').click();
 
@@ -557,11 +557,13 @@ console.log('\n[11] 限流与接口错误分开计数');
 
     await run(dom);
     const d = w.document;
-    d.getElementById('lottery-interval').value = '3';
+    // 退避倍数是相对值，间隔缩短不改变「限流和错误分开数」这件事
+    d.getElementById('lottery-interval').value = '1';
     d.getElementById('max-lottery-count').value = '1';
     d.getElementById('start-lottery').click();
 
-    await sleep(60000);
+    await untilStopped(d, 60000);
+    await sleep(300);
 
     check(`没有在第 5 次被误停（共发出 ${calls} 次请求）`, calls > 5, `实际 ${calls}`);
     check('最终抽到了奖', Number(d.getElementById('draw-count').textContent) === 1,
@@ -796,10 +798,10 @@ console.log('\n[17] 余额随中奖回血（魔力就是憨豆）');
 
     await run(dom);
     const d = w.document;
-    d.getElementById('lottery-interval').value = '3';
+    d.getElementById('lottery-interval').value = '0.5';
     d.getElementById('max-lottery-count').value = '2';
     d.getElementById('start-lottery').click();
-    await sleep(8000);
+    await untilStopped(d, 20000);
 
     // 10,000 - 2×2,000 + 2×5,000 = 16,000
     check('中的憨豆当场加回余额',
@@ -1207,7 +1209,8 @@ console.log('\n[25] 挂机期间站点调价：跟进但不打断');
     d.getElementById('drain-mode').dispatchEvent(new w.Event('change'));
     d.getElementById('reserve-beans').value = '12000';
     d.getElementById('reserve-beans').dispatchEvent(new w.Event('change'));
-    d.getElementById('lottery-interval').value = '3';
+    // 验的是调价能被跟进且不打断循环，间隔用下限
+    d.getElementById('lottery-interval').value = '0.5';
     d.getElementById('start-lottery').click();
 
     // 第一次校准发生在余额估算逼近保留线时，会带回新的成本和爆率
@@ -1639,7 +1642,8 @@ console.log('\n[33] 自动删站内信：关着不动，开着一路清到第一
 
     check('默认不开', d.getElementById('auto-clean-mail').checked === false);
 
-    d.getElementById('lottery-interval').value = '3';
+    // 26 抽才够触发一次自动清理，间隔用下限，否则光等就要一分半
+    d.getElementById('lottery-interval').value = '0.5';
     d.getElementById('max-lottery-count').value = '3';
     d.getElementById('start-lottery').click();
     await untilStopped(d);
@@ -2539,7 +2543,7 @@ console.log('\n[51] 站点的冷却就是上一抽的 duration，跟着它排队
 }
 
 /* ---------------------------------------------------------------- */
-console.log('\n[52] 填的间隔只当下限，站点转得快也不会更快');
+console.log('\n[52] 自适应开着时，手填的间隔完全不生效');
 {
     const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
     const w = dom.window;
@@ -2561,15 +2565,24 @@ console.log('\n[52] 填的间隔只当下限，站点转得快也不会更快');
 
     await run(dom, { followDuration: true });
     const d = w.document;
-    d.getElementById('lottery-interval').value = '3';
-    d.getElementById('lottery-interval').dispatchEvent(new w.Event('change'));
+
+    const interval = d.getElementById('lottery-interval');
+    check('自适应接管后间隔输入框是灰的', interval.disabled === true);
+
+    // 就算硬把值塞进去，也不该影响节奏
+    interval.value = '3';
+    interval.dispatchEvent(new w.Event('change'));
+
     d.getElementById('max-lottery-count').value = '3';
     d.getElementById('start-lottery').click();
     await untilStopped(d, 30000);
 
     const gaps = stamps.slice(1).map((t, i) => t - stamps[i]);
-    check('转盘只要 0.6 秒，但填了 3 秒下限，就走 3 秒',
-        gaps.every(gap => gap >= 2850 && gap < 4200), gaps.join(' / '));
+    check('转盘只要 0.6 秒就按 0.6 秒走，填的 3 秒当没看见',
+        gaps.every(gap => gap >= 500 && gap < 1600), gaps.join(' / '));
+    check('「当前间隔」报的是实际节奏，不是输入框里的数',
+        d.getElementById('current-interval').textContent === '0.6',
+        d.getElementById('current-interval').textContent);
 }
 
 /* ---------------------------------------------------------------- */
@@ -2682,10 +2695,15 @@ console.log('\n[55] 关掉跟随，就只认填的间隔');
     const toggle = d.getElementById('follow-duration');
     check('开关默认是开的', toggle.checked === true);
 
+    check('自适应开着时间隔输入框是灰的',
+        d.getElementById('lottery-interval').disabled === true);
+
     toggle.checked = false;
     toggle.dispatchEvent(new w.Event('change'));
     check('关掉这件事存下来了',
         JSON.parse(w.localStorage.getItem('hhanclub_lottery_settings_v1')).followDuration === false);
+    check('关掉后间隔输入框恢复可用',
+        d.getElementById('lottery-interval').disabled === false);
 
     d.getElementById('lottery-interval').value = '1.5';
     d.getElementById('lottery-interval').dispatchEvent(new w.Event('change'));
