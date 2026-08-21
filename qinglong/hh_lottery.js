@@ -193,7 +193,36 @@ function loadExternalConfig() {
     });
     if (unknown.length) log(`⚠️ ${CONFIG_FILE} 里有认不出的项，已忽略：${unknown.join(', ')}`);
 
+    const added = backfillConfigFile(file, data);
+    if (added.length) {
+        log(`📝 ${CONFIG_FILE} 补上了新版本才有的项：${added.join(', ')}`);
+        log('   值就是当前生效的默认值，行为没变 —— 要用的话去文件里改');
+    }
+
     return file;
+}
+
+/* 配置文件是老版本生成的话，后来新加的项它不会有 —— 不主动去翻 README
+   就永远不知道有这些开关（tgBotToken 这些就是这么被漏掉的）。
+   这里按当前生效的值补进去：行为一点不变，只是让人看得见。
+   用户自己写的、认不出的项原样留着，不动。 */
+function backfillConfigFile(file, data) {
+    const missing = Object.keys(CONFIG)
+        .filter(key => !Object.prototype.hasOwnProperty.call(data, key));
+    if (!missing.length) return [];
+
+    const merged = { ...data };
+    missing.forEach(key => { merged[key] = CONFIG[key]; });
+
+    try {
+        const tmp = `${file}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(merged, null, 4));
+        fs.renameSync(tmp, file);
+        return missing;
+    } catch (error) {
+        // 只读挂载之类的，补不上就算了，不该因此跑不了
+        return [];
+    }
 }
 
 function writeConfigTemplate() {

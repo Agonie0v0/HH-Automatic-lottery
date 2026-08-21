@@ -1485,6 +1485,64 @@ console.log('\n[50] 青龙注入的 QLAPI.systemNotify 能兜底');
 }
 
 /* ---------------------------------------------------------------- */
+console.log('\n[51] 老配置文件缺的项要补进去');
+{
+    // 配置文件一旦存在就不再被模板覆盖，所以老版本生成的那份
+    // 永远不会长出后来新加的项（tgBotToken 这些就是这么被漏掉的）。
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
+    const { dir, file } = installScript({ host: site.state.origin });
+
+    const cfgFile = path.join(dir, 'hh_lottery.config.json');
+    fs.writeFileSync(cfgFile, JSON.stringify({
+        '//': '老版本生成的',
+        cookie: 'uid=1; pass=2',
+        draws: 3,
+        host: site.state.origin,
+        我自己加的: '别删我'
+    }, null, 4));
+
+    await runFile(file, dir);
+    const after = JSON.parse(fs.readFileSync(cfgFile, 'utf8'));
+
+    // 期望值从 DEFAULT_CONFIG 推，别手写清单 —— 手写的迟早跟不上
+    const want = Object.keys(DEFAULT_CONFIG).filter(k => !(k in { cookie: 0, draws: 0, host: 0 }));
+    const still = want.filter(k => !Object.prototype.hasOwnProperty.call(after, k));
+    check('配置区里有、文件里没有的项都补上了', still.length === 0, `还缺：${still.join(', ')}`);
+    check('原有的值没被改回默认', after.draws === 3, `draws=${after.draws}`);
+    check('注释还在', after['//'] === '老版本生成的', String(after['//']));
+    check('认不出的项没被删掉', after['我自己加的'] === '别删我', JSON.stringify(after));
+    check('补进去的是当前生效的默认值',
+        want.every(k => JSON.stringify(after[k]) === JSON.stringify(DEFAULT_CONFIG[k])),
+        JSON.stringify(after));
+
+    // 补完就该安静了，第二次不该再报一遍
+    const second = await runFile(file, dir);
+    check('第二次不再刷补全提示', !/补上了新版本才有的项/.test(second.out), second.out.slice(-300));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[52] 仓库里那份样板配置要和配置区对得上');
+{
+    // 它是手写维护的，脚本加了新项很容易忘了同步 —— 忘了的话
+    // 照着它填的人就看不到新开关
+    const sample = JSON.parse(
+        fs.readFileSync(path.join(ROOT, 'qinglong', 'hh_lottery.config.json'), 'utf8'));
+
+    const head = SOURCE.indexOf('const CONFIG = {');
+    const foot = SOURCE.indexOf('\n};\n\n/* ===== 配置区结束 ===== */');
+    const block = SOURCE.slice(head, foot);
+    const keys = [...block.matchAll(/\n {4}(\w+):/g)].map(m => m[1]);
+
+    const missing = keys.filter(k => !Object.prototype.hasOwnProperty.call(sample, k));
+    const extra = Object.keys(sample).filter(k => k !== '//' && !keys.includes(k));
+
+    check('配置区的项样板里一个不少', missing.length === 0, `缺：${missing.join(', ')}`);
+    check('样板里没有多出来的项', extra.length === 0, `多：${extra.join(', ')}`);
+}
+
+/* ---------------------------------------------------------------- */
 fs.rmSync(TMP, { recursive: true, force: true });
 
 console.log(`\n=========== ${passed} passed, ${failed} failed ===========\n`);
