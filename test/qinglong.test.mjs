@@ -1274,6 +1274,44 @@ console.log('\n[43] 间隔填得离谱时收敛到合法范围');
 }
 
 /* ---------------------------------------------------------------- */
+console.log('\n[44] 老用户把设置写在脚本里：头一次跑就固化成配置文件');
+{
+    // 这是升级路径上最要命的一环 —— 设置写在脚本里，
+    // ql raw / curl 一覆盖就全没了。所以第一次跑必须先存下来。
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
+
+    const { dir, file } = installScript({
+        host: site.state.origin, draws: 2, interval: 7, maxMinutes: 600, cleanMail: false
+    });
+    const configFile = path.join(dir, 'hh_lottery.config.json');
+
+    check('跑之前没有配置文件', !fs.existsSync(configFile), configFile);
+
+    const first = await runFile(file, dir);
+
+    check('跑完生成了配置文件', fs.existsSync(configFile), configFile);
+    check('日志说明了这件事', /📝 已把当前设置存成/.test(first.out), first.out.slice(0, 500));
+
+    const saved = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+    check('存的是脚本里那份设置，不是默认值',
+        saved.draws === 2 && saved.interval === 7 && saved.maxMinutes === 600,
+        JSON.stringify({ draws: saved.draws, interval: saved.interval, maxMinutes: saved.maxMinutes }));
+    check('Cookie 也一起存了', saved.cookie === 'c_secure_uid=test', saved.cookie);
+
+    // 模拟一次「更新脚本」：把脚本换成默认配置那版，设置应该还在
+    fs.writeFileSync(file, patchSource({ host: 'http://127.0.0.1:1', draws: 99 }));
+    const second = await runFile(file, dir);
+
+    check('更新脚本后配置来自文件', /⚙️ 配置来自/.test(second.out), second.out.slice(0, 400));
+    check('设置没丢：还是抽 2 次不是 99 次',
+        site.state.draws === 4, `两次共抽了 ${site.state.draws} 次`);
+    check('不会重复生成、把改过的覆盖回去',
+        !/📝 已把当前设置存成/.test(second.out), second.out.slice(0, 400));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
 fs.rmSync(TMP, { recursive: true, force: true });
 
 console.log(`\n=========== ${passed} passed, ${failed} failed ===========\n`);
