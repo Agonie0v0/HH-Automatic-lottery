@@ -184,8 +184,12 @@ function startSite({ prizes = ['魔力 100 '], durations = [6000], rateLimitAtte
 const DEFAULT_CONFIG = {
     cookie: 'c_secure_uid=test',
     notifyBigPrize: false,
+    bigPrizeMinBeans: 780000,
+    notifyPeriodic: false,
+    periodicMinutes: 60,
     tgBotToken: '',
     tgUserId: '',
+    tgApiHost: 'api.telegram.org',
     webhookUrl: '',
     statsFile: '',
     draws: 10,
@@ -685,7 +689,7 @@ console.log('\n[19] 档位要挂在类别下面，光看「7 天 × 1」认不�
         /🎫 补签卡 2 次 · 2 个/.test(block), block);
     check('彩虹 ID 认得出来，不再是光秃秃的「7 天 × 1」',
         /🌈 彩虹ID 1 次 · 7 天/.test(block), block);
-    check('上传量也带上类别', /⬆️ 上传量 1 次 · 2 GB/.test(block), block);
+    check('上传量也带上类别', /[📤⬆️] 上传量 1 次 · 2 GB/.test(block), block);
 
     // 档位行缩进得比类别行深，视觉上才是从属关系
     const lines = block.split('\n');
@@ -1190,8 +1194,8 @@ console.log('\n[36] 不在青龙里也能收到通知：Webhook 兜底');
 
     check('推了一条', hook.got.length === 1, `实际 ${hook.got.length} 条`);
     check('标题里有脚本名', /HHCLUB 幸运大转盘/.test(hook.got[0]?.title || ''), hook.got[0]?.title);
-    check('正文带汇总', /本次：2 抽/.test(hook.got[0]?.content || ''), (hook.got[0]?.content || '').slice(0, 200));
-    check('正文报了运行时长', /本次运行 \d+ 秒/.test(hook.got[0]?.content || ''),
+    check('正文带汇总', /抽奖：\+2 抽|本次：2 抽/.test(hook.got[0]?.content || ''), (hook.got[0]?.content || '').slice(0, 200));
+    check('正文报了运行时长', /运行时长：|本次运行/.test(hook.got[0]?.content || ''),
         (hook.got[0]?.content || '').slice(0, 200));
     check('不再说「没有可用的通知渠道」', !/没有可用的通知渠道/.test(out), out.slice(-300));
     check('日志里逐个渠道报了结果', /📤 通知：Webhook ✓/.test(out), out.slice(-400));
@@ -1227,12 +1231,12 @@ console.log('\n[38] 中大奖当场推一条');
         webhookUrl: hook.url
     });
 
-    const big = hook.got.find(item => /中大奖了/.test(item.title || ''));
+    const big = hook.got.find(item => /命中大奖|中大奖/.test(item.title || ''));
 
     check('大奖那条推出去了', !!big, hook.got.map(i => i.title).join(' | '));
-    check('写明了第几抽中的什么', /第 1 抽中了：魔力 780000/.test(big?.content || ''), big?.content);
+    check('写明了第几抽中的什么', /第 1 抽|命中大奖：💰 780,000 憨豆/.test(big?.content || ''), big?.content);
     check('收尾那条汇总也还在',
-        hook.got.some(item => /本次：2 抽/.test(item.content || '')),
+        hook.got.some(item => /抽奖：\+2 抽|本次：2 抽/.test(item.content || '')),
         hook.got.map(i => i.title).join(' | '));
 
     await hook.close();
@@ -1252,7 +1256,7 @@ console.log('\n[39] 普通奖不推，别刷屏');
     });
 
     check('只有收尾那一条', hook.got.length === 1, hook.got.map(i => i.title).join(' | '));
-    check('不是大奖通知', !/中大奖了/.test(hook.got[0]?.title || ''), hook.got[0]?.title);
+    check('不是大奖通知', !/命中大奖|中大奖/.test(hook.got[0]?.title || ''), hook.got[0]?.title);
 
     await hook.close();
     await site.close();
@@ -1300,7 +1304,7 @@ if (process.platform === 'win32') {
         hook.got.some(item => /手动停止/.test(item.title || '')),
         hook.got.map(i => i.title).join(' | '));
     check('通知里写了停止原因',
-        hook.got.some(item => /收到 SIGTERM，手动停止/.test(item.content || '')),
+        hook.got.some(item => /收到 SIGTERM.*手动停止/.test(item.content || '')),
         hook.got.map(i => (i.content || '').slice(0, 60)).join(' | '));
 
     await hook.close();
@@ -1551,7 +1555,7 @@ console.log('\n[50] 青龙注入的 QLAPI.systemNotify 能兜底');
 
     check('走到了 QLAPI 这条路', fs.existsSync(marker), '没被调用');
     check('标题传对了',
-        fs.existsSync(marker) && fs.readFileSync(marker, 'utf8').startsWith('🎡 HHCLUB 幸运大转盘'),
+        fs.existsSync(marker) && /HHCLUB 幸运大转盘/.test(fs.readFileSync(marker, 'utf8')),
         fs.existsSync(marker) ? fs.readFileSync(marker, 'utf8').slice(0, 60) : '');
     check('不再说没有可用渠道', !/没有可用的通知渠道/.test(out), out.slice(-300));
 
@@ -1716,7 +1720,102 @@ console.log('\n[56] 尚无 duration 时被限流，按 1 秒慢速补枪');
 }
 
 /* ---------------------------------------------------------------- */
+console.log('\n[57] 定时战报：按周期推送增量与历史奖品明细');
+{
+    const site = await startSite({
+        prizes: ['魔力 100 ', '补签卡 1 ', '魔力 5000 '],
+        balance: 100000
+    });
+    const hook = await startWebhook();
+
+    const { dir, file } = installScript({
+        host: site.state.origin,
+        draws: 3,
+        notifyPeriodic: true,
+        periodicMinutes: 0.00001,
+        webhookUrl: hook.url
+    });
+
+    await runFile(file, dir);
+
+    const reportNotice = hook.got.find(item => /定时战报/.test(item.title || ''));
+    check('定时战报推出去了', !!reportNotice, hook.got.map(i => i.title).join(' | '));
+    check('标题带定时战报', /📊 HHCLUB 幸运大转盘｜定时战报/.test(reportNotice?.title || ''), reportNotice?.title);
+    check('包含播报概览', /╭─ ⏰ 播报概览/.test(reportNotice?.content || ''), reportNotice?.content);
+    check('包含此次播报增量', /⚡ 此次播报增量/.test(reportNotice?.content || ''), reportNotice?.content);
+    check('包含此次奖品明细', /🎁 此次奖品明细/.test(reportNotice?.content || ''), reportNotice?.content);
+    check('包含历史累计总量', /🏆 历史累计总量/.test(reportNotice?.content || ''), reportNotice?.content);
+    check('包含历史奖品明细', /📜 历史奖品明细/.test(reportNotice?.content || ''), reportNotice?.content);
+    check('包含下次播报提示', /下次播报约/.test(reportNotice?.content || ''), reportNotice?.content);
+
+    await hook.close();
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[58] 命中大奖通知排版与字段完整');
+{
+    const site = await startSite({
+        prizes: ['魔力 780000 '],
+        balance: 100000
+    });
+    const hook = await startWebhook();
+
+    const { dir, file } = installScript({
+        host: site.state.origin,
+        draws: 1,
+        notifyBigPrize: true,
+        bigPrizeMinBeans: 780000,
+        webhookUrl: hook.url
+    });
+
+    await runFile(file, dir);
+
+    const big = hook.got.find(item => /命中大奖/.test(item.title || ''));
+    check('命中大奖标题正确', /🎉 HHCLUB 幸运大转盘｜命中大奖/.test(big?.title || ''), big?.title);
+    check('包含欧皇降临卡片', /╭─ 🎊 欧皇降临/.test(big?.content || ''), big?.content);
+    check('命中大奖内容对齐', /命中大奖：💰 780,000 憨豆/.test(big?.content || ''), big?.content);
+    check('包含中奖时间与当前抽数', /中奖时间：\d\d\/\d\d, \d\d:\d\d:\d\d/.test(big?.content || '') && /当前抽数：本次第 1 抽/.test(big?.content || ''), big?.content);
+    check('包含本次运行数据', /📊 本次运行数据/.test(big?.content || '') && /已抽：1 抽/.test(big?.content || ''), big?.content);
+    check('包含净盈亏与当前余额', /净盈亏：\+778,000/.test(big?.content || '') && /当前余额：878,000 憨豆/.test(big?.content || ''), big?.content);
+    check('包含挂机提示', /🌟 后台持续挂机抽奖中/.test(big?.content || ''), big?.content);
+
+    await hook.close();
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[59] 任务结算通知排版与字段完整');
+{
+    const site = await startSite({
+        prizes: ['魔力 100 ', '补签卡 1 '],
+        balance: 100000
+    });
+    const hook = await startWebhook();
+
+    const { dir, file } = installScript({
+        host: site.state.origin,
+        draws: 2,
+        webhookUrl: hook.url
+    });
+
+    await runFile(file, dir);
+
+    const finish = hook.got.find(item => /运行结束/.test(item.title || ''));
+    check('运行结束标题正确', /🏁 HHCLUB 幸运大转盘｜运行结束/.test(finish?.title || ''), finish?.title);
+    check('包含任务结算卡片', /╭─ 🎯 任务结算/.test(finish?.content || ''), finish?.content);
+    check('包含运行状态与运行时长', /运行状态：/.test(finish?.content || '') && /运行时长：/.test(finish?.content || ''), finish?.content);
+    check('包含本次运行增量', /⚡ 本次运行增量/.test(finish?.content || ''), finish?.content);
+    check('包含本次奖品明细', /🎁 本次奖品明细/.test(finish?.content || ''), finish?.content);
+    check('奖品层级列表格式正确', /💰 憨豆｜1 次 · 100 憨豆/.test(finish?.content || '') && /└ 100 憨豆 × 1/.test(finish?.content || ''), finish?.content);
+
+    await hook.close();
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
 fs.rmSync(TMP, { recursive: true, force: true });
 
 console.log(`\n=========== ${passed} passed, ${failed} failed ===========\n`);
 process.exit(failed ? 1 : 0);
+

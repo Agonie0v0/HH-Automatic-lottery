@@ -73,7 +73,13 @@ const CONFIG = {
     /* ⑪ 多少憨豆算大奖。填 0 就只有 VIP 才推 */
     bigPrizeMinBeans: 780000,
 
-    /* ⑫ Telegram 直推（可选）。手动停止时优先走它 —— 路径短，
+    /* ⑫ 定时播报战报（分钟）。
+          一抽到底或长跑时，每隔指定分钟推送一次增量战报。
+          填 0 为关闭定时播报 */
+    notifyPeriodic: true,
+    periodicMinutes: 60,
+
+    /* ⑬ Telegram 直推（可选）。手动停止时优先走它 —— 路径短，
           来得及送出去。留空就不用。
 
           注意：青龙里已经配了 TG 推送的话这里就别填了，
@@ -83,19 +89,19 @@ const CONFIG = {
     tgUserId: '',
     tgApiHost: 'api.telegram.org',
 
-    /* ⑬ 通用 Webhook（可选）。填个 URL 就会 POST 一份
+    /* ⑭ 通用 Webhook（可选）。填个 URL 就会 POST 一份
           {"title":"...","content":"...","text":"标题\n\n正文"} 过去。
           Bark、自建服务、n8n 之类都能接。留空就不用 */
     webhookUrl: '',
 
-    /* ⑭ 日志时间按哪个时区显示。
+    /* ⑮ 日志时间按哪个时区显示。
           青龙容器默认常是 UTC，不设这个的话日志时间对不上 */
     timezone: 'Asia/Shanghai',
 
-    /* ⑮ 站点域名，一般不用改 */
+    /* ⑯ 站点域名，一般不用改 */
     host: 'hhanclub.net',
 
-    /* ⑯ User-Agent，一般不用改 */
+    /* ⑰ User-Agent，一般不用改 */
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
         + '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
 };
@@ -176,6 +182,13 @@ function normalizeConfig() {
     CONFIG.cleanMail = CONFIG.cleanMail === true;
     CONFIG.notifyBigPrize = CONFIG.notifyBigPrize !== false;
     CONFIG.bigPrizeMinBeans = int(CONFIG.bigPrizeMinBeans, 780000, 0);
+    CONFIG.notifyPeriodic = CONFIG.notifyPeriodic !== false;
+    const float = (value, fallback, min) => {
+        const number = typeof value === 'number' ? value : parseFloat(value);
+        return Number.isFinite(number) ? Math.max(min, number) : fallback;
+    };
+    CONFIG.periodicMinutes = float(CONFIG.periodicMinutes ?? CONFIG.notifyIntervalMinutes, 60, 0);
+    if (CONFIG.periodicMinutes <= 0) CONFIG.notifyPeriodic = false;
     // 只认填在这里的，不去读 TG_BOT_TOKEN / TG_USER_ID 环境变量 ——
     // 那两个是青龙给 sendNotify 用的，青龙自己已经会往 TG 推一条了，
     // 再拿来直连就成了同一条消息推两遍。
@@ -367,11 +380,11 @@ function numberAfterClass(html, className) {
 const PRIZE_META = {
     beans: { name: '憨豆', icon: '💰', unit: '' },
     magic: { name: '憨豆（旧魔力）', icon: '💰', unit: '' },
-    invite: { name: '邀请', icon: '📧', unit: '' },
+    invite: { name: '邀请', icon: '💌', unit: '个' },
     rainbow: { name: '彩虹ID', icon: '🌈', unit: '天' },
     vip: { name: 'VIP', icon: '⭐', unit: '天' },
     makeup: { name: '补签卡', icon: '🎫', unit: '个' },
-    upload: { name: '上传量', icon: '⬆️', unit: 'GB' },
+    upload: { name: '上传量', icon: '📤', unit: 'GB' },
     rename: { name: '改名卡', icon: '📛', unit: '张' },
     unknown: { name: '其他奖品', icon: '🎁', unit: '' }
 };
@@ -412,10 +425,14 @@ function parsePrizeText(text) {
             if (value === null) break;
         }
 
+        const tierLabel = rule.type === 'invite'
+            ? `${fmt(value)} 邀请`
+            : `${fmt(value)}${meta.unit ? ' ' + meta.unit : ' ' + meta.name}`;
+
         return {
             type: rule.type,
             value,
-            label: `${fmt(value)}${meta.unit ? ' ' + meta.unit : ' ' + meta.name}`
+            label: tierLabel
         };
     }
 
@@ -675,6 +692,7 @@ class Lottery {
 
         this.current = emptyStats();
         this.total = loadTotal();
+        this.intervalStats = emptyStats();
 
         // 站点公布的折算金额，开跑时从抽奖页读
         this.vipSwapBeans = 0;
@@ -684,6 +702,8 @@ class Lottery {
 
         this.mailCleaned = 0;
         this.startedAt = Date.now();
+        this.lastPeriodicReportAt = this.startedAt;
+        this.stopReason = '';
 
         this.errorStreak = 0;
         this.rateLimitStreak = 0;
@@ -755,6 +775,7 @@ class Lottery {
     record(prizeText, prize) {
         applyPrize(this.current, prizeText, this.cost, prize);
         applyPrize(this.total, prizeText, this.cost, prize);
+        applyPrize(this.intervalStats, prizeText, this.cost, prize);
     }
 
     /* 抽奖页写着：「当中奖 [VIP] 时，如果用户已经是 VIP 或以上等级，
@@ -857,6 +878,7 @@ class Lottery {
         // 开销，当金额用会记出「1,000,060 憨豆」这种奖池里根本没有的档位。
         markVipSwapped(this.current, prize, beans);
         markVipSwapped(this.total, prize, beans);
+        markVipSwapped(this.intervalStats, prize, beans);
 
         report(`👑 你已经是 VIP，站点改发了 ${fmt(beans)} 憨豆 · 仍计为一次 VIP 中奖`);
 
@@ -866,8 +888,6 @@ class Lottery {
         }
     }
 
-    /* 说多久就是多久 —— 以前会在设定值上下浮动 15%，
-       填 3 秒实际可能跑成 2.55 或 3.45 秒，对不上账。 */
     /* 挂机跑一晚上，中了大奖当场推一条 —— 不然要等跑完才知道。
        口径和油猴版的全屏庆祝一致：VIP，或单笔憨豆到门槛。
        推送失败不能影响抽奖，吞掉就是了。 */
@@ -880,16 +900,90 @@ class Lottery {
                 && prize.value >= CONFIG.bigPrizeMinBeans);
         if (!big) return;
 
+        const meta = PRIZE_META[prize.type] || PRIZE_META.unknown;
+        let prizeDisplay = `${meta.icon} ${prize.label || String(prizeText).trim()}`;
+        if (prize.type === 'beans') {
+            prizeDisplay = `💰 ${fmt(prize.value)} 憨豆`;
+        }
+
+        const profit = (this.current.gains.beans || 0) - this.current.cost;
+        const rate = this.current.cost > 0 ? (profit / this.current.cost) * 100 : 0;
+
         const body = [
-            `第 ${fmt(this.current.draws)} 抽中了：${String(prizeText).trim()}`,
-            `当前余额 ${fmt(this.balance)} 憨豆`,
-            `已跑 ${formatDuration(Date.now() - this.startedAt)}`
+            '╭─ 🎊 欧皇降临',
+            `│ 命中大奖：${prizeDisplay}`,
+            `│ 中奖时间：${formatNoticeTime()}`,
+            `│ 当前抽数：本次第 ${fmt(this.current.draws)} 抽`,
+            `╰─ 历史累计：${fmt(this.total.draws)} 抽`,
+            '━━━━━━━━━━━━━━━━━━━',
+            '📊 本次运行数据',
+            `  🎲 已抽：${fmt(this.current.draws)} 抽`,
+            `  🔥 消耗：${fmt(this.current.cost)} 憨豆`,
+            `  🎁 获得：${fmt(this.current.gains.beans)} 憨豆`,
+            `  🚀 净盈亏：${profit >= 0 ? '+' : ''}${fmt(profit)}（${rate >= 0 ? '+' : ''}${rate.toFixed(1)}%）`,
+            `  💰 当前余额：${fmt(this.balance)} 憨豆`,
+            '━━━━━━━━━━━━━━━━━━━',
+            '🌟 后台持续挂机抽奖中'
         ].join('\n');
 
         try {
-            await notify('👑 HHCLUB 幸运大转盘 · 中大奖了', body);
+            await notify('🎉 HHCLUB 幸运大转盘｜命中大奖', body);
         } catch (error) {
             log(`⚠️ 大奖通知发送失败：${error?.message || error}`);
+        }
+    }
+
+    /* 定时战报：挂机长跑时按设定周期推送此次增量与累计总览 */
+    async pushPeriodicReport() {
+        if (!CONFIG.notifyPeriodic) return;
+        if (!this.intervalStats || !this.intervalStats.draws) return;
+
+        const deltaBeans = this.intervalStats.gains.beans || 0;
+        const deltaProfit = deltaBeans - this.intervalStats.cost;
+        const deltaRate = this.intervalStats.cost > 0 ? (deltaProfit / this.intervalStats.cost) * 100 : 0;
+
+        const totalBeans = this.total.gains.beans || 0;
+        const totalProfit = totalBeans - this.total.cost;
+        const totalRate = this.total.cost > 0 ? (totalProfit / this.total.cost) * 100 : 0;
+
+        const elapsedMinutes = Math.max(1, Math.round((Date.now() - this.lastPeriodicReportAt) / 60000));
+        const intervalTitleMinutes = CONFIG.periodicMinutes >= 1
+            ? Math.round(CONFIG.periodicMinutes)
+            : elapsedMinutes;
+        const nextMinutes = Math.round(CONFIG.periodicMinutes) || 60;
+
+        const body = [
+            '╭─ ⏰ 播报概览',
+            `│ 统计区间：近 ${intervalTitleMinutes} 分钟`,
+            `│ 持续运行：${formatDuration(Date.now() - this.startedAt)}`,
+            `╰─ 播报时间：${formatNoticeTime()}`,
+            '━━━━━━━━━━━━━━━━━━━',
+            '⚡ 此次播报增量',
+            `  🎲 抽奖：+${fmt(this.intervalStats.draws)} 抽`,
+            `  🔥 消耗：-${fmt(this.intervalStats.cost)} 憨豆`,
+            `  🎁 获得：+${fmt(deltaBeans)} 憨豆`,
+            `  🚀 净盈亏：${deltaProfit >= 0 ? '+' : ''}${fmt(deltaProfit)}（${deltaRate >= 0 ? '+' : ''}${deltaRate.toFixed(1)}%）`,
+            `  💰 当前余额：${fmt(this.balance)} 憨豆`,
+            '━━━━━━━━━━━━━━━━━━━',
+            '🎁 此次奖品明细',
+            formatPrizeDetails(this.intervalStats.prizes),
+            '━━━━━━━━━━━━━━━━━━━',
+            '🏆 历史累计总量（含此次增量）',
+            `  🎲 抽奖：${fmt(this.total.draws)} 抽`,
+            `  🔥 消耗：${fmt(this.total.cost)} 憨豆`,
+            `  🎁 获得：${fmt(totalBeans)} 憨豆`,
+            `  ✨ 净盈亏：${totalProfit >= 0 ? '+' : ''}${fmt(totalProfit)}（${totalRate >= 0 ? '+' : ''}${totalRate.toFixed(1)}%）`,
+            '━━━━━━━━━━━━━━━━━━━',
+            '📜 历史奖品明细',
+            formatPrizeDetails(this.total.prizes),
+            '━━━━━━━━━━━━━━━━━━━',
+            `🌟 后台持续监控与抽奖中 · 下次播报约 ${nextMinutes} 分钟后`
+        ].join('\n');
+
+        try {
+            await notify('📊 HHCLUB 幸运大转盘｜定时战报', body);
+        } catch (error) {
+            log(`⚠️ 定时战报发送失败：${error?.message || error}`);
         }
     }
 
@@ -919,13 +1013,20 @@ class Lottery {
 
     shouldContinue() {
         if (Date.now() > this.deadline) {
+            this.stopReason = `到达单次运行时间上限（${CONFIG.maxMinutes} 分钟）`;
             report(`⏰ 到达单次运行时间上限（${CONFIG.maxMinutes} 分钟），收工`);
             return false;
         }
-        if (CONFIG.draws > 0) return this.current.draws < CONFIG.draws;
+        if (CONFIG.draws > 0) {
+            if (this.current.draws >= CONFIG.draws) {
+                this.stopReason = `已达到设定抽奖次数（${fmt(CONFIG.draws)} 抽）`;
+            }
+            return this.current.draws < CONFIG.draws;
+        }
 
         // 一抽到底：留够保留线
         if (this.balance - this.cost < CONFIG.reserve) {
+            this.stopReason = `一抽到底完成（余额 ${fmt(this.balance)} 触及保留线 ${fmt(CONFIG.reserve)}）`;
             report(`🏁 一抽到底完成，余额 ${fmt(this.balance)}（保留线 ${fmt(CONFIG.reserve)}）`);
             return false;
         }
@@ -940,10 +1041,12 @@ class Lottery {
         report(`▶ 开始 · 余额 ${fmt(this.balance)} 憨豆 · 单抽 ${fmt(this.cost)}`);
 
         if (this.balance < this.cost) {
+            this.stopReason = '憨豆不足，跳过';
             report('💸 憨豆不足，跳过');
             return;
         }
         if (CONFIG.draws === 0 && this.balance - this.cost < CONFIG.reserve) {
+            this.stopReason = '余额已在保留线之下，跳过';
             report('💸 余额已在保留线之下，跳过');
             return;
         }
@@ -962,6 +1065,7 @@ class Lottery {
                 this.errorStreak++;
                 log(`❌ 请求失败（HTTP ${result.status}）`);
                 if (this.errorStreak >= RUNTIME.maxErrors) {
+                    this.stopReason = `连续 ${this.errorStreak} 次失败，停止`;
                     report(`🛑 连续 ${this.errorStreak} 次失败，停止`);
                     return;
                 }
@@ -989,6 +1093,16 @@ class Lottery {
 
                 if (prize.type === 'vip') await this.reconcileVip(prize);
                 await this.pushBigPrize(prize, prizeText);
+
+                // 定时战报：达到设定分钟数且有增量抽奖时推送
+                if (CONFIG.notifyPeriodic && CONFIG.periodicMinutes > 0
+                    && Date.now() - this.lastPeriodicReportAt >= CONFIG.periodicMinutes * 60 * 1000) {
+                    if (this.intervalStats.draws > 0) {
+                        await this.pushPeriodicReport();
+                        this.lastPeriodicReportAt = Date.now();
+                        this.intervalStats = emptyStats();
+                    }
+                }
 
                 // 和油猴版一个节奏：每 25 抽顺手清一次。挂机跑几百抽的话，
                 // 收件箱整场都在涨，等到最后才清没道理
@@ -1018,6 +1132,7 @@ class Lottery {
                     }
                 }
                 if (this.rateLimitStreak >= RUNTIME.maxRateLimits) {
+                    this.stopReason = `连续 ${this.rateLimitStreak} 次被限流，停止`;
                     report(`🛑 连续 ${this.rateLimitStreak} 次被限流，停止`);
                     return;
                 }
@@ -1026,6 +1141,7 @@ class Lottery {
 
             // 憨豆不足 / 次数用完这类是明确的终止信号，不重试
             if (msg.includes('次数') || msg.includes('用完') || msg.includes('不足')) {
+                this.stopReason = `${msg}，停止`;
                 report(`🛑 ${msg}，停止`);
                 return;
             }
@@ -1033,6 +1149,7 @@ class Lottery {
             this.errorStreak++;
             log(`❌ ${msg}`);
             if (this.errorStreak >= RUNTIME.maxErrors) {
+                this.stopReason = `连续 ${this.errorStreak} 次失败，停止`;
                 report(`🛑 连续 ${this.errorStreak} 次失败，停止`);
                 return;
             }
@@ -1360,15 +1477,110 @@ async function notify(title, content, { preferTelegram = false } = {}) {
     }
 }
 
+function formatNoticeTime(date = new Date()) {
+    const d = date instanceof Date ? date : new Date(date);
+    try {
+        const parts = new Intl.DateTimeFormat('en-GB', {
+            timeZone: CONFIG.timezone || undefined,
+            hourCycle: 'h23',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit'
+        }).formatToParts(d).reduce((acc, part) => {
+            acc[part.type] = part.value;
+            return acc;
+        }, {});
+
+        return `${parts.month}/${parts.day}, ${parts.hour}:${parts.minute}:${parts.second}`;
+    } catch (error) {
+        const iso = d.toISOString();
+        return `${iso.slice(5, 7)}/${iso.slice(8, 10)}, ${iso.slice(11, 19)}`;
+    }
+}
+
 function formatDuration(ms) {
     const total = Math.max(0, Math.round(ms / 1000));
     const hours = Math.floor(total / 3600);
     const minutes = Math.floor((total % 3600) / 60);
     const seconds = total % 60;
 
-    if (hours) return `${hours} 小时 ${minutes} 分`;
-    if (minutes) return `${minutes} 分 ${seconds} 秒`;
-    return `${seconds} 秒`;
+    if (hours) return `${hours}小时 ${minutes}分`;
+    if (minutes) return `${minutes}分 ${seconds}秒`;
+    return `${seconds}秒`;
+}
+
+function formatPrizeDetails(prizes) {
+    const entries = Object.entries(prizes || {})
+        .filter(([, bucket]) => bucket && bucket.count > 0)
+        .sort((a, b) => b[1].count - a[1].count);
+
+    if (!entries.length) return '  （暂无奖品）';
+
+    return entries.flatMap(([type, bucket]) => {
+        const meta = PRIZE_META[type] || PRIZE_META.unknown;
+        const sums = [];
+        const unitName = meta.unit || (type === 'beans' || type === 'magic' ? '憨豆' : meta.name);
+        if (bucket.value > 0) {
+            sums.push(`${fmt(bucket.value)} ${unitName}`.trim());
+        }
+        if (bucket.swappedBeans > 0) {
+            sums.push(`另折算 ${fmt(bucket.swappedBeans)} 憨豆`);
+        }
+
+        const head = `  ${meta.icon} ${meta.name}｜${fmt(bucket.count)} 次`
+            + (sums.length ? ` · ${sums.join(' · ')}` : '');
+
+        const tiers = Object.entries(bucket.tiers || {})
+            .sort((a, b) => b[1] - a[1])
+            .map(([label, count]) => `     └ ${label} × ${fmt(count)}`);
+
+        return [head, ...tiers];
+    }).join('\n');
+}
+
+function buildSummaryNotice(lottery, { statusText = '正常结束', isStop = false } = {}) {
+    const currentBeans = lottery.current.gains.beans || 0;
+    const currentProfit = currentBeans - lottery.current.cost;
+    const currentRate = lottery.current.cost > 0 ? (currentProfit / lottery.current.cost) * 100 : 0;
+
+    const totalBeans = lottery.total.gains.beans || 0;
+    const totalProfit = totalBeans - lottery.total.cost;
+    const totalRate = lottery.total.cost > 0 ? (totalProfit / lottery.total.cost) * 100 : 0;
+
+    const sections = [
+        '╭─ 🎯 任务结算',
+        `│ 运行状态：${statusText}`,
+        `│ 运行时长：${formatDuration(Date.now() - lottery.startedAt)}`,
+        `│ 最终余额：${fmt(lottery.balance)} 憨豆`,
+        `╰─ 结束时间：${formatNoticeTime()}`,
+        '━━━━━━━━━━━━━━━━━━━',
+        '⚡ 本次运行增量',
+        `  🎲 抽奖：+${fmt(lottery.current.draws)} 抽`,
+        `  🔥 消耗：-${fmt(lottery.current.cost)} 憨豆`,
+        `  🎁 获得：+${fmt(currentBeans)} 憨豆`,
+        `  🚀 净盈亏：${currentProfit >= 0 ? '+' : ''}${fmt(currentProfit)}（${currentRate >= 0 ? '+' : ''}${currentRate.toFixed(1)}%）`,
+        '━━━━━━━━━━━━━━━━━━━',
+        '🎁 本次奖品明细',
+        formatPrizeDetails(lottery.current.prizes)
+    ];
+
+    if (lottery.total.draws > 0) {
+        sections.push(
+            '━━━━━━━━━━━━━━━━━━━',
+            '🏆 历史累计总览（含本次）',
+            `  🎲 抽奖：${fmt(lottery.total.draws)} 抽`,
+            `  🔥 消耗：${fmt(lottery.total.cost)} 憨豆`,
+            `  🎁 获得：${fmt(totalBeans)} 憨豆`,
+            `  ✨ 净盈亏：${totalProfit >= 0 ? '+' : ''}${fmt(totalProfit)}（${totalRate >= 0 ? '+' : ''}${totalRate.toFixed(1)}%）`,
+            '━━━━━━━━━━━━━━━━━━━',
+            '📜 历史奖品明细',
+            formatPrizeDetails(lottery.total.prizes)
+        );
+    }
+
+    return sections.join('\n');
 }
 
 /* 直接在终端跑的时候 Ctrl-C 很常见，抽到一半的成绩不能就这么没了。
@@ -1381,7 +1593,7 @@ function guardExit(lottery) {
         if (stopping) return stopping;
 
         stopping = (async () => {
-            const reason = `收到 ${signal}，手动停止`;
+            const reason = `收到 ${signal} 停止信号（手动停止）`;
             log(`⚠️ ${reason} —— 先保存再退出`);
 
             if (lottery.current.draws > 0) {
@@ -1399,14 +1611,8 @@ function guardExit(lottery) {
             }, RUNTIME.notifyTimeoutMs);
 
             try {
-                const body = [
-                    reason,
-                    `已跑 ${formatDuration(Date.now() - lottery.startedAt)}`,
-                    '',
-                    summary
-                ].join('\n');
-
-                const sent = await notify('🛑 HHCLUB 幸运大转盘 · 手动停止', body, { preferTelegram: true });
+                const body = buildSummaryNotice(lottery, { statusText: reason, isStop: true });
+                const sent = await notify('🛑 HHCLUB 幸运大转盘｜手动停止', body, { preferTelegram: true });
                 if (!sent) log('ℹ️ 没有可用的通知渠道，数据已存好，直接退出');
             } catch (error) {
                 log(`⚠️ 停止通知发送异常：${error?.message || error}`);
@@ -1506,15 +1712,12 @@ async function main() {
     const summary = lottery.summary();
     raw(`\n${'─'.repeat(40)}\n${summary}`);
 
-    const body = [
-        ...messages,
-        '',
-        `本次运行 ${formatDuration(Date.now() - lottery.startedAt)}`,
-        '',
-        summary
-    ].join('\n').trim();
+    const statusText = lottery.stopReason || (lottery.current.draws > 0 ? '正常结束' : '本次未抽奖');
+    const isError = lottery.stopReason && lottery.stopReason.includes('失败');
+    const title = isError ? '🛑 HHCLUB 幸运大转盘｜异常停止' : '🏁 HHCLUB 幸运大转盘｜运行结束';
+    const body = buildSummaryNotice(lottery, { statusText });
 
-    const sent = await notify('🎡 HHCLUB 幸运大转盘', body);
+    const sent = await notify(title, body);
     if (!sent) log('ℹ️ 没有可用的通知渠道，本次只写了日志');
 }
 

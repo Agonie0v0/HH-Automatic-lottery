@@ -11,6 +11,8 @@
     "statsFile": "hh_lottery_stats.json",
     "notifyBigPrize": true,
     "bigPrizeMinBeans": 780000,
+    "notifyPeriodic": true,
+    "periodicMinutes": 60,
     "tgBotToken": "",
     "tgUserId": "",
     "tgApiHost": "api.telegram.org",
