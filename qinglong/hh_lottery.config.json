@@ -12,7 +12,7 @@
     "notifyBigPrize": true,
     "bigPrizeMinBeans": 780000,
     "notifyPeriodic": true,
-    "periodicMinutes": 60,
+    "periodicMinutes": 30,
     "tgBotToken": "",
     "tgUserId": "",
     "tgApiHost": "api.telegram.org",

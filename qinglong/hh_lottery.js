@@ -75,9 +75,12 @@ const CONFIG = {
 
     /* ⑫ 定时播报战报（分钟）。
           一抽到底或长跑时，每隔指定分钟推送一次增量战报。
-          填 0 为关闭定时播报 */
+          填 0 为关闭定时播报。
+
+          注意别填得比 maxMinutes 还大 —— 一轮都跑完了还没到播报点，
+          等于白开 */
     notifyPeriodic: true,
-    periodicMinutes: 60,
+    periodicMinutes: 30,
 
     /* ⑬ Telegram 直推（可选）。手动停止时优先走它 —— 路径短，
           来得及送出去。留空就不用。
@@ -172,6 +175,11 @@ function normalizeConfig() {
         const number = parseInt(value, 10);
         return Number.isFinite(number) ? Math.max(min, number) : fallback;
     };
+    // 播报间隔允许填小数（0.5 就是半分钟），不能按整数收
+    const float = (value, fallback, min) => {
+        const number = typeof value === 'number' ? value : parseFloat(value);
+        return Number.isFinite(number) ? Math.max(min, number) : fallback;
+    };
 
     CONFIG.draws = int(CONFIG.draws, 10, 0);
     CONFIG.reserve = int(CONFIG.reserve, 0, 0);
@@ -183,12 +191,15 @@ function normalizeConfig() {
     CONFIG.notifyBigPrize = CONFIG.notifyBigPrize !== false;
     CONFIG.bigPrizeMinBeans = int(CONFIG.bigPrizeMinBeans, 780000, 0);
     CONFIG.notifyPeriodic = CONFIG.notifyPeriodic !== false;
-    const float = (value, fallback, min) => {
-        const number = typeof value === 'number' ? value : parseFloat(value);
-        return Number.isFinite(number) ? Math.max(min, number) : fallback;
-    };
-    CONFIG.periodicMinutes = float(CONFIG.periodicMinutes ?? CONFIG.notifyIntervalMinutes, 60, 0);
+    CONFIG.periodicMinutes = float(CONFIG.periodicMinutes, 30, 0);
     if (CONFIG.periodicMinutes <= 0) CONFIG.notifyPeriodic = false;
+    // 播报间隔不小于单次运行上限的话，一轮跑完都轮不到播报一次 ——
+    // 填了却收不到，只会以为是推送坏了
+    if (CONFIG.notifyPeriodic && CONFIG.periodicMinutes >= CONFIG.maxMinutes) {
+        log(`⚠️ 定时播报间隔（${CONFIG.periodicMinutes} 分钟）不小于单次运行上限`
+            + `（${CONFIG.maxMinutes} 分钟），这一轮基本播报不出来`);
+        log('   要么调小 periodicMinutes，要么调大 maxMinutes');
+    }
     // 只认填在这里的，不去读 TG_BOT_TOKEN / TG_USER_ID 环境变量 ——
     // 那两个是青龙给 sendNotify 用的，青龙自己已经会往 TG 推一条了，
     // 再拿来直连就成了同一条消息推两遍。
@@ -377,14 +388,19 @@ function numberAfterClass(html, className) {
    奖品解析（和油猴版同一套规则）
 ========================================================= */
 
+/* 改这里之前想两件事：
+   ① unit 会进 parsePrizeText 拼出来的 label，而 label 就是统计文件里
+      档位的 key —— 改了单位，老档案里的档位就和新抽的对不上，分成两行；
+   ② 图标在油猴版 hhclub-auto-lottery.user.js 里有一份一模一样的，
+      两版共用统计文件（面板能直接导入青龙的备份），只改一边就花了。 */
 const PRIZE_META = {
     beans: { name: '憨豆', icon: '💰', unit: '' },
     magic: { name: '憨豆（旧魔力）', icon: '💰', unit: '' },
-    invite: { name: '邀请', icon: '💌', unit: '个' },
+    invite: { name: '邀请', icon: '📧', unit: '' },
     rainbow: { name: '彩虹ID', icon: '🌈', unit: '天' },
     vip: { name: 'VIP', icon: '⭐', unit: '天' },
     makeup: { name: '补签卡', icon: '🎫', unit: '个' },
-    upload: { name: '上传量', icon: '📤', unit: 'GB' },
+    upload: { name: '上传量', icon: '⬆️', unit: 'GB' },
     rename: { name: '改名卡', icon: '📛', unit: '张' },
     unknown: { name: '其他奖品', icon: '🎁', unit: '' }
 };
@@ -425,14 +441,10 @@ function parsePrizeText(text) {
             if (value === null) break;
         }
 
-        const tierLabel = rule.type === 'invite'
-            ? `${fmt(value)} 邀请`
-            : `${fmt(value)}${meta.unit ? ' ' + meta.unit : ' ' + meta.name}`;
-
         return {
             type: rule.type,
             value,
-            label: tierLabel
+            label: `${fmt(value)}${meta.unit ? ' ' + meta.unit : ' ' + meta.name}`
         };
     }
 
@@ -946,22 +958,21 @@ class Lottery {
         const totalProfit = totalBeans - this.total.cost;
         const totalRate = this.total.cost > 0 ? (totalProfit / this.total.cost) * 100 : 0;
 
+        // 报实际隔了多久，别报配置值 —— 被限流拖慢时两者能差出一大截，
+        // 抽奖也只在一抽结束后才轮到检查，本来就到不了正点
         const elapsedMinutes = Math.max(1, Math.round((Date.now() - this.lastPeriodicReportAt) / 60000));
-        const intervalTitleMinutes = CONFIG.periodicMinutes >= 1
-            ? Math.round(CONFIG.periodicMinutes)
-            : elapsedMinutes;
-        const nextMinutes = Math.round(CONFIG.periodicMinutes) || 60;
+        const nextMinutes = Math.max(1, Math.round(CONFIG.periodicMinutes));
 
         const body = [
             '╭─ ⏰ 播报概览',
-            `│ 统计区间：近 ${intervalTitleMinutes} 分钟`,
+            `│ 统计区间：近 ${elapsedMinutes} 分钟`,
             `│ 持续运行：${formatDuration(Date.now() - this.startedAt)}`,
             `╰─ 播报时间：${formatNoticeTime()}`,
             '━━━━━━━━━━━━━━━━━━━',
             '⚡ 此次播报增量',
             `  🎲 抽奖：+${fmt(this.intervalStats.draws)} 抽`,
             `  🔥 消耗：-${fmt(this.intervalStats.cost)} 憨豆`,
-            `  🎁 获得：+${fmt(deltaBeans)} 憨豆`,
+            gainLine(this.intervalStats, '+'),
             `  🚀 净盈亏：${deltaProfit >= 0 ? '+' : ''}${fmt(deltaProfit)}（${deltaRate >= 0 ? '+' : ''}${deltaRate.toFixed(1)}%）`,
             `  💰 当前余额：${fmt(this.balance)} 憨豆`,
             '━━━━━━━━━━━━━━━━━━━',
@@ -971,7 +982,7 @@ class Lottery {
             '🏆 历史累计总量（含此次增量）',
             `  🎲 抽奖：${fmt(this.total.draws)} 抽`,
             `  🔥 消耗：${fmt(this.total.cost)} 憨豆`,
-            `  🎁 获得：${fmt(totalBeans)} 憨豆`,
+            gainLine(this.total),
             `  ✨ 净盈亏：${totalProfit >= 0 ? '+' : ''}${fmt(totalProfit)}（${totalRate >= 0 ? '+' : ''}${totalRate.toFixed(1)}%）`,
             '━━━━━━━━━━━━━━━━━━━',
             '📜 历史奖品明细',
@@ -987,6 +998,8 @@ class Lottery {
         }
     }
 
+    /* 说多久就是多久 —— 以前会在设定值上下浮动 15%，
+       填 3 秒实际可能跑成 2.55 或 3.45 秒，对不上账。 */
     plannedGap() {
         if (CONFIG.followDuration) {
             const base = this.lastDurationMs || RUNTIME.blindGapMs;
@@ -1378,6 +1391,17 @@ function loadNotifyModule() {
     return null;
 }
 
+/* Telegram 单条上限 4096 字符，超了整条都发不出去。历史奖品明细的行数
+   随账号累计的档位只增不减，长期跑的号迟早会撞上 —— 宁可截断也不能整条丢。 */
+const TG_TEXT_LIMIT = 4096;
+
+function clampTelegramText(text) {
+    if (text.length <= TG_TEXT_LIMIT) return text;
+
+    const tail = '\n…（内容过长已截断，完整版见青龙日志）';
+    return text.slice(0, TG_TEXT_LIMIT - tail.length) + tail;
+}
+
 /* Telegram 直推。青龙的 sendNotify 找不到 / 发失败时兜底，
    手动停止时也优先走它 —— 少绕一圈，来得及送出去。 */
 async function sendTelegramDirect(title, content) {
@@ -1389,7 +1413,7 @@ async function sendTelegramDirect(title, content) {
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({
                 chat_id: CONFIG.tgUserId,
-                text: `${title}\n\n${content}`,
+                text: clampTelegramText(`${title}\n\n${content}`),
                 disable_web_page_preview: true
             })
         });
@@ -1540,7 +1564,40 @@ function formatPrizeDetails(prizes) {
     }).join('\n');
 }
 
-function buildSummaryNotice(lottery, { statusText = '正常结束', isStop = false } = {}) {
+/* 折算来的憨豆不在憨豆档位里，不点这一句的话，拿各档位乘开
+   去对「获得憨豆」会差出一大截，看着像 bug */
+function gainLine(stats, sign = '') {
+    const swapped = swappedBeansTotal(stats);
+    return `  🎁 获得：${sign}${fmt(stats.gains.beans || 0)} 憨豆`
+        + (swapped > 0 ? `（其中 ${fmt(swapped)} 来自 VIP 折算）` : '');
+}
+
+/* 卡片是好看，但警告和错误不能只留在日志里 —— 挂机的人本来就不看日志，
+   通知就是他唯一的出口。这里把 report() 一路收的提示接回正文。
+   开头那行「▶ 开始」和收工原因已经在卡片里了，不必再重复一遍。 */
+const NOTICE_ECHOED = /^(▶|⏰|🏁|💸|🛑)/;
+const NOTICE_MAX_LINES = 20;
+
+function runNotices() {
+    const lines = messages.filter(line => !NOTICE_ECHOED.test(line));
+    if (!lines.length) return [];
+
+    const shown = lines.slice(-NOTICE_MAX_LINES).map(line => `  ${line}`);
+    if (lines.length > NOTICE_MAX_LINES) {
+        shown.unshift(`  （前面还有 ${lines.length - NOTICE_MAX_LINES} 条，见日志）`);
+    }
+
+    return ['━━━━━━━━━━━━━━━━━━━', '📋 运行提示', ...shown];
+}
+
+/* 出没出岔子看实际报了什么，别拿 stopReason 猜字符串 —— run() 抛出来的
+   异常压根不进 stopReason。「次数用完」「憨豆不足」那种是正常收工，
+   虽然也是 🛑 开头，但不该顶着「异常停止」的标题推出去。 */
+function hasTrouble() {
+    return messages.some(line => /^❌/.test(line) || /^🛑 连续/.test(line));
+}
+
+function buildSummaryNotice(lottery, { statusText = '正常结束' } = {}) {
     const currentBeans = lottery.current.gains.beans || 0;
     const currentProfit = currentBeans - lottery.current.cost;
     const currentRate = lottery.current.cost > 0 ? (currentProfit / lottery.current.cost) * 100 : 0;
@@ -1559,7 +1616,7 @@ function buildSummaryNotice(lottery, { statusText = '正常结束', isStop = fal
         '⚡ 本次运行增量',
         `  🎲 抽奖：+${fmt(lottery.current.draws)} 抽`,
         `  🔥 消耗：-${fmt(lottery.current.cost)} 憨豆`,
-        `  🎁 获得：+${fmt(currentBeans)} 憨豆`,
+        gainLine(lottery.current, '+'),
         `  🚀 净盈亏：${currentProfit >= 0 ? '+' : ''}${fmt(currentProfit)}（${currentRate >= 0 ? '+' : ''}${currentRate.toFixed(1)}%）`,
         '━━━━━━━━━━━━━━━━━━━',
         '🎁 本次奖品明细',
@@ -1572,13 +1629,15 @@ function buildSummaryNotice(lottery, { statusText = '正常结束', isStop = fal
             '🏆 历史累计总览（含本次）',
             `  🎲 抽奖：${fmt(lottery.total.draws)} 抽`,
             `  🔥 消耗：${fmt(lottery.total.cost)} 憨豆`,
-            `  🎁 获得：${fmt(totalBeans)} 憨豆`,
+            gainLine(lottery.total),
             `  ✨ 净盈亏：${totalProfit >= 0 ? '+' : ''}${fmt(totalProfit)}（${totalRate >= 0 ? '+' : ''}${totalRate.toFixed(1)}%）`,
             '━━━━━━━━━━━━━━━━━━━',
             '📜 历史奖品明细',
             formatPrizeDetails(lottery.total.prizes)
         );
     }
+
+    sections.push(...runNotices());
 
     return sections.join('\n');
 }
@@ -1611,7 +1670,7 @@ function guardExit(lottery) {
             }, RUNTIME.notifyTimeoutMs);
 
             try {
-                const body = buildSummaryNotice(lottery, { statusText: reason, isStop: true });
+                const body = buildSummaryNotice(lottery, { statusText: reason });
                 const sent = await notify('🛑 HHCLUB 幸运大转盘｜手动停止', body, { preferTelegram: true });
                 if (!sent) log('ℹ️ 没有可用的通知渠道，数据已存好，直接退出');
             } catch (error) {
@@ -1691,7 +1750,11 @@ async function main() {
     try {
         await lottery.run();
     } catch (error) {
-        report(`❌ ${error?.message || error}`);
+        const msg = `${error?.message || error}`;
+        // 这里是最后一道网，run() 里没接住的都掉这儿。不写进 stopReason
+        // 的话，通知的「运行状态」会照样写「正常结束」
+        lottery.stopReason = `脚本异常中断（${msg}）`;
+        report(`❌ ${msg}`);
     }
 
     // 成绩先落盘再干别的。清信可能要上百个请求，卡在那儿被 kill 的话，
@@ -1713,8 +1776,7 @@ async function main() {
     raw(`\n${'─'.repeat(40)}\n${summary}`);
 
     const statusText = lottery.stopReason || (lottery.current.draws > 0 ? '正常结束' : '本次未抽奖');
-    const isError = lottery.stopReason && lottery.stopReason.includes('失败');
-    const title = isError ? '🛑 HHCLUB 幸运大转盘｜异常停止' : '🏁 HHCLUB 幸运大转盘｜运行结束';
+    const title = hasTrouble() ? '🛑 HHCLUB 幸运大转盘｜异常停止' : '🏁 HHCLUB 幸运大转盘｜运行结束';
     const body = buildSummaryNotice(lottery, { statusText });
 
     const sent = await notify(title, body);
