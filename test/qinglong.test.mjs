@@ -226,9 +226,12 @@ function installScript(config, runtime = null, extraFiles = {}) {
     return { dir, file };
 }
 
-function runFile(file, dir) {
+function runFile(file, dir, env = null) {
     return new Promise(resolve => {
-        const child = spawn(process.execPath, [file], { cwd: ROOT });
+        const child = spawn(process.execPath, [file], {
+            cwd: ROOT,
+            env: env ? { ...process.env, ...env } : process.env
+        });
         let out = '';
         child.stdout.on('data', d => { out += d; });
         child.stderr.on('data', d => { out += d; });
@@ -1358,6 +1361,61 @@ console.log('\n[46] 时间戳格式不随平台变（Linux 上曾多出个逗号
         stamps.find(text => !/^\d\d\/\d\d \d\d:\d\d:\d\d$/.test(text)) || stamps[0]);
     check('里面没有逗号', stamps.every(text => !text.includes(',')), stamps[0]);
 
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[47] 青龙的 TG 环境变量不能被当成本脚本的 TG 配置');
+{
+    // 青龙会把 config.sh 里的 TG_BOT_TOKEN / TG_USER_ID 注入 process.env，
+    // 它自己的 sendNotify 已经往 TG 推了一条。要是脚本再拿这两个变量直连，
+    // 同一条消息就推两遍。实机上真踩到过。
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
+    const hook = await startWebhook();
+
+    const { dir, file } = installScript(
+        { host: site.state.origin, draws: 1, webhookUrl: hook.url, tgApiHost: hook.tgHost },
+        null,
+        { 'sendNotify.js': 'module.exports = async function () { return; };\n' }
+    );
+
+    const { out } = await runFile(file, dir, {
+        TG_BOT_TOKEN: '123456:fake-token',
+        TG_USER_ID: '7654321'
+    });
+
+    // 假 TG 主机指向同一个监听端；真去直连的话这里会多收一条
+    check('只收到 Webhook 那一条，没有多出来的 TG',
+        hook.got.length === 1, `实际 ${hook.got.length} 条`);
+    check('日志里压根没有 Telegram 这一项',
+        !/Telegram/.test(out), out.slice(-400));
+    check('Webhook 照常', /Webhook ✓/.test(out), out.slice(-400));
+
+    await hook.close();
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[48] 自己在配置里填了 TG 才直连');
+{
+    const site = await startSite({ prizes: ['魔力 100 '], balance: 100000 });
+    const hook = await startWebhook();
+
+    // tgApiHost 指向假服务器，直连会打到它上面
+    const { dir, file } = installScript({
+        host: site.state.origin, draws: 1,
+        tgBotToken: '123456:fake', tgUserId: '7654321', tgApiHost: hook.tgHost
+    });
+
+    const { out } = await runFile(file, dir);
+
+    // sendTelegramDirect 写死 https，这个假服务器是明文 HTTP，握手必然失败 ——
+    // 所以只验「确实发起了直连」，不验对端收到。真实送达在实机上验。
+    check('填了就会走直连这条路', /Telegram [✓✗]/.test(out), out.slice(-400));
+    check('失败也如实报，不冒充成功', /Telegram ✗/.test(out), out.slice(-400));
+    check('没配 Webhook 就不提 Webhook', !/Webhook/.test(out), out.slice(-400));
+
+    await hook.close();
     await site.close();
 }
 

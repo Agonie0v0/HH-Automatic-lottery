@@ -66,10 +66,12 @@ const CONFIG = {
     /* ⑨ 多少憨豆算大奖。填 0 就只有 VIP 才推 */
     bigPrizeMinBeans: 780000,
 
-    /* ⑩ Telegram 直推（可选）。青龙的 sendNotify 找不到或发失败时用它兜底；
-          手动停止时也优先走它 —— 路径短，来不及绕远路。
-          留空就不用。青龙里设过 TG_BOT_TOKEN / TG_USER_ID 环境变量的话，
-          这里不填也会自动拿来用 */
+    /* ⑩ Telegram 直推（可选）。手动停止时优先走它 —— 路径短，
+          来得及送出去。留空就不用。
+
+          注意：青龙里已经配了 TG 推送的话这里就别填了，
+          青龙的 sendNotify 会推一条，这里再推一条就是重复。
+          这两项只认填在这儿的值，不会去读青龙的环境变量。 */
     tgBotToken: '',
     tgUserId: '',
     tgApiHost: 'api.telegram.org',
@@ -148,8 +150,11 @@ function normalizeConfig() {
     CONFIG.cleanMail = CONFIG.cleanMail === true;
     CONFIG.notifyBigPrize = CONFIG.notifyBigPrize !== false;
     CONFIG.bigPrizeMinBeans = int(CONFIG.bigPrizeMinBeans, 780000, 0);
-    CONFIG.tgBotToken = String(CONFIG.tgBotToken || process.env.TG_BOT_TOKEN || '').trim();
-    CONFIG.tgUserId = String(CONFIG.tgUserId || process.env.TG_USER_ID || '').trim();
+    // 只认填在这里的，不去读 TG_BOT_TOKEN / TG_USER_ID 环境变量 ——
+    // 那两个是青龙给 sendNotify 用的，青龙自己已经会往 TG 推一条了，
+    // 再拿来直连就成了同一条消息推两遍。
+    CONFIG.tgBotToken = String(CONFIG.tgBotToken || '').trim();
+    CONFIG.tgUserId = String(CONFIG.tgUserId || '').trim();
     CONFIG.tgApiHost = String(CONFIG.tgApiHost || 'api.telegram.org').trim()
         .replace(/^https?:\/\//, '').replace(/\/+$/, '');
     CONFIG.webhookUrl = String(CONFIG.webhookUrl || '').trim();
