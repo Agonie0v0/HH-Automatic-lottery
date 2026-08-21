@@ -1817,9 +1817,7 @@
                     </div>
                 </div>
                 <div id="duration-hint" class="hh-drain-hint">
-                    站点的冷却就是上一抽转盘转多久（实测 3~8 秒随机），跟着它排队；上面填的间隔只当下限。
-                    缓冲可以为负 —— 请求在网络上飞的时候服务端已经在计时。
-                    贴边被「不要重复点击」挡回不扣憨豆，${CONFIG.rateLimitRetryMs}ms 后自动补一枪
+                    转盘转多久就等多久，自动排队。缓冲越小抽得越快（可为负），被挡回也不扣憨豆
                 </div>
                 <div class="hh-drain" style="justify-content:flex-end;">
                     <span id="duration-info" class="hh-duration-info">等站点报第一个转盘时长</span>
