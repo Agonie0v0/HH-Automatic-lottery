@@ -30,7 +30,7 @@ https://raw.githubusercontent.com/SAGIRIxr/HH-Automatic-lottery/main/hhclub-auto
 | **油猴脚本** [`hhclub-auto-lottery.user.js`](hhclub-auto-lottery.user.js) | 开着抽奖页，悬浮面板实时看战绩 |
 | **命令行版** [`qinglong/hh_lottery.js`](qinglong/hh_lottery.js) | 填个 Cookie 挂青龙 / NAS / Debian 上跑，统计存成油猴版能直接导入的备份，见 [qinglong/README.md](qinglong/README.md) |
 
-两边共用同一套抽奖逻辑（限流退避、VIP 折算、站内信清理），青龙版把面板换成了日志和通知。
+两边共用同一套抽奖逻辑（按转盘 `duration` 自适应延迟、限流补枪、VIP 折算、站内信清理），青龙版把面板换成了日志和通知。
 
 ## 功能
 

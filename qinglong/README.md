@@ -96,7 +96,7 @@ curl -fLO https://raw.githubusercontent.com/SAGIRIxr/HH-Automatic-lottery/main/q
 
 配置文件里只写你要改的项也行，没写的按脚本里的默认值走。`"//"` 开头的项当注释忽略，认不出的项会在日志里点名。
 
-脚本以后新加的开关，会在下次运行时自动补进你已有的配置文件里（值就是当前生效的默认值，行为不变），日志里会说补了哪些 —— 不然照着老文件填的人根本不知道有这些项。你自己填的值、自己加的项都不动。
+脚本以后新加的开关，会在下次运行时自动补进你已有的配置文件里（值取当前版本默认值），日志里会说补了哪些 —— 不然照着老文件填的人根本不知道有这些项。你自己填的值、自己加的项都不动。本次升级会补上并默认开启 `followDuration`；若仍想用旧的固定间隔，把它改成 `false`。
 
 ### 写在脚本里
 
@@ -109,22 +109,24 @@ const CONFIG = {
 
     draws: 10,          // ② 每次抽多少次。填 0 = 一抽到底
     reserve: 0,         // ③ 一抽到底时留多少憨豆
-    interval: 8,        // ④ 每抽间隔（秒），最小 3
-    maxMinutes: 60,     // ⑤ 单次运行时间上限（分钟）
-    cleanMail: false,   // ⑥ 抽完顺手清抽奖站内信
-    statsFile: 'hh_lottery_stats.json',   // ⑦ 统计存哪儿，留空 '' 就是不记
+    interval: 6.8,      // ④ 固定间隔；关闭自适应后才生效，最小 3 秒
+    followDuration: true,       // ⑤ 按上一抽的转盘时长自适应延迟（推荐）
+    durationBufferMs: 0,        // ⑥ 自适应缓冲，-500 ~ 5000ms
+    maxMinutes: 60,     // ⑦ 单次运行时间上限（分钟）
+    cleanMail: false,   // ⑧ 抽完顺手清抽奖站内信
+    statsFile: 'hh_lottery_stats.json',   // ⑨ 统计存哪儿，留空 '' 就是不记
 
-    notifyBigPrize: true,      // ⑧ 中了大奖当场推一条
-    bigPrizeMinBeans: 780000,  // ⑨ 多少憨豆算大奖，填 0 就只有 VIP 才推
+    notifyBigPrize: true,      // ⑩ 中了大奖当场推一条
+    bigPrizeMinBeans: 780000,  // ⑪ 多少憨豆算大奖，填 0 就只有 VIP 才推
 
-    tgBotToken: '',            // ⑩ Telegram 直推，青龙里配过 TG 就别填
+    tgBotToken: '',            // ⑫ Telegram 直推，青龙里配过 TG 就别填
     tgUserId: '',
     tgApiHost: 'api.telegram.org',
-    webhookUrl: '',            // ⑪ 通用 Webhook，留空不用
+    webhookUrl: '',            // ⑬ 通用 Webhook，留空不用
 
-    timezone: 'Asia/Shanghai', // ⑫ 日志时间按哪个时区显示
-    host: 'hhanclub.net',      // ⑬
-    userAgent: '...'           // ⑭
+    timezone: 'Asia/Shanghai', // ⑭ 日志时间按哪个时区显示
+    host: 'hhanclub.net',      // ⑮
+    userAgent: '...'           // ⑯
 };
 ```
 
@@ -133,7 +135,9 @@ const CONFIG = {
 | `cookie` | **必填** | 站点完整 Cookie |
 | `draws` | `10` | 每次运行抽多少次。**填 `0` 表示一抽到底** |
 | `reserve` | `0` | 一抽到底时留多少憨豆不动 |
-| `interval` | `8` | 每抽间隔（秒），最小 3。站点有重复点击风控，别贪快 |
+| `interval` | `6.8` | 固定间隔（秒），最小 3；仅在 `followDuration: false` 时生效 |
+| `followDuration` | `true` | 自适应延迟。按上一抽返回的 `data.duration` 安排下一抽，开启后 `interval` 完全不参与节奏 |
+| `durationBufferMs` | `0` | 自适应延迟缓冲，范围 -500～5000ms。负值更贴边，正值更保守 |
 | `maxMinutes` | `60` | 单次运行时间上限（分钟），防止一抽到底把任务挂死 |
 | `cleanMail` | `false` | 清掉「幸运大转盘 中奖通知」站内信：抽奖途中每 25 抽一次，收尾再翻一遍整个收件箱 |
 | `statsFile` | `hh_lottery_stats.json` | 统计存到哪个文件，相对路径按脚本所在目录算。留空 `''` 就是不记 |
@@ -184,7 +188,7 @@ c_secure_uid=NzMyMQ%3D%3D; c_secure_pass=...; c_secure_ssl=...; c_secure_tracker
 
 ```
 [08/19 09:05:01] 🎡 HHCLUB 幸运大转盘
-[08/19 09:05:01]    抽 20 次 · 间隔 8 秒
+[08/19 09:05:01]    抽 20 次 · 自适应延迟 · 缓冲 0ms
 [08/19 09:05:02] ▶ 开始 · 余额 1,574,093 憨豆 · 单抽 2,000
 [08/19 09:05:02] 🎲 第 1 抽：魔力 2000 · 余额 1,574,093
 [08/19 09:05:10] 🎲 第 2 抽：补签卡 1 · 余额 1,572,093
@@ -269,7 +273,8 @@ c_secure_uid=NzMyMQ%3D%3D; c_secure_pass=...; c_secure_ssl=...; c_secure_tracker
 ## 它会自己处理的几件事
 
 - **通知** —— 青龙里优先用它自己 preload 的 `/ql/shell/preload/__ql_notify__.js`，其次是各处的 `sendNotify.js`，再不行退到全局 `QLAPI.systemNotify`。`/ql/data/scripts` 下常躺着别的脚本留下的 `sendNotify.js`（依赖没装、`require` 直接抛），所以顺序不能反。青龙的 `sendNotify` 只是「调用了」，它一个渠道都没配时也不会报错、也不返回状态，所以脚本不拿它当送达凭据；你自己填在配置里的 Telegram / Webhook 一律照发。日志里逐个渠道报结果
-- **限流退避** —— 连续被拦就把间隔往上调（最高 30 秒），连拦 12 次放弃这个账号
+- **自适应延迟** —— 站点的冷却就是上一抽返回的转盘时长 `data.duration`，脚本从请求发出时开始计时，响应与本地处理耗时也算在冷却内。自适应开启时手填的 `interval` 完全不参与；还没拿到首个 duration 时先按 5 秒兜底
+- **限流补枪 / 退避** —— 自适应模式下，已知冷却时被拦会在 300ms 后补枪；尚无 duration 时按 1 秒慢速重试，避免过早攒满 12 次限流。关闭自适应后沿用固定间隔的倍增退避（最高 30 秒）
 - **接口异常** —— 连续 5 次失败自动停，不会闷头刷请求
 - **憨豆不足 / 次数用完** —— 站点这么说就立刻停，不重试
 - **单抽消耗变了** —— 每次开跑前读页面上的实际值，站点调价自动跟上
@@ -304,7 +309,7 @@ c_secure_uid=NzMyMQ%3D%3D; c_secure_pass=...; c_secure_ssl=...; c_secure_tracker
 npm run test:ql
 ```
 
-会在本地起一个假站点，把脚本当子进程真跑一遍，覆盖按次数抽 / 一抽到底 / VIP 折算两种走向及其跨次留存 / 站内信清理（含每页 10 封的分页）/ 统计导出格式 / 跨次累计 / 统计文件损坏 / Cookie 没填 / Cookie 失效 / 日志时间戳与时区 / 汇总的分类分组 / 按等级判折算的四种走向 / 清信的节奏与全本扫描 / 外置配置与模板生成 / 中途打断 / 等级查失败后的重试 / 通知渠道兜底 / 大奖即时推送 / 青龙信号接管 / 间隔精度 / 老用户升级不丢设置 / 在仓库里直接运行 / 老配置文件补新项，共 175 条断言。
+会在本地起一个假站点，把脚本当子进程真跑一遍，覆盖按次数抽 / 一抽到底 / 自适应 duration 节奏与缓冲 / 已知和未知冷却的限流补枪 / VIP 折算两种走向及其跨次留存 / 站内信清理（含每页 10 封的分页）/ 统计导出格式 / 跨次累计 / 统计文件损坏 / Cookie 没填 / Cookie 失效 / 日志时间戳与时区 / 汇总的分类分组 / 按等级判折算的四种走向 / 清信的节奏与全本扫描 / 外置配置与模板生成 / 中途打断 / 等级查失败后的重试 / 通知渠道兜底 / 大奖即时推送 / 青龙信号接管 / 间隔精度 / 老用户升级不丢设置 / 在仓库里直接运行 / 老配置文件补新项。
 
 测试是**照你的用法来的**：复制一份源码、把配置区整块换掉、再当子进程真跑，所以配置区的写法本身也在被测。
 

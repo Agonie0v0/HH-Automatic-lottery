@@ -85,12 +85,13 @@ const mailboxPage = (items, pageCount) => {
  *   mail      收件箱内容
  *   pageSize  收件箱每页显示多少封
  */
-function startSite({ prizes = ['魔力 100 '], balance = 100000, cost = 2000, onDraw = null,
+function startSite({ prizes = ['魔力 100 '], durations = [6000], rateLimitAttempts = [],
+                     balance = 100000, cost = 2000, onDraw = null,
                      mail = [], pageSize = 100, loggedOut = false,
                      swapBeans = 0, userClass = null, classFailTimes = 0 } = {}) {
     const state = {
         balance, cost, draws: 0, deleted: [], mailPageHits: [],
-        mail: [...mail], drawn: [], classFails: 0
+        mail: [...mail], drawn: [], classFails: 0, drawAttempts: 0
     };
 
     const server = http.createServer(async (req, res) => {
@@ -128,7 +129,13 @@ function startSite({ prizes = ['魔力 100 '], balance = 100000, cost = 2000, on
         }
 
         if (url.pathname === '/plugin/lucky-draw') {
+            state.drawAttempts++;
+            if (rateLimitAttempts.includes(state.drawAttempts)) {
+                return send(200, JSON.stringify({ ret: 1, msg: '不要重复点击，请稍后' }),
+                    'application/json');
+            }
             const text = prizes[state.draws % prizes.length];
+            const duration = durations[state.draws % durations.length];
             state.draws++;
             state.drawn.push(text);
             state.balance -= state.cost;
@@ -137,7 +144,10 @@ function startSite({ prizes = ['魔力 100 '], balance = 100000, cost = 2000, on
                 state.balance += won;
             }
             onDraw?.(state, text);
-            return send(200, JSON.stringify({ ret: 0, data: { prize_text: text, winning_record_id: 900 + state.draws } }),
+            return send(200, JSON.stringify({
+                ret: 0,
+                data: { prize_text: text, winning_record_id: 900 + state.draws, duration }
+            }),
                 'application/json');
         }
 
@@ -176,6 +186,9 @@ const DEFAULT_CONFIG = {
     draws: 10,
     reserve: 0,
     interval: 3,
+    // 旧用例继续覆盖固定间隔；自适应节奏在后面的专门用例里测
+    followDuration: false,
+    durationBufferMs: 0,
     maxMinutes: 60,
     cleanMail: false,
     host: 'hhanclub.net',
@@ -1540,6 +1553,105 @@ console.log('\n[52] 仓库里那份样板配置要和配置区对得上');
 
     check('配置区的项样板里一个不少', missing.length === 0, `缺：${missing.join(', ')}`);
     check('样板里没有多出来的项', extra.length === 0, `多：${extra.join(', ')}`);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[53] 自适应延迟跟随上一抽 duration，固定 interval 完全不参与');
+{
+    const site = await startSite({
+        prizes: ['魔力 100 '],
+        durations: [700, 1100, 600],
+        balance: 100000
+    });
+    const stamps = [];
+    site.server.on('request', req => {
+        if (req.url.includes('lucky-draw')) stamps.push(Date.now());
+    });
+
+    const { out } = await runScript({
+        host: site.state.origin,
+        draws: 3,
+        interval: 300,
+        followDuration: true,
+        durationBufferMs: 100
+    });
+
+    const gaps = stamps.slice(1).map((at, i) => at - stamps[i]);
+    check('下一抽分别贴着 700+100ms、1100+100ms',
+        gaps.length === 2 && Math.abs(gaps[0] - 800) < 250 && Math.abs(gaps[1] - 1200) < 250,
+        gaps.join(', '));
+    check('启动日志明确是自适应，不把 interval 300 秒说成生效',
+        /自适应延迟 · 缓冲 100ms/.test(out) && !/固定间隔 300 秒/.test(out),
+        out.slice(0, 400));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[54] 自适应缓冲支持负值，并收敛到 -500 ~ 5000ms');
+{
+    const low = await startSite({ durations: [700], balance: 100000 });
+    const lowStamps = [];
+    low.server.on('request', req => {
+        if (req.url.includes('lucky-draw')) lowStamps.push(Date.now());
+    });
+    const lowRun = await runScript({
+        host: low.state.origin, draws: 2, followDuration: true, durationBufferMs: -900
+    });
+    const lowGap = lowStamps[1] - lowStamps[0];
+    check('低于 -500 的缓冲收敛到 -500，且总间隔仍不低于 500ms',
+        /缓冲 -500ms/.test(lowRun.out) && Math.abs(lowGap - 500) < 250,
+        `${lowGap}ms\n${lowRun.out.slice(0, 300)}`);
+    await low.close();
+
+    const high = await startSite({ balance: 100000 });
+    const highRun = await runScript({
+        host: high.state.origin, draws: 1, followDuration: true, durationBufferMs: 9000
+    });
+    check('高于 5000 的缓冲收敛到 5000', /缓冲 5000ms/.test(highRun.out), highRun.out.slice(0, 300));
+    await high.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[55] 已知冷却时被限流，300ms 后补枪而不是重等完整周期');
+{
+    const site = await startSite({
+        durations: [500, 500],
+        rateLimitAttempts: [2],
+        balance: 100000
+    });
+    const stamps = [];
+    site.server.on('request', req => {
+        if (req.url.includes('lucky-draw')) stamps.push(Date.now());
+    });
+
+    const { out } = await runScript({
+        host: site.state.origin, draws: 2, followDuration: true, durationBufferMs: 0
+    });
+    const retryGap = stamps[2] - stamps[1];
+    check('限流没有算成一次抽奖', site.state.draws === 2 && site.state.drawAttempts === 3,
+        `成功 ${site.state.draws}，请求 ${site.state.drawAttempts}`);
+    check('补枪贴着 300ms', Math.abs(retryGap - 300) < 180, `${retryGap}ms`);
+    check('日志说明按已知 duration 补枪', /上一抽转盘 0\.5 秒，没等够 · 300ms 后补一枪/.test(out), out.slice(-500));
+
+    await site.close();
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[56] 尚无 duration 时被限流，按 1 秒慢速补枪');
+{
+    const site = await startSite({ rateLimitAttempts: [1], balance: 100000 });
+    const stamps = [];
+    site.server.on('request', req => {
+        if (req.url.includes('lucky-draw')) stamps.push(Date.now());
+    });
+
+    const { out } = await runScript({ host: site.state.origin, draws: 1, followDuration: true });
+    const retryGap = stamps[1] - stamps[0];
+    check('未知冷却补枪贴着 1 秒', Math.abs(retryGap - 1000) < 250, `${retryGap}ms`);
+    check('日志明确冷却未知', /冷却剩多久未知，1000ms 后再试/.test(out), out.slice(-500));
+
+    await site.close();
 }
 
 /* ---------------------------------------------------------------- */

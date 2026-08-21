@@ -42,31 +42,38 @@ const CONFIG = {
     /* ③ 一抽到底时给自己留多少憨豆不动 */
     reserve: 0,
 
-    /* ④ 每抽间隔（秒）。站点有重复点击风控，别贪快，最小 3 */
-    interval: 8,
+    /* ④ 固定间隔（秒），关闭下面的自适应延迟后才生效，最小 3 */
+    interval: 6.8,
 
-    /* ⑤ 单次运行的时间上限（分钟）。
+    /* ⑤ 自适应延迟（推荐）。按上一抽返回的转盘时长排下一抽，
+          开启后 interval 完全不参与节奏 */
+    followDuration: true,
+
+    /* ⑥ 自适应延迟的缓冲（毫秒），可为负数，范围 -500 ~ 5000 */
+    durationBufferMs: 0,
+
+    /* ⑦ 单次运行的时间上限（分钟）。
           一抽到底可能跑很久，这个是防止把青龙任务挂死的保险 */
     maxMinutes: 60,
 
-    /* ⑥ 抽完顺手清掉「幸运大转盘 中奖通知」站内信。
+    /* ⑧ 抽完顺手清掉「幸运大转盘 中奖通知」站内信。
           站点每抽一次就发一封，不清的话收件箱很快被埋掉。
           只删这一种，「种子被删除」之类的一封不碰 */
     cleanMail: false,
 
-    /* ⑦ 统计存到哪个文件。跨次运行累计，格式和油猴版备份一致，
+    /* ⑨ 统计存到哪个文件。跨次运行累计，格式和油猴版备份一致，
           拿下来就能在浏览器面板里「📥 导入备份」。
           留空字符串 '' 就是不记 */
     statsFile: 'hh_lottery_stats.json',
 
-    /* ⑧ 中了大奖立刻推一条通知（VIP，或单笔憨豆达到下面的门槛）。
+    /* ⑩ 中了大奖立刻推一条通知（VIP，或单笔憨豆达到下面的门槛）。
           挂机跑一晚上的话，中了大奖当场就能知道 */
     notifyBigPrize: true,
 
-    /* ⑨ 多少憨豆算大奖。填 0 就只有 VIP 才推 */
+    /* ⑪ 多少憨豆算大奖。填 0 就只有 VIP 才推 */
     bigPrizeMinBeans: 780000,
 
-    /* ⑩ Telegram 直推（可选）。手动停止时优先走它 —— 路径短，
+    /* ⑫ Telegram 直推（可选）。手动停止时优先走它 —— 路径短，
           来得及送出去。留空就不用。
 
           注意：青龙里已经配了 TG 推送的话这里就别填了，
@@ -76,19 +83,19 @@ const CONFIG = {
     tgUserId: '',
     tgApiHost: 'api.telegram.org',
 
-    /* ⑪ 通用 Webhook（可选）。填个 URL 就会 POST 一份
+    /* ⑬ 通用 Webhook（可选）。填个 URL 就会 POST 一份
           {"title":"...","content":"...","text":"标题\n\n正文"} 过去。
           Bark、自建服务、n8n 之类都能接。留空就不用 */
     webhookUrl: '',
 
-    /* ⑫ 日志时间按哪个时区显示。
+    /* ⑭ 日志时间按哪个时区显示。
           青龙容器默认常是 UTC，不设这个的话日志时间对不上 */
     timezone: 'Asia/Shanghai',
 
-    /* ⑬ 站点域名，一般不用改 */
+    /* ⑮ 站点域名，一般不用改 */
     host: 'hhanclub.net',
 
-    /* ⑭ User-Agent，一般不用改 */
+    /* ⑯ User-Agent，一般不用改 */
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
         + '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
 };
@@ -105,6 +112,12 @@ const RUNTIME = {
     backoffAfter: 3,
     backoffFactor: 1.5,
     maxBackoffMs: 30000,
+    // 自适应模式还没成功拿到 duration 时的兜底间隔
+    blindGapMs: 5000,
+    // 已知上一抽冷却时，被限流后快速补枪
+    rateLimitRetryMs: 300,
+    // 冷却剩余未知时放慢补枪，避免过早攒满连续限流次数
+    blindRetryMs: 1000,
     // 读不到站点公布的折算金额时用这个兜底
     vipSwapFallbackBeans: 1000000,
     // 查不到等级时才用余额差兜底判断。容差收得比较紧 ——
@@ -131,6 +144,12 @@ function normalizeInterval(raw, fallback) {
     return Math.min(300, Math.max(3, Math.round(seconds * 100) / 100));
 }
 
+function normalizeDurationBuffer(raw, fallback) {
+    const value = parseInt(raw, 10);
+    const ms = Number.isFinite(value) ? value : fallback;
+    return Math.min(5000, Math.max(-500, ms));
+}
+
 /* 3 → 「3」，3.5 → 「3.5」，3.25 → 「3.25」；不留没用的 0 */
 function intervalText(seconds) {
     return String(Math.round(seconds * 100) / 100);
@@ -145,7 +164,9 @@ function normalizeConfig() {
 
     CONFIG.draws = int(CONFIG.draws, 10, 0);
     CONFIG.reserve = int(CONFIG.reserve, 0, 0);
-    CONFIG.interval = normalizeInterval(CONFIG.interval, 8);
+    CONFIG.interval = normalizeInterval(CONFIG.interval, 6.8);
+    CONFIG.followDuration = CONFIG.followDuration !== false;
+    CONFIG.durationBufferMs = normalizeDurationBuffer(CONFIG.durationBufferMs, 0);
     CONFIG.maxMinutes = int(CONFIG.maxMinutes, 60, 1);
     CONFIG.cleanMail = CONFIG.cleanMail === true;
     CONFIG.notifyBigPrize = CONFIG.notifyBigPrize !== false;
@@ -196,7 +217,7 @@ function loadExternalConfig() {
     const added = backfillConfigFile(file, data);
     if (added.length) {
         log(`📝 ${CONFIG_FILE} 补上了新版本才有的项：${added.join(', ')}`);
-        log('   值就是当前生效的默认值，行为没变 —— 要用的话去文件里改');
+        log('   新项已按当前版本默认值启用；不想用的开关可直接在配置文件里关闭');
     }
 
     return file;
@@ -204,7 +225,7 @@ function loadExternalConfig() {
 
 /* 配置文件是老版本生成的话，后来新加的项它不会有 —— 不主动去翻 README
    就永远不知道有这些开关（tgBotToken 这些就是这么被漏掉的）。
-   这里按当前生效的值补进去：行为一点不变，只是让人看得见。
+   这里按当前版本的默认值补进去，让升级用户也能看到并调整新开关。
    用户自己写的、认不出的项原样留着，不动。 */
 function backfillConfigFile(file, data) {
     const missing = Object.keys(CONFIG)
@@ -617,6 +638,11 @@ class Lottery {
         this.errorStreak = 0;
         this.rateLimitStreak = 0;
         this.intervalMs = CONFIG.interval * 1000;
+        // 上一抽的 duration 就是下一抽的冷却窗口；请求发出时服务端已开始计时
+        this.lastDurationMs = 0;
+        this.lastDrawSentAt = 0;
+        // 被限流后的单次等待覆盖值，用过即清
+        this.quickRetryMs = 0;
         this.deadline = Date.now() + CONFIG.maxMinutes * 60 * 1000;
     }
 
@@ -657,6 +683,7 @@ class Lottery {
     }
 
     async drawOnce() {
+        this.lastDrawSentAt = Date.now();
         const response = await fetch(`${this.origin}/plugin/lucky-draw`, {
             method: 'POST',
             headers: this.headers({
@@ -795,8 +822,28 @@ class Lottery {
         }
     }
 
-    nextDelay() {
+    plannedGap() {
+        if (CONFIG.followDuration) {
+            const base = this.lastDurationMs || RUNTIME.blindGapMs;
+            return Math.max(500, base + CONFIG.durationBufferMs);
+        }
         return Math.max(1000, Math.round(this.intervalMs));
+    }
+
+    nextDelay() {
+        // 被拒不会重置服务端冷却，补一枪即可，不必再等完整 duration
+        if (this.quickRetryMs > 0) {
+            const wait = this.quickRetryMs;
+            this.quickRetryMs = 0;
+            return wait;
+        }
+
+        const gap = this.plannedGap();
+        if (CONFIG.followDuration && this.lastDrawSentAt) {
+            // 响应传输、记账和通知耗掉的时间也算在冷却里
+            return Math.max(250, gap - (Date.now() - this.lastDrawSentAt));
+        }
+        return gap;
     }
 
     shouldContinue() {
@@ -855,6 +902,11 @@ class Lottery {
                 this.rateLimitStreak = 0;
                 this.intervalMs = CONFIG.interval * 1000;
 
+                const duration = Number(result.data.data?.duration);
+                this.lastDurationMs = Number.isFinite(duration) && duration > 0 && duration <= 300000
+                    ? duration
+                    : 0;
+
                 const prizeText = decodeUnicode(result.data.data?.prize_text || '未知奖品');
                 const prize = parsePrizeText(prizeText);
 
@@ -880,11 +932,19 @@ class Lottery {
 
             if (msg.includes('重复点击') || msg.includes('请稍后') || msg.includes('频繁')) {
                 this.rateLimitStreak++;
-                log(`⏳ ${msg}`);
-
-                if (this.rateLimitStreak >= RUNTIME.backoffAfter) {
-                    this.intervalMs = Math.min(this.intervalMs * RUNTIME.backoffFactor, RUNTIME.maxBackoffMs);
-                    log(`🔄 间隔上调到 ${intervalText(this.intervalMs / 1000)} 秒`);
+                if (CONFIG.followDuration) {
+                    this.quickRetryMs = this.lastDurationMs
+                        ? RUNTIME.rateLimitRetryMs
+                        : RUNTIME.blindRetryMs;
+                    log(this.lastDurationMs
+                        ? `⏳ ${msg}（上一抽转盘 ${intervalText(this.lastDurationMs / 1000)} 秒，没等够 · ${this.quickRetryMs}ms 后补一枪）`
+                        : `⏳ ${msg}（冷却剩多久未知，${this.quickRetryMs}ms 后再试）`);
+                } else {
+                    log(`⏳ ${msg}`);
+                    if (this.rateLimitStreak >= RUNTIME.backoffAfter) {
+                        this.intervalMs = Math.min(this.intervalMs * RUNTIME.backoffFactor, RUNTIME.maxBackoffMs);
+                        log(`🔄 间隔上调到 ${intervalText(this.intervalMs / 1000)} 秒`);
+                    }
                 }
                 if (this.rateLimitStreak >= RUNTIME.maxRateLimits) {
                     report(`🛑 连续 ${this.rateLimitStreak} 次被限流，停止`);
@@ -1341,9 +1401,12 @@ async function main() {
             log('   以后更新脚本直接覆盖就行，设置不会丢；要改设置改这个文件');
         }
     }
+    const pace = CONFIG.followDuration
+        ? `自适应延迟 · 缓冲 ${CONFIG.durationBufferMs}ms`
+        : `固定间隔 ${intervalText(CONFIG.interval)} 秒`;
     log(CONFIG.draws > 0
-        ? `   抽 ${CONFIG.draws} 次 · 间隔 ${intervalText(CONFIG.interval)} 秒`
-        : `   一抽到底 · 保留 ${fmt(CONFIG.reserve)} 憨豆 · 间隔 ${intervalText(CONFIG.interval)} 秒`);
+        ? `   抽 ${CONFIG.draws} 次 · ${pace}`
+        : `   一抽到底 · 保留 ${fmt(CONFIG.reserve)} 憨豆 · ${pace}`);
 
     const lottery = new Lottery(cookie);
     guardExit(lottery);
