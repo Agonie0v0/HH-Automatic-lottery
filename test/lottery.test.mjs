@@ -72,7 +72,14 @@ const untilStopped = (d, timeoutMs) =>
 
 // jsdom 构造完成时 readyState 可能还是 loading，脚本会等 DOMContentLoaded，
 // 所以 eval 之后要让出一拍再断言。
-async function run(dom) {
+async function run(dom, { followDuration = false } = {}) {
+    // 跟随转盘时长默认开着，但多数用例验的是「填几秒就跑几秒」。
+    // 要测跟随行为的用例自己打开。
+    const key = 'hhanclub_lottery_settings_v1';
+    const saved = JSON.parse(dom.window.localStorage.getItem(key) || '{}');
+    saved.followDuration = followDuration;
+    dom.window.localStorage.setItem(key, JSON.stringify(saved));
+
     dom.window.eval(SRC);
     await sleep(150);
 }
@@ -2484,6 +2491,200 @@ console.log('\n[50] 间隔说多久就是多久，不再随机浮动');
         gaps.every(gap => gap >= 3450), gaps.join(' / '));
     check('也没有被拖长成别的数',
         gaps.every(gap => gap < 5000), gaps.join(' / '));
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[51] 站点的冷却就是上一抽的 duration，跟着它排队');
+{
+    // 实测：上一抽 duration 7666ms 要等到 7211ms 才放行，3976ms 的
+    // 4322ms 就放行。duration 随机，所以任何固定间隔都躲不掉被拒。
+    // 这里让站点报 2500ms，下限填 1 秒 —— 应该按 2500 + 500 排，不是 1 秒。
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+    const w = dom.window;
+
+    const stamps = [];
+    w.fetch = async url => {
+        const target = String(url);
+        if (target.includes('lucky.php')) {
+            return { ok: true, status: 200, text: async () => '<html><body></body></html>' };
+        }
+        stamps.push(Date.now());
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({
+                ret: 0, data: { prize_text: '100 魔力', duration: 2500 }
+            })
+        };
+    };
+
+    await run(dom, { followDuration: true });
+    const d = w.document;
+    d.getElementById('lottery-interval').value = '1';
+    d.getElementById('lottery-interval').dispatchEvent(new w.Event('change'));
+    d.getElementById('max-lottery-count').value = '3';
+    d.getElementById('start-lottery').click();
+    await untilStopped(d, 30000);
+
+    check('3 次都抽出去了', stamps.length === 3, `实际 ${stamps.length} 次`);
+
+    const gaps = stamps.slice(1).map((t, i) => t - stamps[i]);
+    check('按 2500 + 500 排，没有按填的 1 秒',
+        gaps.every(gap => gap >= 2900 && gap < 4200), gaps.join(' / '));
+    check('面板报出上一抽的转盘时长和本次要等多久',
+        d.getElementById('duration-info').textContent === '上一抽转盘 2.5s · 本次等 3s',
+        d.getElementById('duration-info').textContent);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[52] 填的间隔只当下限，站点转得快也不会更快');
+{
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+    const w = dom.window;
+
+    const stamps = [];
+    w.fetch = async url => {
+        const target = String(url);
+        if (target.includes('lucky.php')) {
+            return { ok: true, status: 200, text: async () => '<html><body></body></html>' };
+        }
+        stamps.push(Date.now());
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({
+                ret: 0, data: { prize_text: '100 魔力', duration: 600 }
+            })
+        };
+    };
+
+    await run(dom, { followDuration: true });
+    const d = w.document;
+    d.getElementById('lottery-interval').value = '3';
+    d.getElementById('lottery-interval').dispatchEvent(new w.Event('change'));
+    d.getElementById('max-lottery-count').value = '3';
+    d.getElementById('start-lottery').click();
+    await untilStopped(d, 30000);
+
+    const gaps = stamps.slice(1).map((t, i) => t - stamps[i]);
+    check('转盘只要 0.6 秒，但填了 3 秒下限，就走 3 秒',
+        gaps.every(gap => gap >= 2900 && gap < 4200), gaps.join(' / '));
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[53] 每抽的 duration 都不一样，逐抽跟上');
+{
+    // 站点的 duration 是随机的，不能只读第一次就当常数
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+    const w = dom.window;
+
+    const spins = [3000, 1000, 1000];
+    const stamps = [];
+    let i = 0;
+    w.fetch = async url => {
+        const target = String(url);
+        if (target.includes('lucky.php')) {
+            return { ok: true, status: 200, text: async () => '<html><body></body></html>' };
+        }
+        stamps.push(Date.now());
+        const duration = spins[Math.min(i++, spins.length - 1)];
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ret: 0, data: { prize_text: '100 魔力', duration } })
+        };
+    };
+
+    await run(dom, { followDuration: true });
+    const d = w.document;
+    d.getElementById('lottery-interval').value = '0.5';
+    d.getElementById('lottery-interval').dispatchEvent(new w.Event('change'));
+    d.getElementById('max-lottery-count').value = '3';
+    d.getElementById('start-lottery').click();
+    await untilStopped(d, 30000);
+
+    const gaps = stamps.slice(1).map((t, i2) => t - stamps[i2]);
+    check('第一段按 3000 + 500 等', gaps[0] >= 3400 && gaps[0] < 4600, `实际 ${gaps[0]}`);
+    check('第二段按 1000 + 500 等，跟着降下来', gaps[1] >= 1400 && gaps[1] < 2600, `实际 ${gaps[1]}`);
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[54] 被「不要重复点击」挡回时，日志说清是没等够');
+{
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+    const w = dom.window;
+
+    let draws = 0;
+    w.fetch = async url => {
+        const target = String(url);
+        if (target.includes('lucky.php')) {
+            return { ok: true, status: 200, text: async () => '<html><body></body></html>' };
+        }
+        draws++;
+        if (draws === 2) {
+            return {
+                ok: true, status: 200,
+                text: async () => JSON.stringify({ ret: -1, msg: '不要重复点击！' })
+            };
+        }
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({
+                ret: 0, data: { prize_text: '100 魔力', duration: 1200 }
+            })
+        };
+    };
+
+    await run(dom, { followDuration: true });
+    const d = w.document;
+    d.getElementById('lottery-interval').value = '0.5';
+    d.getElementById('lottery-interval').dispatchEvent(new w.Event('change'));
+    d.getElementById('max-lottery-count').value = '2';
+    d.getElementById('start-lottery').click();
+    await untilStopped(d, 30000);
+
+    const log = d.getElementById('lottery-log').textContent;
+    check('日志点出上一抽转盘多久', /不要重复点击.*上一抽转盘 1.2 秒，没等够/.test(log),
+        log.slice(0, 300));
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[55] 关掉跟随，就只认填的间隔');
+{
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+    const w = dom.window;
+
+    const stamps = [];
+    w.fetch = async url => {
+        const target = String(url);
+        if (target.includes('lucky.php')) {
+            return { ok: true, status: 200, text: async () => '<html><body></body></html>' };
+        }
+        stamps.push(Date.now());
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({
+                ret: 0, data: { prize_text: '100 魔力', duration: 5000 }
+            })
+        };
+    };
+
+    await run(dom, { followDuration: true });
+    const d = w.document;
+    const toggle = d.getElementById('follow-duration');
+    check('开关默认是开的', toggle.checked === true);
+
+    toggle.checked = false;
+    toggle.dispatchEvent(new w.Event('change'));
+    check('关掉这件事存下来了',
+        JSON.parse(w.localStorage.getItem('hhanclub_lottery_settings_v1')).followDuration === false);
+
+    d.getElementById('lottery-interval').value = '1.5';
+    d.getElementById('lottery-interval').dispatchEvent(new w.Event('change'));
+    d.getElementById('max-lottery-count').value = '3';
+    d.getElementById('start-lottery').click();
+    await untilStopped(d, 30000);
+
+    const gaps = stamps.slice(1).map((t, i) => t - stamps[i]);
+    check('站点报 5 秒也不管，就走填的 1.5 秒',
+        gaps.every(gap => gap >= 1400 && gap < 2600), gaps.join(' / '));
 }
 
 /* ---------------------------------------------------------------- */

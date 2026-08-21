@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.23.0
+// @version      1.24.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 一抽到底 · 实时余额 · 站内信清理
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -47,15 +47,19 @@
         // 抽奖间隔允许范围（秒）
         minInterval: 0.5,
         maxInterval: 300,
-        /* 站点的冷却窗口，2026-08-21 在 lucky.php 上实测出来的：
-           从上一次成功受理算起，4.5 秒后重发被「不要重复点击」挡回，
-           4.6 秒放行 —— 窗口约 4.8 秒。
+        /* 站点的冷却窗口 = 上一次抽奖返回的 data.duration（转盘转多久）。
+           2026-08-21 在 lucky.php 上实测：
 
-           接口返回的 data.duration（三次采样 4370 / 5597 / 7581）只是
-           发给转盘做旋转动画的参数，是随机的，和这个窗口没有关系。
-           页面自己那套 `if (running) return` 也只是防动画期间重复点，
-           别拿 duration 当节奏依据。 */
-        siteCooldownMs: 4800,
+               上一抽 duration 7666ms → 7211ms 才放行
+               上一抽 duration 3976ms → 4322ms 就放行
+
+           duration 本身是随机的，采样落在 3976 ~ 7666 之间。所以任何固定
+           间隔都躲不掉「不要重复点击」—— 填 5.1 秒时，凡是 duration 超过
+           5.1 秒的那些抽（约三成）下一抽必被拒。
+
+           跟着 duration 排队才是对的。500ms 缓冲覆盖「服务端受理时刻」和
+           「我们收到响应的时刻」之间的往返差。 */
+        durationBufferMs: 500,
         // 被限流时的退避策略
         backoffAfterErrors: 3,
         backoffFactor: 1.5,
@@ -136,6 +140,8 @@
     let errorStreak = 0;
     let rateLimitStreak = 0;
     let dynamicInterval = 6800;
+    // 站点最近一次给的转盘时长，就是下一抽的冷却下限
+    let lastDurationMs = 0;
     let roundStartDraws = 0;
     let sleepTimer = null;
     let sleepResolve = null;
@@ -148,6 +154,7 @@
 
     let settings = {
         interval: 6.8,
+        followDuration: true,
         maxCount: 10,
         viewMode: 'current',
         animation: true,
@@ -392,6 +399,7 @@
         // 存下来的值可能来自旧版本、别的合法区间，或者被手改过。
         // 不在这里收敛的话，输入框会显示一个和实际生效值不一样的数字。
         settings.interval = normalizeInterval(settings.interval, 6.8);
+        settings.followDuration = settings.followDuration !== false;
         settings.maxCount = Math.max(1, parseInt(settings.maxCount, 10) || 10);
         if (settings.viewMode !== 'total') settings.viewMode = 'current';
         if (settings.detailOpen !== 'all') settings.detailOpen = 'none';
@@ -1561,15 +1569,16 @@
     background: #fffdf9;
     text-align: right;
 }
-#lottery-control-panel .hh-cooldown-note {
-    margin-top: 6px;
-    padding: 5px 8px;
+#lottery-control-panel .hh-duration-info {
+    flex: 0 0 auto;
     font-size: 9px;
-    line-height: 1.6;
-    color: #a08066;
-    border: 1px dashed #e8d5bc;
+    font-weight: 700;
+    color: #5a4030;
+    padding: 3px 8px;
+    border: 1px solid #e8d5bc;
     border-radius: 6px;
     background: #fffdf9;
+    white-space: nowrap;
 }
 #lottery-control-panel .hh-drain-hint {
     margin-top: 5px;
@@ -1765,9 +1774,16 @@
                     </div>
                 </div>
 
-                <div class="hh-cooldown-note">
-                    站点冷却实测约 ${(CONFIG.siteCooldownMs / 1000).toFixed(1)} 秒，
-                    填低于 5 秒会被「不要重复点击」挡回来，白跑一趟
+                <div class="hh-drain">
+                    <label class="hh-drain-toggle">
+                        <input type="checkbox" id="follow-duration">
+                        <span>⏱ 跟随转盘时长</span>
+                    </label>
+                    <span id="duration-info" class="hh-duration-info">等站点报第一个转盘时长</span>
+                </div>
+                <div id="duration-hint" class="hh-drain-hint">
+                    站点的冷却就是上一抽转盘转多久（实测 4~7.7 秒随机）—— 跟着它排队才不会被
+                    「不要重复点击」挡回。上面填的间隔只当下限，想快就往小了填
                 </div>
 
                 <div class="hh-drain">
@@ -2505,8 +2521,22 @@
 
     /* 说多久就是多久 —— 以前会在设定值上下浮动 15%，
        填 3 秒实际可能跑成 2.55 或 3.45 秒，对不上账。 */
+    /* 下一抽等多久。
+
+       站点的冷却就是上一抽的 duration，所以真正的下限由它说了算；
+       手填的间隔只作为「再慢也不低于这个数」的底。 */
     function nextDelayMs() {
-        return Math.max(500, Math.round(dynamicInterval));
+        const floor = Math.max(500, Math.round(dynamicInterval));
+        if (!settings.followDuration || !lastDurationMs) return floor;
+        return Math.max(floor, lastDurationMs + CONFIG.durationBufferMs);
+    }
+
+    function setDurationInfo() {
+        const info = $('duration-info');
+        if (!info) return;
+        info.textContent = lastDurationMs
+            ? `上一抽转盘 ${intervalText(lastDurationMs / 1000)}s · 本次等 ${intervalText(nextDelayMs() / 1000)}s`
+            : '等站点报第一个转盘时长';
     }
 
     function setCurrentIntervalDisplay() {
@@ -2538,6 +2568,11 @@
             dynamicInterval = baseIntervalMs();
             setCurrentIntervalDisplay();
 
+            // 站点把下一抽的冷却写在这儿了 —— 转盘转多久就得等多久
+            const spin = Number(data.data?.duration);
+            lastDurationMs = Number.isFinite(spin) && spin > 0 && spin <= 300000 ? spin : 0;
+            setDurationInfo();
+
             const prizeText = decodeUnicode(data.data?.prize_text || '未知奖品');
             const recordId = data.data?.winning_record_id || '';
             const prize = parsePrizeText(prizeText);
@@ -2561,7 +2596,11 @@
 
         if (msg.includes('重复点击') || msg.includes('请稍后') || msg.includes('频繁')) {
             rateLimitStreak++;
-            addLog(`⏳ ${msg}`, 'warning');
+            if (settings.followDuration && lastDurationMs) {
+                addLog(`⏳ ${msg}（上一抽转盘 ${intervalText(lastDurationMs / 1000)} 秒，没等够）`, 'warning');
+            } else {
+                addLog(`⏳ ${msg}`, 'warning');
+            }
 
             if (rateLimitStreak >= CONFIG.backoffAfterErrors) {
                 dynamicInterval = Math.min(dynamicInterval * CONFIG.backoffFactor, CONFIG.maxBackoffMs);
@@ -2663,6 +2702,8 @@
             return;
         }
 
+        lastDurationMs = 0;
+        setDurationInfo();
         dynamicInterval = Math.round(interval * 1000);
         errorStreak = 0;
         rateLimitStreak = 0;
@@ -3486,6 +3527,13 @@
             render();
         });
 
+        on('follow-duration', 'change', event => {
+            settings.followDuration = !!event.target.checked;
+            saveSettings();
+            applyDurationUI();
+            setDurationInfo();
+        });
+
         on('lottery-interval', 'change', event => {
             const value = normalizeInterval(event.target.value, settings.interval);
             event.target.value = intervalText(value);
@@ -3496,6 +3544,7 @@
             // 否则「当前间隔」会一直挂着上一次的数，和输入框对不上
             dynamicInterval = Math.round(value * 1000);
             setCurrentIntervalDisplay();
+            setDurationInfo();
         });
 
         on('max-lottery-count', 'change', event => {
@@ -3578,6 +3627,9 @@
         const viewSelect = $('view-mode');
         if (viewSelect) viewSelect.value = settings.viewMode;
 
+        const followToggle = $('follow-duration');
+        if (followToggle) followToggle.checked = !!settings.followDuration;
+
         const drainToggle = $('drain-mode');
         if (drainToggle) drainToggle.checked = !!settings.drainMode;
 
@@ -3587,6 +3639,7 @@
         const mailToggle = $('auto-clean-mail');
         if (mailToggle) mailToggle.checked = !!settings.autoCleanMail;
 
+        applyDurationUI();
         applyDrainUI();
         applyMailUI();
 
@@ -3595,9 +3648,16 @@
 
         dynamicInterval = Math.round(settings.interval * 1000);
         setCurrentIntervalDisplay();
+        setDurationInfo();
     }
 
     /* 一抽到底开着时「最大抽奖次数」不起作用，置灰，免得以为设了有用 */
+    function applyDurationUI() {
+        $('duration-hint')?.classList.toggle('is-on', !!settings.followDuration);
+        const info = $('duration-info');
+        if (info) info.style.display = settings.followDuration ? '' : 'none';
+    }
+
     function applyDrainUI() {
         const maxInput = $('max-lottery-count');
         if (maxInput) {
