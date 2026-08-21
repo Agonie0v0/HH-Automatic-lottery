@@ -2285,44 +2285,77 @@ console.log('\n[44] 抽奖期间有人赠送魔力，不能误判成 VIP 折算'
 }
 
 /* ---------------------------------------------------------------- */
-console.log('\n[45] 是发布员（class 高于 VIP），余额没动也照样判折算');
+console.log('\n[45] 等级够 VIP 但钱没到账，不能记成折算');
 {
-    // 极端情况：校准恰好读到和估算一样的余额（比如同期花掉了等额憨豆）。
-    // 按等级判就不受影响。
-    const { stats, userdetailsHits } = await drawVipWith({
+    // 线上真出过这个事故：一个号只中过一次 VIP、账面一分没多，
+    // 却被记了一百万 —— 因为旧逻辑「等级说是就是」，根本不看余额。
+    // 等级那条线本来就脆（usercp 上第一个 userdetails 链接未必是自己，
+    // 「等级」二字也可能先出现在别处），必须由余额定性。
+    const { stats, logs } = await drawVipWith({
         classIcon: 'uploader',
-        serverBalance: start => start - 2000
+        serverBalance: start => start - 2000        // 只扣了抽奖成本
     });
 
-    check('按等级判定为折算', stats.gains.beans === 1000000, `实际 ${stats.gains.beans}`);
+    check('没有凭空记出一百万', stats.gains.beans === 0, `实际 ${stats.gains.beans}`);
+    check('照实记成 7 天 VIP', stats.gains.vip === 7, `实际 ${stats.gains.vip}`);
+    check('仍算一次 VIP 中奖', stats.prizes.vip?.count === 1, JSON.stringify(stats.prizes.vip));
+    check('档位就是天数，不是折算', stats.prizes.vip?.tiers['7 天'] === 1,
+        JSON.stringify(stats.prizes.vip?.tiers));
+    check('日志说明等级够但账面没动',
+        logs.some(line => line.includes('站点发的是天数')), logs.slice(-3).join(' | '));
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[45b] 等级够 VIP 且钱到账了，才记折算');
+{
+    const { stats, userdetailsHits } = await drawVipWith({
+        classIcon: 'uploader',
+        serverBalance: start => start - 2000 + 1000000
+    });
+
+    check('按公布金额记一百万', stats.gains.beans === 1000000, `实际 ${stats.gains.beans}`);
     check('没拿到 VIP 天数', !stats.gains.vip, `实际 ${stats.gains.vip}`);
     check('仍算一次 VIP 中奖', stats.prizes.vip?.count === 1, JSON.stringify(stats.prizes.vip));
     check('等级只查一次', userdetailsHits === 1, `实际 ${userdetailsHits}`);
 }
 
 /* ---------------------------------------------------------------- */
-console.log('\n[46] 等级读不到时退回余额差，且窄带才认');
+console.log('\n[46] 等级读不到时，全凭余额定性');
 {
-    // 读不到等级 + 余额只多了 80 万（离公布的 100 万差 20 万，超出容差）
-    const loose = await drawVipWith({
+    // 读不到等级 + 账面几乎没动 → 就是拿到了天数
+    const flat = await drawVipWith({
         classIcon: null,
-        serverBalance: start => start - 2000 + 800000
+        serverBalance: start => start - 2000 + 300
     });
-    check('偏差太大就不认，按 VIP 记', loose.stats.gains.vip === 7, `实际 ${loose.stats.gains.vip}`);
-    check('憨豆不乱加', loose.stats.gains.beans === 0, `实际 ${loose.stats.gains.beans}`);
-    check('提示读不到等级、无法确认',
-        loose.logs.some(line => line.includes('读不到你的等级')), loose.logs.slice(-3).join(' | '));
+    check('账面没动就按 VIP 天数记', flat.stats.gains.vip === 7, `实际 ${flat.stats.gains.vip}`);
+    check('憨豆不乱加', flat.stats.gains.beans === 0, `实际 ${flat.stats.gains.beans}`);
 
-    // 读不到等级 + 余额多了 1,000,060（做种那 60 点，在容差内）
-    const tight = await drawVipWith({
+    // 读不到等级 + 余额多了 1,000,060（做种那 60 点）→ 按公布金额记
+    const paid = await drawVipWith({
         classIcon: null,
         serverBalance: start => start - 2000 + 1000060
     });
-    check('落在窄带内就认，且按公布金额记',
-        tight.stats.gains.beans === 1000000, `实际 ${tight.stats.gains.beans}`);
+    check('钱到账了就认，且按公布金额记，不把做种那 60 点算进去',
+        paid.stats.gains.beans === 1000000, `实际 ${paid.stats.gains.beans}`);
     check('多出的 60 单独说明',
-        tight.logs.some(line => line.includes('+60') && line.includes('未计入中奖')),
-        tight.logs.slice(-3).join(' | '));
+        paid.logs.some(line => line.includes('+60') && line.includes('未计入中奖')),
+        paid.logs.slice(-3).join(' | '));
+}
+
+/* ---------------------------------------------------------------- */
+console.log('\n[46b] 等级明确不够，账面却多了一大笔：不认这是折算');
+{
+    // 抽奖期间有人赠送了一大笔魔力。站点的规则是「已是 VIP 才折算」，
+    // 等级不够就不可能触发，这钱另有来源，不能凭它造出一个一百万的档位。
+    const { stats, logs } = await drawVipWith({
+        classIcon: 'user',
+        serverBalance: start => start - 2000 + 1000000
+    });
+
+    check('按 VIP 天数记', stats.gains.vip === 7, `实际 ${stats.gains.vip}`);
+    check('没把赠送的钱记成中奖', stats.gains.beans === 0, `实际 ${stats.gains.beans}`);
+    check('日志点明等级不符合折算条件',
+        logs.some(line => line.includes('不符合折算条件')), logs.slice(-3).join(' | '));
 }
 
 /* ---------------------------------------------------------------- */
@@ -2335,6 +2368,9 @@ console.log('\n[47] 等级第一次查失败，下次还要再查');
     const w = dom.window;
 
     let userdetailsHits = 0;
+    // 第一注账面只扣了成本（等级又查不到）→ 按 VIP 天数记；
+    // 第二注那一百万真到账 → 配合重试查到的等级，判出折算。
+    let luckyHits = 0;
     w.fetch = async url => {
         const target = String(url);
         if (target.includes('usercp.php')) {
@@ -2357,7 +2393,7 @@ console.log('\n[47] 等级第一次查失败，下次还要再查');
                 // 余额只反映消耗，不含补偿 —— 这样第一注（等级查不到时）
                 // 走余额差也判不出折算，能干净地看出第二注是靠等级判出来的
                 text: async () => `<html><body>
-                    <div class="bean-number">${START - 2000}.0</div>
+                    <div class="bean-number">${++luckyHits === 1 ? START - 2000 : START - 4000 + 1000000}.0</div>
                     <div class="use-bean">每次消耗憨豆： 2000</div>
                     <div>当中奖 [VIP] 时，如果用户已经是 VIP 或以上等级，奖励憨豆： 1000000</div>
                 </body></html>`
@@ -2382,9 +2418,9 @@ console.log('\n[47] 等级第一次查失败，下次还要再查');
 
     const stats = JSON.parse(w.localStorage.getItem('hhanclub_lottery_stats_v4'));
     check('两注 VIP 都记上了', stats.prizes.vip?.count === 2, `实际 ${stats.prizes.vip?.count}`);
-    check('第一注等级查不到、余额也对不上，按 VIP 记',
+    check('第一注等级查不到、账面也没多钱，按 VIP 记',
         stats.prizes.vip?.tiers['7 天'] === 1, JSON.stringify(stats.prizes.vip?.tiers));
-    check('第二注凭等级判出折算',
+    check('第二注等级查到了、钱也到账，判出折算',
         stats.prizes.vip?.tiers['已转换为憨豆 1,000,000'] === 1, JSON.stringify(stats.prizes.vip?.tiers));
     check('只折算了一注，憨豆恰好一百万',
         stats.gains.beans === 1000000, `实际 ${stats.gains.beans}`);

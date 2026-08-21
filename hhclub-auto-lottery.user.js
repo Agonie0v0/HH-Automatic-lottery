@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HHCLUB 自动抽奖 · 情绪价值拉满版
 // @namespace    http://tampermonkey.net/
-// @version      1.26.0
+// @version      1.27.0
 // @description  HHCLUB 自动抽奖增强版 · 分奖项中奖次数统计 · 一抽到底 · 实时余额 · 站内信清理
 // @author       Timqaq, JIEDIAO
 // @match        https://hhanclub.net/lucky.php
@@ -105,9 +105,14 @@
         jackpotBeansFloor: 100000,
         // 读不到站点公布的折算金额时用这个兜底
         vipSwapFallbackBeans: 1000000,
-        // 查不到等级时才用余额差兜底判断。容差收得比较紧 ——
-        // 松了的话别人赠送一笔魔力就可能被误判成折算。
-        vipSwapTolerance: 20000,
+        /* 判定折算的主证据是余额：站点真发了那笔憨豆，账面必然多出接近
+           这个数；发的是天数，账面只有做种那点零头。要求至少多出公布金额
+           的这个比例才算折算。
+
+           取一半是因为两头都要留余量 —— 同期可能还在扣抽奖成本、涨做种
+           收益，也可能有人赠送。真折算是一百万级的跳变，赠送要凑到五十万
+           才可能混淆，那种巧合可以不管。 */
+        vipSwapMinDriftRatio: 0.5,
         // 个人页，用来读等级
         userCpPageForId: '/usercp.php',
         // 每抽多少次回服务端校准一次余额，纠正本地估算的累计漂移
@@ -588,12 +593,28 @@
     let vipOrAbove = null;
     let vipClassChecked = false;
 
+    /* 取自己的 user id。不能抓页面上第一个 userdetails 链接就走 ——
+       站内信发件人、邀请列表里全是别人的链接，抓错了就会拿别人的等级
+       当自己的。优先认「控制面板」这类明确指向本人的链接，实在找不到
+       才退回第一个，并且只在整页只有一个候选时才敢用。 */
     async function fetchSelfUserId() {
         const response = await fetch(CONFIG.userCpPageForId, { credentials: 'include' });
         if (!response.ok) return null;
 
-        const match = (await response.text()).match(/userdetails\.php\?id=(\d+)/);
-        return match ? match[1] : null;
+        const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
+
+        // usercp 顶部的用户名链接带 class="User_Name"（NexusPHP 的等级色块）
+        const named = doc.querySelector('a[href*="userdetails.php?id="] > b, a.User_Name[href*="userdetails.php?id="]');
+        const owner = named?.closest('a') || named;
+        const fromOwner = owner?.getAttribute('href')?.match(/id=(\d+)/);
+        if (fromOwner) return fromOwner[1];
+
+        const ids = new Set(
+            Array.from(doc.querySelectorAll('a[href*="userdetails.php?id="]'))
+                .map(link => link.getAttribute('href').match(/id=(\d+)/)?.[1])
+                .filter(Boolean)
+        );
+        return ids.size === 1 ? [...ids][0] : null;
     }
 
     async function checkVipOrAbove() {
@@ -763,12 +784,15 @@
     /* 抽奖页上写着一条隐藏规则：
          「当中奖 [VIP] 时，如果用户已经是 VIP 或以上等级，奖励憨豆：1000000」
        接口返回的 prize_text 是转盘上停的那一格，未必反映这个替换，
-       所以中到 VIP 就立刻回服务端核一次余额：真多出一大笔，
-       就说明站点发的是憨豆，把这一注改记成憨豆。
+       所以中到 VIP 就立刻回服务端核一次余额。
 
-       不用去猜用户是不是 VIP —— 余额说了算。而且要是哪天 prize_text
-       本身就返回「魔力 1000000」，那笔憨豆已经记进去了、估算和实际对得上，
-       这里不会重复计。 */
+       定性只认余额，等级仅作佐证。等级这条线太脆：usercp 上第一个
+       userdetails 链接未必是自己，「等级」二字也可能先出现在别处，
+       一旦认错行就会凭空记出一百万 —— 线上真发生过：一个不是 VIP 的
+       号只中过一次 VIP，账面一分没多，却被记成了折算。
+
+       余额则是硬事实。要是哪天 prize_text 本身就返回「魔力 1000000」，
+       那笔憨豆已经记进去了、估算和实际对得上，这里也不会重复计。 */
     async function reconcileVipPrize(prize) {
         const estimated = beanBalance;
 
@@ -781,21 +805,23 @@
 
         const drift = beanBalance - estimated;
         const beans = readVipSwapBeans();
-
-        // 先按等级判 —— 这是确定的事实，不受赠送魔力 / 做种收益干扰
         const eligible = await checkVipOrAbove();
 
-        if (eligible === false) return;                 // 不是 VIP，真拿到了天数
-        if (eligible === null) {
-            // 等级读不到才退回余额差，而且要求落在公布金额附近的窄带里。
-            // 放宽的话，抽奖期间有人赠送一笔魔力就会被误判成折算。
-            if (Math.abs(drift - beans) > CONFIG.vipSwapTolerance) {
-                if (drift > CONFIG.vipSwapTolerance) {
-                    addLog(`⚠️ 中了 VIP 且余额变动 ${drift > 0 ? '+' : ''}${fmt(Math.round(drift))}，`
-                        + '但读不到你的等级，无法确认是否折算 —— 这一注按 VIP 记', 'warning');
-                }
-                return;
+        // 账面没多出那笔钱，就是真拿到了天数 —— 不管等级看着像什么
+        if (drift < beans * CONFIG.vipSwapMinDriftRatio) {
+            if (eligible === true) {
+                addLog(`ℹ️ 中了 VIP，你的等级也够折算，但账面只变动 `
+                    + `${drift > 0 ? '+' : ''}${fmt(Math.round(drift))} —— 站点发的是天数，按 VIP 记`, 'info');
             }
+            return;
+        }
+
+        // 钱到账了，但等级明确不够 —— 这笔多出来的多半来自别处（赠送、
+        // 别的标签页中奖）。宁可少记也不能凭空造一个一百万的档位。
+        if (eligible === false) {
+            addLog(`⚠️ 中了 VIP 后余额多出 ${fmt(Math.round(drift))}，但你的等级不到 VIP，`
+                + '不符合折算条件 —— 这一注按 VIP 记，多出的钱另有来源', 'warning');
+            return;
         }
 
         // 金额一律按站点公布的来。drift 里混着做种收益、赠送、别的标签页的
