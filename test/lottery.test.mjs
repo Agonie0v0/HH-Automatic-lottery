@@ -2745,5 +2745,52 @@ console.log('\n[56] 缓冲可以自定义，负值也行');
 }
 
 /* ---------------------------------------------------------------- */
+console.log('\n[57] 开抽前刚手动转过一把：残留冷却别被误判成持续限流');
+{
+    // 第一枪就撞上残留冷却（本轮还没成功过，冷却剩多久未知）。
+    // 300ms 连打会在最长 8 秒的冷却结束前攒满 12 连拒而误停 ——
+    // 未知冷却要 1 秒一枪，连拒 4 次也照样抽完。
+    const dom = makeDom({ pool: REAL_POOL, useBean: '每次消耗憨豆： 2000' });
+    const w = dom.window;
+
+    let posts = 0;
+    w.fetch = async url => {
+        const target = String(url);
+        if (target.includes('lucky.php')) {
+            return { ok: true, status: 200, text: async () => '<html><body></body></html>' };
+        }
+        posts++;
+        if (posts <= 4) {
+            return {
+                ok: true, status: 200,
+                text: async () => JSON.stringify({ ret: -1, msg: '不要重复点击！' })
+            };
+        }
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({
+                ret: 0, data: { prize_text: '100 魔力', duration: 1000 }
+            })
+        };
+    };
+
+    await run(dom, { followDuration: true });
+    const d = w.document;
+    d.getElementById('lottery-interval').value = '0.5';
+    d.getElementById('lottery-interval').dispatchEvent(new w.Event('change'));
+    d.getElementById('max-lottery-count').value = '1';
+    d.getElementById('start-lottery').click();
+    await untilStopped(d, 30000);
+
+    const stats = JSON.parse(w.localStorage.getItem('hhanclub_lottery_stats_v4'));
+    check('熬过 4 连拒，最终抽成了', stats.draws >= 1, `实际 ${stats.draws}`);
+
+    const log = d.getElementById('lottery-log').textContent;
+    check('没有被误判成持续限流', !log.includes('持续被限流'), log.slice(0, 300));
+    check('日志说明冷却未知、放慢重试', /冷却剩多久未知，1000ms 后再试/.test(log),
+        log.slice(0, 300));
+}
+
+/* ---------------------------------------------------------------- */
 console.log(`\n=========== ${passed} passed, ${failed} failed ===========\n`);
 process.exit(failed ? 1 : 0);

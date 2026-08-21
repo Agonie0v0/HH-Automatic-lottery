@@ -79,6 +79,10 @@
         maxBufferMs: 5000,
         // 被「不要重复点击」挡回后多久补一枪
         rateLimitRetryMs: 300,
+        // 冷却剩多久不知道时（本轮还没成功过，比如开抽前刚手动转过一把）
+        // 补枪要放慢：残留冷却最长 8 秒，300ms 连打会在它结束前就攒满
+        // maxRateLimitRetries 而误停，1 秒一枪则 12 次能兜住 12 秒
+        blindRetryMs: 1000,
         // 被限流时的退避策略
         backoffAfterErrors: 3,
         backoffFactor: 1.5,
@@ -2653,11 +2657,13 @@
         if (msg.includes('重复点击') || msg.includes('请稍后') || msg.includes('频繁')) {
             rateLimitStreak++;
             if (settings.followDuration) {
-                // 被拒不重置服务端计时、也不扣憨豆，快速补枪即可
-                quickRetryMs = CONFIG.rateLimitRetryMs;
+                // 被拒不重置服务端计时、也不扣憨豆，快速补枪即可。
+                // 但冷却剩多久都不知道时（开抽前刚手动转过一把）得放慢，
+                // 免得 12 连拒攒满 maxRateLimitRetries 被误判成持续限流
+                quickRetryMs = lastDurationMs ? CONFIG.rateLimitRetryMs : CONFIG.blindRetryMs;
                 addLog(lastDurationMs
-                    ? `⏳ ${msg}（上一抽转盘 ${intervalText(lastDurationMs / 1000)} 秒，没等够 · ${CONFIG.rateLimitRetryMs}ms 后补一枪）`
-                    : `⏳ ${msg}（${CONFIG.rateLimitRetryMs}ms 后补一枪）`, 'warning');
+                    ? `⏳ ${msg}（上一抽转盘 ${intervalText(lastDurationMs / 1000)} 秒，没等够 · ${quickRetryMs}ms 后补一枪）`
+                    : `⏳ ${msg}（冷却剩多久未知，${quickRetryMs}ms 后再试）`, 'warning');
             } else {
                 addLog(`⏳ ${msg}`, 'warning');
                 if (rateLimitStreak >= CONFIG.backoffAfterErrors) {
